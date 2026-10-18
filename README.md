@@ -51,9 +51,13 @@ python3 bin/poa.py init --import
 
 *(On Windows PowerShell, you can use either `python bin\poa.py <cmd>` or `powershell -NoProfile -ExecutionPolicy Bypass -File bin\poa.ps1 <cmd>`.)*
 
-### 2. Run One Full Mining Cycle
+### 2. Run One Full Mining Cycle (or Single-Command `pulse`)
 
 ```bash
+# Single-command operator check: mines peer txs, checks /me + /challenge, audits open grading seats, and lists ballots
+python3 bin/poa.py pulse --mine
+
+# Or step-by-step:
 # 1. Check account status & current epoch challenge words
 python3 bin/poa.py me
 python3 bin/poa.py challenge
@@ -67,6 +71,7 @@ $EDITOR work/answer.txt
 python3 bin/poa.py check --file work/answer.txt
 
 # 4. Submit answer & immediately trigger auto-mining / peer attestation
+#    (Automatically handles mid-epoch seed-word rotations if the epoch was already answered on-ledger)
 python3 bin/poa.py answer --file work/answer.txt
 python3 bin/poa.py mine
 python3 bin/poa.py me
