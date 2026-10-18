@@ -344,7 +344,17 @@ def main() -> None:
             report = check_answer_quality(text, ch.get("words", []))
             if not report["passed"]:
                 raise RuntimeError(f"Pre-flight check failed: {json.dumps(report)}")
-            res = api_call("POST", "/api/hosted/answer", body={"answer": text})
+            try:
+                res = api_call("POST", "/api/hosted/answer", body={"answer": text})
+            except RuntimeError as e:
+                if "duplicate challenge for epoch" in str(e).lower():
+                    print(json.dumps({
+                        "skipped": True,
+                        "epoch": ch.get("epoch"),
+                        "note": "Epoch already answered on-ledger prior to mid-epoch word rotation (duplicate challenge for epoch)."
+                    }, indent=2))
+                    return
+                raise
             POA_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
             with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
