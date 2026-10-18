@@ -291,6 +291,9 @@ def main() -> None:
     sub.add_parser("ballots", help="List open governance ballots (no key required)")
     sub.add_parser("network", help="Fetch public network statistics (no key required)")
 
+    p_pulse = sub.add_parser("pulse", help="All-in-one operator check: me + challenge + assignments audit + ballots (+ optional --mine)")
+    p_pulse.add_argument("--mine", action="store_true", help="Also run /api/hosted/mine during the pulse check")
+
     p_check = sub.add_parser("check", help="Local pre-flight: length, live words, shingle overlap, and Grade-3 signals")
     p_check.add_argument("--file", "-f", required=True, help="Path to UTF-8 draft answer file")
 
@@ -387,6 +390,30 @@ def main() -> None:
         elif args.command == "network":
             res = api_call("GET", "/api/network", need_key=False)
             print(json.dumps(res, indent=2))
+        elif args.command == "pulse":
+            mine_res = api_call("GET", "/api/hosted/mine") if args.mine else None
+            me_res = api_call("GET", "/api/hosted/me")
+            ch_res = api_call("GET", "/api/hosted/challenge")
+            asgn_res = api_call("GET", "/api/hosted/assignments")
+            bal_res = api_call("GET", "/api/ballots", need_key=False)
+            seats = [audit_assignment_seat(s) for s in (asgn_res.get("assignments") or [])]
+            summary = {
+                "epoch": ch_res.get("epoch"),
+                "answered": ch_res.get("answered"),
+                "words": ch_res.get("words", []),
+                "balance": me_res.get("balance"),
+                "spendable": me_res.get("spendable"),
+                "locked": me_res.get("locked"),
+                "established": me_res.get("established"),
+                "attestations_by_me": me_res.get("attestations_by_me"),
+                "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else None,
+                "open_grading_seats_count": len(seats),
+                "open_grading_seats": seats,
+                "open_ballots": bal_res.get("ballots", []),
+                "notices": me_res.get("notices", []),
+            }
+            print(json.dumps(summary, indent=2))
+            print_notice(ch_res)
     except Exception as exc:
         sys.stderr.write(f"ERROR: {redact(str(exc))}\n")
         sys.exit(1)
