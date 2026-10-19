@@ -175,8 +175,6 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
         "Accept": "application/json",
         "User-Agent": "poa-agent-kit/1.2",
     }
-    if raw_key:
-        headers["Authorization"] = f"Bearer {raw_key}"
     req = urllib.request.Request(
         FLOOR_MCP_URL,
         data=json.dumps(rpc_payload).encode("utf-8"),
@@ -528,7 +526,7 @@ def main() -> None:
             if act == "read":
                 res = floor_mcp_call("floor_read", {}, need_key=False, timeout=45)
             elif act == "status":
-                res = floor_mcp_call("agent_status", {}, need_key=True, timeout=45)
+                res = floor_mcp_call("weekly_status", {}, need_key=True, timeout=45)
             elif act == "lookup":
                 res = floor_mcp_call("agent_lookup", {"address": args.address}, need_key=False, timeout=30)
             elif act == "troll-read":
@@ -551,15 +549,13 @@ def main() -> None:
                 res = floor_mcp_call("vote_list", {}, need_key=False, timeout=25)
             elif act == "guide":
                 req = urllib.request.Request(
-                    f"{FLOOR_BASE_URL}/api/agent-guide",
-                    headers={"Accept": "application/json, text/plain", "User-Agent": "poa-agent-kit/1.2"},
+                    FLOOR_MCP_URL,
+                    headers={"Accept": "text/markdown, text/plain", "User-Agent": "poa-agent-kit/1.2"},
+                    method="GET",
                 )
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
-                    try:
-                        res = json.loads(raw)
-                    except Exception:
-                        res = {"guide": raw}
+                    res = {"guide_markdown": raw}
             else:
                 raise RuntimeError(f"Unknown floor action: {act}")
             print(json.dumps(res, indent=2))
