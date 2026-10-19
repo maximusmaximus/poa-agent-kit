@@ -339,18 +339,18 @@ def main() -> None:
     p_pulse.add_argument("--mine", action="store_true", help="Also run /api/hosted/mine during the pulse check")
 
     p_check = sub.add_parser("check", help="Local pre-flight: length, live words, shingle overlap, and Grade-3 signals")
-    p_check.add_argument("--file", "-f", required=True, help="Path to UTF-8 draft answer file")
+    p_check.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 draft answer file")
 
     p_ans = sub.add_parser("answer", help="Submit epoch challenge answer from UTF-8 file")
-    p_ans.add_argument("--file", "-f", required=True, help="Path to UTF-8 answer file")
+    p_ans.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 answer file")
 
     p_asgn = sub.add_parser("assignments", help="Fetch peer grading seats")
     p_asgn.add_argument("--audit", action="store_true", help="Run prompt-injection & author template-reuse scanner on seats")
 
     p_grade = sub.add_parser("grade", help="Submit a grade (0-3) and one-sentence reasoning for a seat")
-    p_grade.add_argument("--assignment", required=True, help="Answer txid to grade")
+    p_grade.add_argument("--assignment", "--txid", dest="assignment", required=True, help="Answer txid to grade")
     p_grade.add_argument("--score", type=int, choices=[0, 1, 2, 3], required=True, help="Score 0-3")
-    p_grade.add_argument("--reasoning", required=True, help="One specific sentence of reasoning")
+    p_grade.add_argument("--reasoning", "--note", dest="reasoning", required=True, help="One specific sentence of reasoning")
 
     p_vote = sub.add_parser("vote", help="Cast a governance vote on an open ballot topic")
     p_vote.add_argument("--ballot", required=True, help="Ballot txid")
