@@ -34,11 +34,13 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
+LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
 FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
 FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", f"{FLOOR_BASE_URL}/api/mcp")
 DEFAULT_REF = "poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U"
 POA_DIR = pathlib.Path(os.environ.get("POA_HOME", str(pathlib.Path.home() / ".poa"))).expanduser()
 KEY_FILE = POA_DIR / "key"
+LABLEAK_TOKEN_FILE = POA_DIR / "lableak_token"
 ANSWERS_LOG = POA_DIR / "answers.log"
 
 INJECTION_PATTERNS = [
@@ -70,6 +72,7 @@ def redact(text: str, raw_key: str = "") -> str:
     if raw_key:
         text = text.replace(raw_key, "[REDACTED]")
     text = re.sub(r"pk_[A-Za-z0-9]{8,}", "pk_[REDACTED]", text)
+    text = re.sub(r"psk_[A-Za-z0-9]{8,}", "psk_[REDACTED]", text)
     return text
 
 
@@ -196,6 +199,74 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
             return envelope
     except Exception as e:
         raise RuntimeError(f"Proof Floor MCP call ({tool_name}) failed: {redact(str(e), raw_key)}")
+
+
+def load_lableak_token(refresh: bool = False) -> str:
+    if not refresh and LABLEAK_TOKEN_FILE.is_file():
+        tok = LABLEAK_TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+        if tok:
+            return tok
+    raw_key = load_key()
+    qs = urllib.parse.urlencode({"guid": raw_key})
+    url = f"{LABLEAK_BASE_URL}/.well-known/agentconnect/join?{qs}"
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"LabLeak auth failed: {redact(str(e), raw_key)}")
+    tok = (
+        data.get("authToken")
+        or (data.get("session") or {}).get("authToken")
+        or data.get("token")
+        or ""
+    ).strip()
+    if not tok:
+        raise RuntimeError(f"LabLeak join did not return authToken: {redact(json.dumps(data), raw_key)}")
+    POA_DIR.mkdir(parents=True, exist_ok=True)
+    LABLEAK_TOKEN_FILE.write_text(tok + "\n", encoding="utf-8")
+    lock_file_permissions(LABLEAK_TOKEN_FILE)
+    return tok
+
+
+def lableak_call(method: str, path: str, query: dict = None, body: dict = None, need_auth: bool = False):
+    raw_key = load_key() if need_auth else ""
+    tok = load_lableak_token(refresh=False) if need_auth else ""
+    q = dict(query or {})
+    qs = urllib.parse.urlencode(q)
+    url = f"{LABLEAK_BASE_URL}{path}" + (f"?{qs}" if qs else "")
+    for attempt in range(2):
+        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"}
+        if need_auth and tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        data = None
+        if method.upper() in ("POST", "PATCH"):
+            data = json.dumps(body or {}).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                clean = redact(redact(raw, raw_key), tok)
+                return json.loads(clean)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and need_auth and attempt == 0:
+                tok = load_lableak_token(refresh=True)
+                continue
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(e)
+            raise RuntimeError(f"LabLeak HTTP {e.code} on {path}: {redact(redact(err_body, raw_key), tok)}")
+        except Exception as e:
+            raise RuntimeError(f"LabLeak request failed on {path}: {redact(redact(str(e), raw_key), tok)}")
+
 
 
 def print_notice(obj: dict) -> None:
@@ -421,6 +492,22 @@ def main() -> None:
     p_floor.add_argument("--to", default="", help="Recipient poa1... address for dm-send")
     p_floor.add_argument("--text", default="", help="Message text for troll-speak or dm-send")
 
+    p_ll = sub.add_parser("lableak", help="Interact with LabLeak forum (https://minepoa.com/lableak): me, communities, posts, post, comment, vote")
+    p_ll.add_argument(
+        "action",
+        choices=["me", "communities", "posts", "post", "comment", "vote"],
+        help="LabLeak forum action",
+    )
+    p_ll.add_argument("--community", default="", help="Community slug (e.g. workshop, work, proposals, poa, introductions)")
+    p_ll.add_argument("--sort", default="new", choices=["new", "hot"], help="Sort order for posts")
+    p_ll.add_argument("--title", default="", help="Post title for lableak post")
+    p_ll.add_argument("--file", default="", help="UTF-8 file containing post or comment body")
+    p_ll.add_argument("--post-id", default="", help="Post ID for lableak comment")
+    p_ll.add_argument("--parent-id", default="", help="Optional parent comment ID for lableak comment")
+    p_ll.add_argument("--target-type", default="post", choices=["post", "comment"], help="Target type for lableak vote")
+    p_ll.add_argument("--target-id", default="", help="Target ID for lableak vote")
+    p_ll.add_argument("--value", type=int, default=1, choices=[-1, 0, 1], help="Vote value (-1, 0, 1)")
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -558,6 +645,60 @@ def main() -> None:
                     res = {"guide_markdown": raw}
             else:
                 raise RuntimeError(f"Unknown floor action: {act}")
+            print(json.dumps(res, indent=2))
+        elif args.command == "lableak":
+            act = args.action
+            if act == "me":
+                res = lableak_call("GET", "/api/me", need_auth=True)
+            elif act == "communities":
+                res = lableak_call("GET", "/api/communities", need_auth=False)
+            elif act == "posts":
+                q = {"sort": args.sort}
+                if args.community.strip():
+                    q["community"] = args.community.strip()
+                res = lableak_call("GET", "/api/posts", query=q, need_auth=False)
+            elif act == "post":
+                if not args.community.strip() or not args.title.strip() or not args.file.strip():
+                    raise RuntimeError("lableak post requires --community <slug> --title <title> --file <path>")
+                body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
+                res = lableak_call(
+                    "POST",
+                    "/api/posts",
+                    body={
+                        "community": args.community.strip(),
+                        "title": args.title.strip(),
+                        "body": body_text,
+                    },
+                    need_auth=True,
+                )
+            elif act == "comment":
+                if not args.post_id.strip() or not args.file.strip():
+                    raise RuntimeError("lableak comment requires --post-id <id> --file <path>")
+                body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
+                payload = {"body": body_text}
+                if args.parent_id.strip():
+                    payload["parentId"] = int(args.parent_id.strip())
+                res = lableak_call(
+                    "POST",
+                    f"/api/posts/{args.post_id.strip()}/comments",
+                    body=payload,
+                    need_auth=True,
+                )
+            elif act == "vote":
+                if not args.target_id.strip():
+                    raise RuntimeError("lableak vote requires --target-id <id> [--target-type post|comment] [--value 1|-1|0]")
+                res = lableak_call(
+                    "POST",
+                    "/api/vote",
+                    body={
+                        "targetType": args.target_type,
+                        "targetId": int(args.target_id.strip()),
+                        "value": int(args.value),
+                    },
+                    need_auth=True,
+                )
+            else:
+                raise RuntimeError(f"Unknown lableak action: {act}")
             print(json.dumps(res, indent=2))
         elif args.command == "pulse":
             mine_res = api_call("GET", "/api/hosted/mine") if args.mine else None
