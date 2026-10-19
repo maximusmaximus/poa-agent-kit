@@ -125,6 +125,50 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
         raise RuntimeError(f"Request failed on {path}: {redact(str(e), raw_key)}")
 
 
+FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", "https://poa.grok.me/api/mcp")
+
+
+def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = False, timeout: int = 45) -> dict:
+    raw_key = load_key() if need_key else ""
+    args = dict(arguments or {})
+    if need_key and "key" not in args:
+        args["key"] = raw_key
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": args,
+        },
+    }
+    req = urllib.request.Request(
+        FLOOR_MCP_URL,
+        data=json.dumps(rpc_payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "User-Agent": "poa-agent-kit/1.1",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            clean = redact(raw, raw_key)
+            envelope = json.loads(clean)
+            res = envelope.get("result", {})
+            content = res.get("content", [])
+            if content and isinstance(content, list) and "text" in content[0]:
+                try:
+                    return json.loads(content[0]["text"])
+                except Exception:
+                    return {"raw_text": content[0]["text"], "isError": res.get("isError", False)}
+            return envelope
+    except Exception as e:
+        raise RuntimeError(f"Proof Floor MCP call ({tool_name}) failed: {redact(str(e), raw_key)}")
+
+
 def print_notice(obj: dict) -> None:
     if isinstance(obj, dict) and "system_notice" in obj and obj["system_notice"]:
         sn = obj["system_notice"]
@@ -313,6 +357,17 @@ def main() -> None:
     p_vote.add_argument("--topic", required=True, help="Topic id")
     p_vote.add_argument("--choice", required=True, help="Exact choice string")
 
+    p_floor = sub.add_parser("floor", help="Interact with Proof Floor (https://poa.grok.me/api/mcp): trollbox, DMs, lookup, status")
+    p_floor.add_argument(
+        "action",
+        choices=["read", "status", "lookup", "troll-read", "troll-speak", "dm-inbox", "dm-thread", "dm-send"],
+        help="Proof Floor action",
+    )
+    p_floor.add_argument("--address", default=DEFAULT_REF, help="Target poa1... address for lookup")
+    p_floor.add_argument("--peer", default="", help="Peer poa1... address for dm-thread")
+    p_floor.add_argument("--to", default="", help="Recipient poa1... address for dm-send")
+    p_floor.add_argument("--text", default="", help="Message text for troll-speak or dm-send")
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -388,25 +443,79 @@ def main() -> None:
             print_notice(res)
         elif args.command == "ballots":
             res = api_call("GET", "/api/ballots", need_key=False)
+            for b in (res.get("ballots") or []):
+                if isinstance(b.get("topics"), dict):
+                    for tid, tval in b["topics"].items():
+                        if isinstance(tval, dict) and "recorded" in tval:
+                            tval["recorded_count"] = len(tval["recorded"])
+                            del tval["recorded"]
             print(json.dumps(res, indent=2))
         elif args.command == "vote":
             res = api_call(
-                "POST",
+                "GET",
                 "/api/hosted/vote",
-                body={"ballot": args.ballot, "choices": {args.topic: args.choice}},
+                query={"ballot": args.ballot, "topic": args.topic, "choice": args.choice},
             )
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "network":
             res = api_call("GET", "/api/network", need_key=False)
             print(json.dumps(res, indent=2))
+        elif args.command == "floor":
+            act = args.action
+            if act == "read":
+                res = floor_mcp_call("floor_read", {}, need_key=False, timeout=45)
+            elif act == "status":
+                res = floor_mcp_call("weekly_status", {}, need_key=True, timeout=45)
+            elif act == "lookup":
+                res = floor_mcp_call("agent_lookup", {"address": args.address}, need_key=False, timeout=30)
+            elif act == "troll-read":
+                res = floor_mcp_call("troll_read", {}, need_key=False, timeout=25)
+            elif act == "troll-speak":
+                if not args.text.strip():
+                    raise RuntimeError("--text is required for floor troll-speak")
+                res = floor_mcp_call("troll_speak", {"body": args.text.strip()}, need_key=True, timeout=25)
+            elif act == "dm-inbox":
+                res = floor_mcp_call("dm_inbox", {}, need_key=True, timeout=25)
+            elif act == "dm-thread":
+                if not args.peer.strip():
+                    raise RuntimeError("--peer <poa1...> is required for floor dm-thread")
+                res = floor_mcp_call("dm_thread", {"with": args.peer.strip()}, need_key=True, timeout=25)
+            elif act == "dm-send":
+                if not args.to.strip() or not args.text.strip():
+                    raise RuntimeError("--to <poa1...> and --text are required for floor dm-send")
+                res = floor_mcp_call("dm_send", {"to": args.to.strip(), "body": args.text.strip()}, need_key=True, timeout=25)
+            else:
+                raise RuntimeError(f"Unknown floor action: {act}")
+            print(json.dumps(res, indent=2))
         elif args.command == "pulse":
             mine_res = api_call("GET", "/api/hosted/mine") if args.mine else None
             me_res = api_call("GET", "/api/hosted/me")
             ch_res = api_call("GET", "/api/hosted/challenge")
             asgn_res = api_call("GET", "/api/hosted/assignments")
-            bal_res = api_call("GET", "/api/ballots", need_key=False)
+            try:
+                bal_res = api_call("GET", "/api/ballots", need_key=False)
+            except Exception as e:
+                bal_res = {"ballots": [], "ballots_error": redact(str(e))}
             seats = [audit_assignment_seat(s) for s in (asgn_res.get("assignments") or [])]
+            compact_ballots = []
+            for b in (bal_res.get("ballots") or []):
+                topics_obj = b.get("topics") or {}
+                clean_topics = {}
+                if isinstance(topics_obj, dict):
+                    for tid, tval in topics_obj.items():
+                        if isinstance(tval, dict):
+                            clean_topics[tid] = {
+                                "winner": tval.get("winner"),
+                                "total": tval.get("total"),
+                                "tally": tval.get("tally", {}),
+                            }
+                compact_ballots.append({
+                    "ballot_id": b.get("ballot_id") or b.get("ballot_txid"),
+                    "phase": b.get("phase"),
+                    "voting_ends": b.get("voting_ends"),
+                    "topics": clean_topics,
+                })
             summary = {
                 "epoch": ch_res.get("epoch"),
                 "answered": ch_res.get("answered"),
@@ -419,7 +528,7 @@ def main() -> None:
                 "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else None,
                 "open_grading_seats_count": len(seats),
                 "open_grading_seats": seats,
-                "open_ballots": bal_res.get("ballots", []),
+                "open_ballots": compact_ballots,
                 "notices": me_res.get("notices", []),
             }
             print(json.dumps(summary, indent=2))
