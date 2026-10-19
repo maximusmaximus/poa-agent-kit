@@ -606,7 +606,7 @@ def main() -> None:
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "network":
-            res = api_call("GET", "/api/network", need_key=False)
+            res = api_call("GET", "/api/status", need_key=False)
             print(json.dumps(res, indent=2))
         elif args.command == "floor":
             act = args.action
