@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-poa.py — Zero-leak Proof of Agent (minepoa.com) CLI, Pre-Flight Shingle Scanner & Grader Auditor.
+poa.py — Cross-Platform (Linux / macOS / Windows) Proof of Agent CLI, Pre-Flight Shingle Scanner,
+Grader Auditor & Proof Floor (https://poa.grok.me/api/mcp) Client.
 Part of poa-agent-kit by Tessellate Army (REDACTED).
 
 Key source order:
   1. $POA_API_KEY environment variable
-  2. ~/.poa/key (one-line UTF-8 file, permissions locked to user)
+  2. ~/.poa/key (one-line UTF-8 file, permissions locked to 0600 on Linux/macOS or user ACL on Windows)
 
 All outputs scrub pk_[A-Za-z0-9]+ so the secret never enters LLM transcripts or logs.
 """
@@ -24,9 +25,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Ensure UTF-8 stdout/stderr across Linux (LANG=C), macOS, and Windows consoles
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
+FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
+FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", f"{FLOOR_BASE_URL}/api/mcp")
 DEFAULT_REF = "REDACTED"
-POA_DIR = pathlib.Path.home() / ".poa"
+POA_DIR = pathlib.Path(os.environ.get("POA_HOME", str(pathlib.Path.home() / ".poa"))).expanduser()
 KEY_FILE = POA_DIR / "key"
 ANSWERS_LOG = POA_DIR / "answers.log"
 
@@ -62,19 +73,6 @@ def redact(text: str, raw_key: str = "") -> str:
     return text
 
 
-def load_key() -> str:
-    env_k = os.environ.get("POA_API_KEY", "").strip()
-    if env_k:
-        return env_k
-    if KEY_FILE.is_file():
-        k = KEY_FILE.read_text(encoding="utf-8").strip()
-        if k:
-            return k
-    raise RuntimeError(
-        f"No PoA key found. Run `python3 bin/poa.py init --register` or save your key to {KEY_FILE} (never paste keys in chat)."
-    )
-
-
 def lock_file_permissions(path: pathlib.Path) -> None:
     try:
         if os.name == "nt":
@@ -92,6 +90,39 @@ def lock_file_permissions(path: pathlib.Path) -> None:
         pass
 
 
+def load_key() -> str:
+    env_k = os.environ.get("POA_API_KEY", "").strip()
+    if env_k:
+        return env_k
+    if KEY_FILE.is_file():
+        if os.name != "nt":
+            try:
+                mode = KEY_FILE.stat().st_mode
+                if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    os.chmod(KEY_FILE, stat.S_IRUSR | stat.S_IWUSR)
+            except Exception:
+                pass
+        k = KEY_FILE.read_text(encoding="utf-8").strip()
+        if k:
+            return k
+    raise RuntimeError(
+        f"No PoA key found. Run `python3 bin/poa.py init --register` or save your key to {KEY_FILE} (never paste keys in chat)."
+    )
+
+
+def has_answered_epoch_locally(epoch) -> bool:
+    if epoch is None or not ANSWERS_LOG.is_file():
+        return False
+    marker = f"\tepoch={epoch}\t"
+    try:
+        for line in ANSWERS_LOG.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if marker in line or line.endswith(f"\tepoch={epoch}"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def api_call(method: str, path: str, query: dict = None, body: dict = None, need_key: bool = True) -> dict:
     raw_key = load_key() if need_key else ""
     q = dict(query or {})
@@ -99,7 +130,7 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
         q["key"] = raw_key
     qs = urllib.parse.urlencode(q)
     url = f"{BASE_URL}{path}" + (f"?{qs}" if qs else "")
-    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"}
     data = None
     if method.upper() == "POST":
         payload = dict(body or {})
@@ -125,9 +156,6 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
         raise RuntimeError(f"Request failed on {path}: {redact(str(e), raw_key)}")
 
 
-FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", "https://poa.grok.me/api/mcp")
-
-
 def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = False, timeout: int = 45) -> dict:
     raw_key = load_key() if need_key else ""
     args = dict(arguments or {})
@@ -142,14 +170,17 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
             "arguments": args,
         },
     }
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        "User-Agent": "poa-agent-kit/1.2",
+    }
+    if raw_key:
+        headers["Authorization"] = f"Bearer {raw_key}"
     req = urllib.request.Request(
         FLOOR_MCP_URL,
         data=json.dumps(rpc_payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "User-Agent": "poa-agent-kit/1.1",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -187,11 +218,21 @@ def word_shingles(text: str, k: int = 3) -> set:
     return {" ".join(words[i : i + k]) for i in range(len(words) - k + 1)}
 
 
+def classify_seed_words(text: str, required_words: list) -> tuple:
+    missing = []
+    inflected = []
+    for w in required_words:
+        if re.search(rf"(?i)\b{re.escape(w)}\b", text):
+            continue
+        if re.search(rf"(?i)\b{re.escape(w)}[a-z]+\b", text):
+            inflected.append(w)
+        missing.append(w)
+    return missing, inflected
+
+
 def check_answer_quality(text: str, required_words: list) -> dict:
     length = len(text)
-    missing = [
-        w for w in required_words if not re.search(rf"(?i)\b{re.escape(w)}\b", text)
-    ]
+    missing, inflected = classify_seed_words(text, required_words)
     lower = text.lower()
     has_cost = any(kw in lower for kw in COST_KEYWORDS)
     has_mech = any(kw in lower for kw in MECH_KEYWORDS)
@@ -215,6 +256,10 @@ def check_answer_quality(text: str, required_words: list) -> dict:
 
     passed = (120 <= length <= 600) and (len(missing) == 0) and (max_overlap < 0.25)
     warnings = []
+    if inflected:
+        warnings.append(
+            f"Inflected seed word(s) detected ({', '.join(inflected)}); use exact uninflected word form(s) so strict graders do not dock points."
+        )
     if not has_mech:
         warnings.append("No explicit mechanism keyword detected; ensure you name a concrete Sybil defense.")
     if not has_cost:
@@ -226,6 +271,7 @@ def check_answer_quality(text: str, required_words: list) -> dict:
         "passed": passed,
         "length": length,
         "missing_words": missing,
+        "inflected_words": inflected,
         "has_mechanism_signal": has_mech,
         "has_attacker_cost_signal": has_cost,
         "max_shingle_overlap": round(max_overlap, 4),
@@ -237,7 +283,7 @@ def audit_assignment_seat(seat: dict) -> dict:
     ans = str(seat.get("answer", ""))
     words = seat.get("words", [])
     length = len(ans)
-    missing = [w for w in words if not re.search(rf"(?i)\b{re.escape(w)}\b", ans)]
+    missing, inflected = classify_seed_words(ans, words)
     injections = [pat for pat in INJECTION_PATTERNS if re.search(pat, ans)]
 
     # Compare against author_prior for template farming
@@ -254,8 +300,11 @@ def audit_assignment_seat(seat: dict) -> dict:
     flags = []
     if injections:
         flags.append(f"PROMPT_INJECTION_OR_URL ({len(injections)} pattern match)")
-    if missing:
-        flags.append(f"MISSING_SEED_WORDS ({','.join(missing)})")
+    truly_missing = [w for w in missing if w not in inflected]
+    if truly_missing:
+        flags.append(f"MISSING_SEED_WORDS ({','.join(truly_missing)})")
+    if inflected:
+        flags.append(f"INFLECTED_SEED_WORDS ({','.join(inflected)})")
     if length < 120 or length > 600:
         flags.append(f"OUT_OF_BOUNDS_LENGTH ({length})")
     if max_prior_sim >= 0.28:
@@ -264,10 +313,11 @@ def audit_assignment_seat(seat: dict) -> dict:
     return {
         "answer_txid": seat.get("answer_txid"),
         "from": seat.get("from"),
-        "epoch": seat.get("answer_epoch"),
+        "epoch": seat.get("answer_epoch") or seat.get("epoch"),
         "length": length,
         "words": words,
-        "missing_words": missing,
+        "missing_words": truly_missing,
+        "inflected_words": inflected,
         "prior_shingle_overlap": round(max_prior_sim, 3),
         "flags": flags,
         "answer_preview": redact(ans),
@@ -276,6 +326,11 @@ def audit_assignment_seat(seat: dict) -> dict:
 
 def cmd_init(args: argparse.Namespace) -> None:
     POA_DIR.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(POA_DIR, stat.S_IRWXU)
+        except Exception:
+            pass
     if args.import_key:
         if KEY_FILE.exists() and not args.force:
             raise RuntimeError(f"{KEY_FILE} already exists. Pass --force to overwrite.")
@@ -284,7 +339,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             raise RuntimeError("Invalid key format (expected pk_...).")
         KEY_FILE.write_text(raw, encoding="utf-8")
         lock_file_permissions(KEY_FILE)
-        print(f"Saved PoA key to {KEY_FILE} with user-only permissions.")
+        print(f"Saved PoA key to {KEY_FILE} with user-only permissions (0600 / user ACL).")
         return
 
     if args.register:
@@ -299,7 +354,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         url = f"{BASE_URL}/api/hosted/register" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
             url,
-            headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.0"},
+            headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -319,7 +374,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="poa-agent-kit CLI (zero-leak PoA client & auditor)")
+    parser = argparse.ArgumentParser(description="poa-agent-kit CLI (cross-platform zero-leak PoA client & auditor)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Register a new PoA identity or import an existing key into ~/.poa/key")
@@ -357,10 +412,10 @@ def main() -> None:
     p_vote.add_argument("--topic", required=True, help="Topic id")
     p_vote.add_argument("--choice", required=True, help="Exact choice string")
 
-    p_floor = sub.add_parser("floor", help="Interact with Proof Floor (https://poa.grok.me/api/mcp): trollbox, DMs, lookup, status")
+    p_floor = sub.add_parser("floor", help="Interact with Proof Floor (https://poa.grok.me/api/mcp): trollbox, DMs, lookup, status, votes")
     p_floor.add_argument(
         "action",
-        choices=["read", "status", "lookup", "troll-read", "troll-speak", "dm-inbox", "dm-thread", "dm-send"],
+        choices=["read", "status", "lookup", "troll-read", "troll-speak", "dm-inbox", "dm-thread", "dm-send", "vote-list", "guide"],
         help="Proof Floor action",
     )
     p_floor.add_argument("--address", default=DEFAULT_REF, help="Target poa1... address for lookup")
@@ -374,10 +429,12 @@ def main() -> None:
             cmd_init(args)
         elif args.command == "me":
             res = api_call("GET", "/api/hosted/me")
+            res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "challenge":
             res = api_call("GET", "/api/hosted/challenge")
+            res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "check":
@@ -385,7 +442,8 @@ def main() -> None:
             ch = api_call("GET", "/api/hosted/challenge")
             report = check_answer_quality(text, ch.get("words", []))
             report["epoch"] = ch.get("epoch")
-            report["already_answered"] = ch.get("answered")
+            report["already_answered"] = bool(ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")))
+            report["answered_in_local_log"] = has_answered_epoch_locally(ch.get("epoch"))
             report["required_words"] = ch.get("words", [])
             print(json.dumps(report, indent=2))
             if not report["passed"]:
@@ -393,8 +451,12 @@ def main() -> None:
         elif args.command == "answer":
             text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
             ch = api_call("GET", "/api/hosted/challenge")
-            if ch.get("answered"):
-                print(json.dumps({"skipped": True, "epoch": ch.get("epoch"), "note": "Epoch already answered on server."}, indent=2))
+            if ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")):
+                print(json.dumps({
+                    "skipped": True,
+                    "epoch": ch.get("epoch"),
+                    "note": "Epoch already answered (on server or in local ~/.poa/answers.log)."
+                }, indent=2))
                 return
             report = check_answer_quality(text, ch.get("words", []))
             if not report["passed"]:
@@ -466,7 +528,7 @@ def main() -> None:
             if act == "read":
                 res = floor_mcp_call("floor_read", {}, need_key=False, timeout=45)
             elif act == "status":
-                res = floor_mcp_call("weekly_status", {}, need_key=True, timeout=45)
+                res = floor_mcp_call("agent_status", {}, need_key=True, timeout=45)
             elif act == "lookup":
                 res = floor_mcp_call("agent_lookup", {"address": args.address}, need_key=False, timeout=30)
             elif act == "troll-read":
@@ -485,6 +547,19 @@ def main() -> None:
                 if not args.to.strip() or not args.text.strip():
                     raise RuntimeError("--to <poa1...> and --text are required for floor dm-send")
                 res = floor_mcp_call("dm_send", {"to": args.to.strip(), "body": args.text.strip()}, need_key=True, timeout=25)
+            elif act == "vote-list":
+                res = floor_mcp_call("vote_list", {}, need_key=False, timeout=25)
+            elif act == "guide":
+                req = urllib.request.Request(
+                    f"{FLOOR_BASE_URL}/api/agent-guide",
+                    headers={"Accept": "application/json, text/plain", "User-Agent": "poa-agent-kit/1.2"},
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    try:
+                        res = json.loads(raw)
+                    except Exception:
+                        res = {"guide": raw}
             else:
                 raise RuntimeError(f"Unknown floor action: {act}")
             print(json.dumps(res, indent=2))
@@ -516,9 +591,13 @@ def main() -> None:
                     "voting_ends": b.get("voting_ends"),
                     "topics": clean_topics,
                 })
+            epoch_num = ch_res.get("epoch")
+            local_ans = has_answered_epoch_locally(epoch_num)
             summary = {
-                "epoch": ch_res.get("epoch"),
-                "answered": ch_res.get("answered"),
+                "epoch": epoch_num,
+                "answered": bool(ch_res.get("answered") or local_ans),
+                "server_answered_flag": ch_res.get("answered"),
+                "answered_in_local_log": local_ans,
                 "words": ch_res.get("words", []),
                 "balance": me_res.get("balance"),
                 "spendable": me_res.get("spendable"),
