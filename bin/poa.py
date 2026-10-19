@@ -21,6 +21,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -142,21 +143,28 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            clean = redact(raw, raw_key)
-            return json.loads(clean)
-    except urllib.error.HTTPError as e:
-        err_body = ""
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
         try:
-            err_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            err_body = str(e)
-        raise RuntimeError(f"HTTP {e.code} on {path}: {redact(err_body, raw_key)}")
-    except Exception as e:
-        raise RuntimeError(f"Request failed on {path}: {redact(str(e), raw_key)}")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                clean = redact(raw, raw_key)
+                return json.loads(clean)
+        except urllib.error.HTTPError as e:
+            if e.code in (502, 503, 504) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(e)
+            raise RuntimeError(f"HTTP {e.code} on {path}: {redact(err_body, raw_key)}")
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Request failed on {path}: {redact(str(e), raw_key)}")
 
 
 def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = False, timeout: int = 45) -> dict:
