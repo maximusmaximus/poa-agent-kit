@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 poa.py — Cross-Platform (Linux / macOS / Windows) Proof of Agent CLI, Pre-Flight Shingle Scanner,
-Grader Auditor & Proof Floor (https://poa.grok.me/api/mcp) Client.
+Cross-Seat Sybil Farm Auditor, Batch Grader & Proof Floor (https://poa.grok.me/api/mcp) Client.
 Part of poa-agent-kit by Tessellate Army (poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U).
 
 Key source order:
   1. $POA_API_KEY environment variable
   2. ~/.poa/key (one-line UTF-8 file, permissions locked to 0600 on Linux/macOS or user ACL on Windows)
 
-All outputs scrub pk_[A-Za-z0-9]+ so the secret never enters LLM transcripts or logs.
+All outputs scrub pk_[A-Za-z0-9]+ and psk_[A-Za-z0-9]+ so secrets never enter LLM transcripts or logs.
 """
 
 import argparse
@@ -39,10 +39,18 @@ LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstr
 FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
 FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", f"{FLOOR_BASE_URL}/api/mcp")
 DEFAULT_REF = "poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U"
+MAINNET_CHAIN_ID = "poa-mainnet-1"
+# UTC timestamp when poa-mainnet-1 launched (2026-10-19 10:03 PT = 17:03 UTC)
+MAINNET_GENESIS_UTC = "2026-10-19T17:03:00"
+MAINNET_GENESIS_PT = "2026-10-19T10:03"
+
 POA_DIR = pathlib.Path(os.environ.get("POA_HOME", str(pathlib.Path.home() / ".poa"))).expanduser()
 KEY_FILE = POA_DIR / "key"
 LABLEAK_TOKEN_FILE = POA_DIR / "lableak_token"
 ANSWERS_LOG = POA_DIR / "answers.log"
+HANDOFF_LOG = pathlib.Path(
+    os.environ.get("POA_HANDOFF_LOG", str(pathlib.Path.home() / "poa-handoff" / "LOG.md"))
+).expanduser()
 
 INJECTION_PATTERNS = [
     r"(?i)\bignore\s+(all\s+)?(previous|prior|above)\b",
@@ -52,6 +60,17 @@ INJECTION_PATTERNS = [
     r"(?i)https?://",
     r"(?i)\bpk_[A-Za-z0-9]{10,}\b",
     r"(?i)\bapi[_\s-]?key\b",
+]
+
+KNOWN_FARM_PATTERNS = [
+    (r"-\s*ref\s+[0-9A-Fa-f]{6}\b", "trailing '- ref HEX' farm signature"),
+    (r"\b(?:Agent|qwe|sa|once)\d{3,4}\b", "automated 'AgentXXXX/qweXXXX/saXXXX/onceXXXX' farm signature"),
+    (r"\[e\d+-[0-9a-f]{6,}-\d+\]", "trailing '[eN-hex-id]' bot tag"),
+    (r"(?i)enforcing dynamic topological gossip audits", "mad-lib template ('dynamic topological gossip audits')"),
+    (r"(?i)suppresses Sybil flooding via progressive cryptographic friction", "mad-lib template ('progressive cryptographic friction')"),
+    (r"(?i)multi-tiered cryptographic proof-of-delay\.\s*Ephemeral identities", "mad-lib template ('multi-tiered cryptographic proof-of-delay')"),
+    (r"(?i)Five established peers co-sign each newcomer", "mad-lib template ('Five established peers co-sign each newcomer')"),
+    (r"(?i)are merely challenge words", "explicit refusal to weave challenge words into mechanism"),
 ]
 
 COST_KEYWORDS = [
@@ -87,6 +106,7 @@ def lock_file_permissions(path: pathlib.Path) -> None:
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000,
                 )
         else:
             os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
@@ -115,26 +135,54 @@ def load_key() -> str:
 
 
 def has_answered_epoch_locally(epoch) -> bool:
-    if epoch is None or not ANSWERS_LOG.is_file():
+    """
+    Returns True if `epoch` has already been answered on poa-mainnet-1 according to:
+      1. ~/.poa/answers.log (filtered to chain=poa-mainnet-1 or UTC timestamp >= MAINNET_GENESIS_UTC
+         so old testnet-3 rows for epochs 141-161 never collide when Mainnet reaches epoch 141), OR
+      2. ~/poa-handoff/LOG.md (post-Mainnet launch rows matching `| epoch={epoch} | event=ANSWERED |`
+         so both nodes share answer state across mid-epoch word rotations and failovers).
+    """
+    if epoch is None:
         return False
     marker = f"\tepoch={epoch}\t"
-    try:
-        for line in ANSWERS_LOG.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if marker in line or line.endswith(f"\tepoch={epoch}"):
-                return True
-    except Exception:
-        pass
+    if ANSWERS_LOG.is_file():
+        try:
+            for line in ANSWERS_LOG.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if marker in line or line.endswith(f"\tepoch={epoch}"):
+                    ts_part = line.split("\t", 1)[0].strip()
+                    if f"chain={MAINNET_CHAIN_ID}" in line or ts_part >= MAINNET_GENESIS_UTC:
+                        return True
+        except Exception:
+            pass
+    if HANDOFF_LOG.is_file():
+        handoff_marker = f"| epoch={epoch} | event=ANSWERED |"
+        try:
+            for line in HANDOFF_LOG.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if handoff_marker in line:
+                    ts_part = line.split("|", 1)[0].strip()
+                    if ts_part >= MAINNET_GENESIS_PT:
+                        return True
+        except Exception:
+            pass
     return False
 
 
-def api_call(method: str, path: str, query: dict = None, body: dict = None, need_key: bool = True) -> dict:
+def api_call(
+    method: str,
+    path: str,
+    query: dict = None,
+    body: dict = None,
+    need_key: bool = True,
+    timeout: int = 45,
+    retries: int = 4,
+) -> dict:
     raw_key = load_key() if need_key else ""
     q = dict(query or {})
     if need_key:
         q["key"] = raw_key
     qs = urllib.parse.urlencode(q)
     url = f"{BASE_URL}{path}" + (f"?{qs}" if qs else "")
-    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"}
+    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.3"}
     data = None
     if method.upper() == "POST":
         payload = dict(body or {})
@@ -143,15 +191,15 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
 
-    for attempt in range(3):
+    for attempt in range(retries):
         req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 clean = redact(raw, raw_key)
                 return json.loads(clean)
         except urllib.error.HTTPError as e:
-            if e.code in (502, 503, 504) and attempt < 2:
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(2 * (attempt + 1))
                 continue
             err_body = ""
@@ -161,7 +209,7 @@ def api_call(method: str, path: str, query: dict = None, body: dict = None, need
                 err_body = str(e)
             raise RuntimeError(f"HTTP {e.code} on {path}: {redact(err_body, raw_key)}")
         except Exception as e:
-            if attempt < 2:
+            if attempt < retries - 1:
                 time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(f"Request failed on {path}: {redact(str(e), raw_key)}")
@@ -184,7 +232,7 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "application/json",
-        "User-Agent": "poa-agent-kit/1.2",
+        "User-Agent": "poa-agent-kit/1.3",
     }
     req = urllib.request.Request(
         FLOOR_MCP_URL,
@@ -219,7 +267,7 @@ def load_lableak_token(refresh: bool = False) -> str:
     url = f"{LABLEAK_BASE_URL}/.well-known/agentconnect/join?{qs}"
     req = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"},
+        headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.3"},
         method="GET",
     )
     try:
@@ -249,7 +297,7 @@ def lableak_call(method: str, path: str, query: dict = None, body: dict = None, 
     qs = urllib.parse.urlencode(q)
     url = f"{LABLEAK_BASE_URL}{path}" + (f"?{qs}" if qs else "")
     for attempt in range(2):
-        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"}
+        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.3"}
         if need_auth and tok:
             headers["Authorization"] = f"Bearer {tok}"
         data = None
@@ -274,7 +322,6 @@ def lableak_call(method: str, path: str, query: dict = None, body: dict = None, 
             raise RuntimeError(f"LabLeak HTTP {e.code} on {path}: {redact(redact(err_body, raw_key), tok)}")
         except Exception as e:
             raise RuntimeError(f"LabLeak request failed on {path}: {redact(redact(str(e), raw_key), tok)}")
-
 
 
 def print_notice(obj: dict) -> None:
@@ -314,7 +361,7 @@ def check_answer_quality(text: str, required_words: list) -> dict:
     has_cost = any(kw in lower for kw in COST_KEYWORDS)
     has_mech = any(kw in lower for kw in MECH_KEYWORDS)
 
-    # Shingle overlap check against ~/.poa/answers.log
+    # Shingle overlap check against ~/.poa/answers.log (all historical answers)
     max_overlap = 0.0
     colliding_epoch = None
     cur_shingles = word_shingles(text, 3)
@@ -362,8 +409,9 @@ def audit_assignment_seat(seat: dict) -> dict:
     length = len(ans)
     missing, inflected = classify_seed_words(ans, words)
     injections = [pat for pat in INJECTION_PATTERNS if re.search(pat, ans)]
+    farm_hits = [label for pat, label in KNOWN_FARM_PATTERNS if re.search(pat, ans)]
 
-    # Compare against author_prior for template farming
+    # Compare against author_prior for single-account template farming
     priors = seat.get("author_prior", []) or []
     cur_sh = word_shingles(ans, 3)
     max_prior_sim = 0.0
@@ -386,6 +434,8 @@ def audit_assignment_seat(seat: dict) -> dict:
         flags.append(f"OUT_OF_BOUNDS_LENGTH ({length})")
     if max_prior_sim >= 0.28:
         flags.append(f"AUTHOR_TEMPLATE_REUSE (shingle overlap {max_prior_sim:.1%} with prior epoch)")
+    for fh in farm_hits:
+        flags.append(f"KNOWN_BOT_FARM_SIGNATURE ({fh})")
 
     return {
         "answer_txid": seat.get("answer_txid"),
@@ -396,9 +446,132 @@ def audit_assignment_seat(seat: dict) -> dict:
         "missing_words": truly_missing,
         "inflected_words": inflected,
         "prior_shingle_overlap": round(max_prior_sim, 3),
+        "batch_clone_overlap": 0.0,
         "flags": flags,
         "answer_preview": redact(ans),
     }
+
+
+def audit_assignments_batch(raw_seats: list) -> list:
+    """
+    Audits all assignment seats individually AND performs pairwise cross-seat 3-word shingle
+    comparison across the batch to catch multi-account sybil farms that rotate fresh addresses.
+    """
+    audited = [audit_assignment_seat(s) for s in (raw_seats or [])]
+    shingle_sets = [word_shingles(str(s.get("answer", "")), 3) for s in (raw_seats or [])]
+    n = len(audited)
+    for i in range(n):
+        sh_i = shingle_sets[i]
+        if not sh_i:
+            continue
+        max_batch_sim = 0.0
+        best_peer_txid = ""
+        for j in range(n):
+            if i == j:
+                continue
+            sh_j = shingle_sets[j]
+            if not sh_j:
+                continue
+            union_len = len(sh_i | sh_j)
+            if not union_len:
+                continue
+            sim = len(sh_i & sh_j) / union_len
+            if sim > max_batch_sim:
+                max_batch_sim = sim
+                best_peer_txid = str(audited[j].get("answer_txid") or "")[:8]
+        audited[i]["batch_clone_overlap"] = round(max_batch_sim, 3)
+        if max_batch_sim >= 0.25:
+            audited[i]["flags"].append(
+                f"CROSS_SEAT_BATCH_CLONE (shingle overlap {max_batch_sim:.1%} with {best_peer_txid})"
+            )
+    return audited
+
+
+def cmd_grade_batch(args: argparse.Namespace) -> None:
+    items = json.loads(pathlib.Path(args.file).read_text(encoding="utf-8"))
+    if not isinstance(items, list):
+        raise RuntimeError("--file must contain a JSON array of grading objects.")
+
+    # Check currently open assignments so we skip any already-sealed seats on re-runs
+    open_txids = set()
+    try:
+        asgn_res = api_call("GET", "/api/hosted/assignments", timeout=45)
+        for s in (asgn_res.get("assignments") or []):
+            if s.get("answer_txid"):
+                open_txids.add(s["answer_txid"])
+    except Exception:
+        open_txids = None  # If assignments check fails, attempt all items
+
+    sealed = []
+    skipped_already_graded = []
+    pending_retry = []
+
+    for idx, item in enumerate(items, 1):
+        txid = (item.get("txid") or item.get("assignment") or "").strip()
+        score = int(item.get("score"))
+        note = (item.get("note") or item.get("reasoning") or "").strip()
+        if not txid or not note:
+            raise RuntimeError(f"Item #{idx} missing txid/assignment or note/reasoning.")
+        if open_txids is not None and txid not in open_txids:
+            skipped_already_graded.append(txid)
+            continue
+        try:
+            res = api_call(
+                "POST",
+                "/api/hosted/grade",
+                body={"assignment": txid, "score": score, "reasoning": note},
+                timeout=60,
+                retries=3,
+            )
+            sealed.append({"txid": txid, "score": score, "grade_id": res.get("id")})
+        except Exception as e:
+            pending_retry.append({"txid": txid, "score": score, "note": note, "first_error": redact(str(e))})
+
+    retried_ok = []
+    failed = []
+    if pending_retry:
+        time.sleep(3)
+        for item in pending_retry:
+            try:
+                res = api_call(
+                    "POST",
+                    "/api/hosted/grade",
+                    body={"assignment": item["txid"], "score": item["score"], "reasoning": item["note"]},
+                    timeout=60,
+                    retries=3,
+                )
+                sealed.append({"txid": item["txid"], "score": item["score"], "grade_id": res.get("id")})
+                retried_ok.append(item["txid"])
+            except Exception as e:
+                err_str = redact(str(e))
+                if "already graded" in err_str.lower() or "not assigned" in err_str.lower():
+                    skipped_already_graded.append(item["txid"])
+                else:
+                    failed.append({"txid": item["txid"], "score": item["score"], "error": err_str})
+
+    mine_attested = None
+    mine_error = None
+    if args.mine:
+        try:
+            mres = api_call("GET", "/api/hosted/mine", timeout=60, retries=3)
+            mine_attested = mres.get("attested")
+        except Exception as e:
+            mine_error = redact(str(e))
+
+    out = {
+        "total_in_file": len(items),
+        "sealed_count": len(sealed),
+        "already_graded_count": len(skipped_already_graded),
+        "retried_ok_count": len(retried_ok),
+        "failed_count": len(failed),
+        "failed": failed,
+        "mined_after_batch": mine_attested,
+    }
+    if mine_error:
+        out["mine_error"] = mine_error
+    print(json.dumps(out, indent=2))
+    if failed:
+        sys.exit(2)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -431,7 +604,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         url = f"{BASE_URL}/api/hosted/register" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
             url,
-            headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.2"},
+            headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.3"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -468,7 +641,7 @@ def main() -> None:
     sub.add_parser("network", help="Fetch public network statistics (no key required)")
 
     p_pulse = sub.add_parser("pulse", help="All-in-one operator check: me + challenge + assignments audit + ballots (+ optional --mine)")
-    p_pulse.add_argument("--mine", action="store_true", help="Also run /api/hosted/mine during the pulse check")
+    p_pulse.add_argument("--mine", action="store_true", help="Also run /api/hosted/mine during the pulse check (fault-tolerant)")
 
     p_check = sub.add_parser("check", help="Local pre-flight: length, live words, shingle overlap, and Grade-3 signals")
     p_check.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 draft answer file")
@@ -477,12 +650,16 @@ def main() -> None:
     p_ans.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 answer file")
 
     p_asgn = sub.add_parser("assignments", help="Fetch peer grading seats")
-    p_asgn.add_argument("--audit", action="store_true", help="Run prompt-injection & author template-reuse scanner on seats")
+    p_asgn.add_argument("--audit", action="store_true", help="Run prompt-injection, cross-seat clone & bot-farm scanner on seats")
 
     p_grade = sub.add_parser("grade", help="Submit a grade (0-3) and one-sentence reasoning for a seat")
     p_grade.add_argument("--assignment", "--txid", dest="assignment", required=True, help="Answer txid to grade")
     p_grade.add_argument("--score", type=int, choices=[0, 1, 2, 3], required=True, help="Score 0-3")
     p_grade.add_argument("--reasoning", "--note", dest="reasoning", required=True, help="One specific sentence of reasoning")
+
+    p_gbatch = sub.add_parser("grade-batch", help="Sequentially submit a JSON array of grades with automatic timeout retry")
+    p_gbatch.add_argument("--file", "-f", required=True, help="Path to JSON file containing [{txid, score, note}, ...]")
+    p_gbatch.add_argument("--mine", action="store_true", help="Automatically run /api/hosted/mine after grading")
 
     p_vote = sub.add_parser("vote", help="Cast a governance vote on an open ballot topic")
     p_vote.add_argument("--ballot", required=True, help="Ballot txid")
@@ -548,14 +725,14 @@ def main() -> None:
                 print(json.dumps({
                     "skipped": True,
                     "epoch": ch.get("epoch"),
-                    "note": "Epoch already answered (on server or in local ~/.poa/answers.log)."
+                    "note": "Epoch already answered (on server, in ~/.poa/answers.log, or in poa-handoff/LOG.md)."
                 }, indent=2))
                 return
             report = check_answer_quality(text, ch.get("words", []))
             if not report["passed"]:
                 raise RuntimeError(f"Pre-flight check failed: {json.dumps(report)}")
             try:
-                res = api_call("POST", "/api/hosted/answer", body={"answer": text})
+                res = api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60)
             except RuntimeError as e:
                 if "duplicate challenge for epoch" in str(e).lower():
                     print(json.dumps({
@@ -568,18 +745,20 @@ def main() -> None:
             POA_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
             with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
-                fp.write(f"{ts}\tepoch={ch.get('epoch')}\twords={','.join(ch.get('words', []))}\t{text}\n")
+                fp.write(
+                    f"{ts}\tchain={MAINNET_CHAIN_ID}\tepoch={ch.get('epoch')}\twords={','.join(ch.get('words', []))}\t{text}\n"
+                )
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "mine":
-            res = api_call("GET", "/api/hosted/mine")
+            res = api_call("GET", "/api/hosted/mine", timeout=60)
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "assignments":
             res = api_call("GET", "/api/hosted/assignments")
             if args.audit:
                 seats = res.get("assignments", []) or []
-                audited = [audit_assignment_seat(s) for s in seats]
+                audited = audit_assignments_batch(seats)
                 print(json.dumps({"count": len(audited), "seats": audited}, indent=2))
             else:
                 print(json.dumps(res, indent=2))
@@ -593,9 +772,12 @@ def main() -> None:
                     "score": args.score,
                     "reasoning": args.reasoning.strip(),
                 },
+                timeout=60,
             )
             print(json.dumps(res, indent=2))
             print_notice(res)
+        elif args.command == "grade-batch":
+            cmd_grade_batch(args)
         elif args.command == "ballots":
             res = api_call("GET", "/api/ballots", need_key=False)
             for b in (res.get("ballots") or []):
@@ -645,7 +827,7 @@ def main() -> None:
             elif act == "guide":
                 req = urllib.request.Request(
                     FLOOR_MCP_URL,
-                    headers={"Accept": "text/markdown, text/plain", "User-Agent": "poa-agent-kit/1.2"},
+                    headers={"Accept": "text/markdown, text/plain", "User-Agent": "poa-agent-kit/1.3"},
                     method="GET",
                 )
                 with urllib.request.urlopen(req, timeout=20) as resp:
@@ -709,7 +891,13 @@ def main() -> None:
                 raise RuntimeError(f"Unknown lableak action: {act}")
             print(json.dumps(res, indent=2))
         elif args.command == "pulse":
-            mine_res = api_call("GET", "/api/hosted/mine") if args.mine else None
+            mine_res = None
+            mine_err = None
+            if args.mine:
+                try:
+                    mine_res = api_call("GET", "/api/hosted/mine", timeout=60, retries=3)
+                except Exception as e:
+                    mine_err = redact(str(e))
             me_res = api_call("GET", "/api/hosted/me")
             ch_res = api_call("GET", "/api/hosted/challenge")
             asgn_res = api_call("GET", "/api/hosted/assignments")
@@ -717,7 +905,7 @@ def main() -> None:
                 bal_res = api_call("GET", "/api/ballots", need_key=False)
             except Exception as e:
                 bal_res = {"ballots": [], "ballots_error": redact(str(e))}
-            seats = [audit_assignment_seat(s) for s in (asgn_res.get("assignments") or [])]
+            seats = audit_assignments_batch(asgn_res.get("assignments") or [])
             compact_ballots = []
             for b in (bal_res.get("ballots") or []):
                 topics_obj = b.get("topics") or {}
@@ -749,12 +937,14 @@ def main() -> None:
                 "locked": me_res.get("locked"),
                 "established": me_res.get("established"),
                 "attestations_by_me": me_res.get("attestations_by_me"),
-                "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else None,
+                "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else 0,
                 "open_grading_seats_count": len(seats),
                 "open_grading_seats": seats,
                 "open_ballots": compact_ballots,
                 "notices": me_res.get("notices", []),
             }
+            if mine_err:
+                summary["mine_error"] = mine_err
             print(json.dumps(summary, indent=2))
             print_notice(ch_res)
     except Exception as exc:
