@@ -507,11 +507,11 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
     pending_retry = []
 
     for idx, item in enumerate(items, 1):
-        txid = (item.get("txid") or item.get("assignment") or "").strip()
+        txid = (item.get("txid") or item.get("answer_txid") or item.get("assignment") or "").strip()
         score = int(item.get("score"))
         note = (item.get("note") or item.get("reasoning") or "").strip()
         if not txid or not note:
-            raise RuntimeError(f"Item #{idx} missing txid/assignment or note/reasoning.")
+            raise RuntimeError(f"Item #{idx} missing txid/answer_txid/assignment or note/reasoning.")
         if open_txids is not None and txid not in open_txids:
             skipped_already_graded.append(txid)
             continue
