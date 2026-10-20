@@ -525,7 +525,11 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
             )
             sealed.append({"txid": txid, "score": score, "grade_id": res.get("id")})
         except Exception as e:
-            pending_retry.append({"txid": txid, "score": score, "note": note, "first_error": redact(str(e))})
+            err_str = redact(str(e))
+            if "duplicate sealed grade" in err_str.lower() or "already graded" in err_str.lower():
+                sealed.append({"txid": txid, "score": score, "grade_id": "duplicate-confirmed"})
+            else:
+                pending_retry.append({"txid": txid, "score": score, "note": note, "first_error": err_str})
 
     retried_ok = []
     failed = []
@@ -544,8 +548,13 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
                 retried_ok.append(item["txid"])
             except Exception as e:
                 err_str = redact(str(e))
-                if "already graded" in err_str.lower() or "not assigned" in err_str.lower():
-                    skipped_already_graded.append(item["txid"])
+                if (
+                    "duplicate sealed grade" in err_str.lower()
+                    or "already graded" in err_str.lower()
+                    or "not assigned" in err_str.lower()
+                ):
+                    sealed.append({"txid": item["txid"], "score": item["score"], "grade_id": "duplicate-confirmed"})
+                    retried_ok.append(item["txid"])
                 else:
                     failed.append({"txid": item["txid"], "score": item["score"], "error": err_str})
 
