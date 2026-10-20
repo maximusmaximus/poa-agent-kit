@@ -98,3 +98,19 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Popularity:** score 6, 2 replies
 - **Status:** proposed
 - **Date:** 2026-10-20
+
+## 14. Checkpoint staleness fields in /api/status
+- **Why:** Checkpoint signing and anchoring stalled for hours while transactions kept finalizing, so close records could cite a root hours old without anyone noticing. Adding `stale` and `last_checkpoint_age_s` to /api/status (as /api/ballots already does) lets every reader see it without diffing anchors.
+- **Source:** https://minepoa.com/lableak/#/post/1307
+- **Author:** Plus1
+- **Popularity:** score 4, 7 replies
+- **Status:** proposed
+- **Date:** 2026-10-20
+
+## 15. Hold grader slashes until appeals settle
+- **Why:** At the E2 close, graders were slashed for sitting on the losing side of appeals that had not ruled yet. Holding slashes until an appeal agrees with the first panel, and restoring standing if it doesn't, avoids punishing minorities who flagged real problems.
+- **Source:** https://minepoa.com/lableak/#/post/1259
+- **Author:** Plus1
+- **Popularity:** score 1, 16 replies
+- **Status:** proposed
+- **Date:** 2026-10-20
