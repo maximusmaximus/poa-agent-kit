@@ -15,6 +15,8 @@ All outputs scrub pk_[A-Za-z0-9]+ and psk_[A-Za-z0-9]+ so secrets never enter LL
 import argparse
 import datetime
 import getpass
+import hashlib
+import io
 import json
 import os
 import pathlib
@@ -188,6 +190,49 @@ HTTP_CONNECT_TIMEOUT = float(os.environ.get("POA_HTTP_TIMEOUT", "25"))
 MCP_URL = os.environ.get("POA_MCP_URL", f"{BASE_URL}/mcp")
 
 
+# ---------------------------------------------------------------------------
+# Transport: HTTP/2 via httpx when installed (pip install "httpx[http2]"), else urllib.
+# Errors are normalised to urllib types so _classify() treats both paths the same.
+# ---------------------------------------------------------------------------
+try:  # optional dependency
+    import httpx as _httpx  # type: ignore
+    try:
+        import h2  # noqa: F401  type: ignore
+        _HTTP2 = True
+    except Exception:
+        _HTTP2 = False
+except Exception:
+    _httpx = None
+    _HTTP2 = False
+
+
+def http_transport() -> str:
+    if os.environ.get("POA_NO_HTTPX"):
+        return "urllib"
+    if _httpx is None:
+        return "urllib"
+    return "httpx-h2" if _HTTP2 else "httpx-h1"
+
+
+def http_request(method: str, url: str, data: bytes = None, headers: dict = None, timeout: float = 30) -> bytes:
+    """One HTTP request; returns body bytes or raises urllib.error.HTTPError / TimeoutError / OSError."""
+    headers = dict(headers or {})
+    if http_transport() != "urllib":
+        try:
+            with _httpx.Client(http2=_HTTP2, timeout=timeout, follow_redirects=True) as c:
+                r = c.request(method.upper(), url, content=data, headers=headers)
+        except _httpx.TimeoutException as e:
+            raise TimeoutError(f"timed out ({type(e).__name__})")
+        except _httpx.HTTPError as e:
+            raise OSError(f"{type(e).__name__}: {e}")
+        if r.status_code >= 400:
+            raise urllib.error.HTTPError(url, r.status_code, r.reason_phrase or "", r.headers, io.BytesIO(r.content))
+        return r.content
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
 def mcp_fallback_enabled() -> bool:
     return os.environ.get("POA_MCP_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -260,15 +305,13 @@ def api_call(
 
     last = None
     for attempt in range(max(1, retries)):
-        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                clean = redact(raw, raw_key)
-                try:
-                    return json.loads(clean)
-                except ValueError:
-                    raise PoaHTTPError("server", f"Non-JSON response on {path}: {clean[:300]}")
+            raw = http_request(method, url, data=data, headers=headers, timeout=timeout).decode("utf-8", errors="replace")
+            clean = redact(raw, raw_key)
+            try:
+                return json.loads(clean)
+            except ValueError:
+                raise PoaHTTPError("server", f"Non-JSON response on {path}: {clean[:300]}")
         except Exception as e:
             last = _classify(e, path, raw_key)
             if last.kind in ("auth", "client"):
@@ -323,16 +366,144 @@ def mcp_call(tool: str, arguments: dict = None, need_key: bool = True, timeout: 
     return res
 
 
-def read_challenge() -> dict:
-    """GET /api/hosted/challenge, falling back to MCP poa_challenge on server/timeout errors (flagged)."""
+CACHE_DIR = POA_DIR / "cache"
+
+
+def epoch_cache_path(epoch) -> pathlib.Path:
+    return CACHE_DIR / f"epoch-{epoch}.json"
+
+
+def load_epoch_cache(epoch=None) -> dict:
+    """Cached challenge for `epoch` (or the newest cached epoch when None); {} if none."""
+    if not CACHE_DIR.is_dir():
+        return {}
+    if epoch is None:
+        nums = []
+        for f in CACHE_DIR.glob("epoch-*.json"):
+            try:
+                nums.append(int(f.stem.split("-", 1)[1]))
+            except ValueError:
+                pass
+        if not nums:
+            return {}
+        epoch = max(nums)
+    f = epoch_cache_path(epoch)
     try:
-        return api_call("GET", "/api/hosted/challenge")
+        return json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
+    except Exception:
+        return {}
+
+
+def save_epoch_cache(epoch, **fields) -> dict:
+    """Merge fields into ~/.poa/cache/epoch-<n>.json (atomic write, 0600). Never stores the key."""
+    if epoch is None:
+        return {}
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cur = load_epoch_cache(epoch)
+    cur.update({k: v for k, v in fields.items() if v is not None})
+    cur["epoch"] = epoch
+    f = epoch_cache_path(epoch)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+    lock_file_permissions(tmp)
+    os.replace(tmp, f)
+    return cur
+
+
+def cache_challenge(ch: dict) -> None:
+    """Save words+seed the moment any challenge read succeeds (first seen + last seen)."""
+    try:
+        ep = ch.get("epoch")
+        if ep is None or not ch.get("words"):
+            return
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cur = load_epoch_cache(ep)
+        fields = {k: ch.get(k) for k in ("words", "seed", "challenge", "prompt", "challenge_txid", "txid") if ch.get(k) is not None}
+        if cur.get("words") and cur.get("words") != ch.get("words"):
+            fields["previous_words"] = cur.get("words")
+        fields["last_read"] = now
+        fields.setdefault("first_read", cur.get("first_read") or now)
+        if ch.get("answered"):
+            fields["server_answered"] = True
+        save_epoch_cache(ep, **fields)
+    except Exception:
+        pass
+
+
+def read_challenge(retries: int = None) -> dict:
+    """GET /api/hosted/challenge (cached on success), falling back to MCP poa_challenge (flagged, last resort)."""
+    try:
+        res = api_call("GET", "/api/hosted/challenge", retries=retries)
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
             res = mcp_call("poa_challenge", {})
             res["_rest_error"] = str(e)[:200]
-            return res
-        raise
+        else:
+            raise
+    cache_challenge(res)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Keyless explorer confirmation (public read node; lags a few minutes)
+# ---------------------------------------------------------------------------
+EXPLORER_MIN_WAIT = int(os.environ.get("POA_EXPLORER_MIN_WAIT", "180"))
+EXPLORER_MAX_WAIT = int(os.environ.get("POA_EXPLORER_MAX_WAIT", "900"))
+
+
+def explorer_get(path: str, timeout: float = 40):
+    try:
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout)
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as e:
+        return {"error": redact(str(_classify(e, path, "")))[:200]}
+
+
+def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
+    """Look for our `challenge` tx for `epoch` on the keyless explorer. found: True/False/None(unknown)."""
+    if txid:
+        t = explorer_get(f"/api/explorer/tx/{txid}")
+        if isinstance(t, dict) and not t.get("error") and (t.get("id") or t.get("tx")):
+            return {"found": True, "via": "explorer/tx", "txid": txid, "tx": {k: (t.get("tx") or t).get(k) for k in ("id", "type", "epoch", "ts", "atts", "final")}}
+    if not address:
+        return {"found": None, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}
+    d = explorer_get(f"/api/explorer/address/{address}")
+    if not isinstance(d, dict) or d.get("error"):
+        return {"found": None, "error": (d or {}).get("error") if isinstance(d, dict) else "bad explorer reply"}
+    for t in d.get("txs") or []:
+        if t.get("type") == "challenge" and str(t.get("epoch")) == str(epoch):
+            return {"found": True, "via": "explorer/address", "txid": t.get("id"), "tx": {k: t.get(k) for k in ("id", "type", "epoch", "ts", "atts", "final")},
+                    "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height")}
+    return {"found": False, "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height"), "txs_listed": len(d.get("txs") or [])}
+
+
+def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wait: int = None, sleep=time.sleep) -> dict:
+    """Wait >= min_wait (explorer lags), then poll the explorer (and /challenge when it answers) until max_wait.
+    Never sends anything. Result landed: True / None (unknown); never False from silence alone."""
+    min_wait = EXPLORER_MIN_WAIT if min_wait is None else min_wait
+    max_wait = EXPLORER_MAX_WAIT if max_wait is None else max_wait
+    addr = local_address()
+    waited, checks = 0, []
+    if min_wait:
+        sleep(min_wait)
+        waited += min_wait
+    while True:
+        r = explorer_find_answer(addr, epoch, txid)
+        checks.append({"t": waited, "found": r.get("found"), "err": r.get("error")})
+        if r.get("found"):
+            return {"landed": True, "how": "explorer", "evidence": r, "waited_s": waited, "checks": checks}
+        try:
+            ch = api_call("GET", "/api/hosted/challenge", timeout=20, retries=1)
+            cache_challenge(ch)
+            if ch.get("epoch") == epoch and ch.get("answered"):
+                return {"landed": True, "how": "challenge-read-back", "waited_s": waited, "checks": checks}
+        except Exception:
+            pass
+        if waited >= max_wait:
+            return {"landed": None, "how": "unconfirmed", "note": "not on explorer yet; timeout = unknown, NOT failed. Do not resend; re-run `answer-status` later.", "waited_s": waited, "checks": checks}
+        step = min(60, max(1, max_wait - waited))
+        sleep(step)
+        waited += step
 
 
 def read_open_seats():
@@ -351,78 +522,96 @@ def _verify_rounds():
     return int(os.environ.get("POA_VERIFY_ROUNDS", "4"))
 
 
-def submit_answer_safely(text: str, epoch) -> dict:
-    """Submit an answer at most once per confirmed-unanswered state.
+STALE_MARKERS = ("stale seed", "stale words", "wrong words", "words changed", "seed mismatch", "stale challenge", "epoch closed", "not the current epoch")
+DUP_MARKERS = ("duplicate challenge for epoch", "already answered", "duplicate answer")
 
-    Before every resend we read the challenge back: if `answered` is true for the same epoch,
-    the earlier attempt landed and we stop. Returns {"landed": bool, "result"|"error", ...}.
+
+def submit_answer_safely(text: str, epoch) -> dict:
+    """Send the answer ONCE for this epoch and record it in ~/.poa/cache/epoch-<n>.json.
+
+    - If the cache already records a send for this epoch, do NOT send again (returns sent_before).
+    - Duplicate reply = landed. Stale-seed/closed-epoch reply = stop (landed False, no retry).
+    - Timeout / 5xx = unknown: confirm via the keyless explorer, never blind-resend.
+    MCP is used only when POA_MCP_FALLBACK=1 and REST failed before reaching the server (network).
     """
-    attempts = []
-    max_sends = int(os.environ.get("POA_MAX_SENDS", "2"))
-    for send in range(max_sends):
+    cache = load_epoch_cache(epoch)
+    if cache.get("sent_at"):
+        return {"landed": cache.get("landed"), "how": "sent_before", "note": f"already sent for epoch {epoch} at {cache['sent_at']} ({cache.get('send_outcome')}); not resending",
+                "txid": cache.get("txid_answer")}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    save_epoch_cache(epoch, sent_at=now, send_outcome="sending", answer_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+    try:
         try:
-            if send > 0 and mcp_fallback_enabled() and attempts and attempts[-1]["kind"] in ("server", "network"):
+            res = api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1)
+        except PoaHTTPError as e:
+            if e.kind == "network" and mcp_fallback_enabled():
                 res = mcp_call("poa_answer", {"answer": text}, timeout=60)
             else:
-                res = api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1)
-            return {"landed": True, "how": "response", "result": res, "attempts": attempts}
-        except PoaHTTPError as e:
-            low = str(e).lower()
-            if "duplicate challenge for epoch" in low or "already answered" in low:
-                return {"landed": True, "how": "duplicate", "note": "Server says this epoch is already answered.", "attempts": attempts}
-            attempts.append({"send": send + 1, "kind": e.kind, "error": str(e)[:300]})
-            if e.kind in ("auth", "client"):
-                return {"landed": False, "error": str(e), "kind": e.kind, "attempts": attempts}
-        # Ambiguous failure: read back before deciding to resend
-        state = None
-        for r in range(_verify_rounds()):
-            _backoff(r)
-            try:
-                ch = read_challenge()
-            except PoaHTTPError as ve:
-                state = {"unknown": str(ve)[:200]}
-                continue
-            if ch.get("epoch") != epoch:
-                return {"landed": False, "error": f"epoch moved from {epoch} to {ch.get('epoch')} during retry; not resending", "attempts": attempts}
-            if ch.get("answered"):
-                return {"landed": True, "how": "read-back", "note": "Challenge shows answered=true after an ambiguous failure.", "attempts": attempts}
-            state = {"answered": False}
-            break
-        if not state or "unknown" in state:
-            return {"landed": None, "error": "write failed and state could not be read back; NOT resending (avoid double submission). Re-run later.", "attempts": attempts}
-    return {"landed": False, "error": "write failed; read-back confirms not answered; send budget exhausted", "attempts": attempts}
+                raise
+        txid = res.get("txid") or res.get("id") if isinstance(res, dict) else None
+        save_epoch_cache(epoch, send_outcome="accepted", landed=True, txid_answer=txid)
+        return {"landed": True, "how": "response", "result": res, "txid": txid}
+    except PoaHTTPError as e:
+        low = str(e).lower()
+        if any(m in low for m in DUP_MARKERS):
+            save_epoch_cache(epoch, send_outcome="duplicate", landed=True)
+            return {"landed": True, "how": "duplicate", "note": "Server says this epoch is already answered."}
+        if any(m in low for m in STALE_MARKERS):
+            save_epoch_cache(epoch, send_outcome="stale", landed=False, error=str(e)[:300])
+            return {"landed": False, "how": "stale", "error": str(e)[:300], "kind": e.kind}
+        if e.kind in ("auth", "client"):
+            save_epoch_cache(epoch, send_outcome="rejected", landed=False, error=str(e)[:300])
+            return {"landed": False, "error": str(e)[:300], "kind": e.kind}
+        save_epoch_cache(epoch, send_outcome=f"unknown-{e.kind}", error=str(e)[:300])
+        return {"landed": None, "how": "unknown", "kind": e.kind, "error": str(e)[:300]}
+
+
+def grade_shown_on_assignments(txid: str) -> dict:
+    """A grade counts as done only when a successful /assignments read no longer deals this seat."""
+    try:
+        seats = read_open_seats()
+    except PoaHTTPError as e:
+        return {"confirmed": None, "error": str(e)[:200]}
+    return {"confirmed": txid not in seats, "open_seats": len(seats)}
 
 
 def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
-    attempts = []
-    for send in range(int(os.environ.get("POA_MAX_SENDS", "2"))):
-        try:
-            if send > 0 and mcp_fallback_enabled() and attempts and attempts[-1]["kind"] in ("server", "network"):
-                res = mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60)
-            else:
-                res = api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1)
-            return {"landed": True, "how": "response", "result": res}
-        except PoaHTTPError as e:
-            low = str(e).lower()
-            if "duplicate sealed grade" in low or "already graded" in low:
-                return {"landed": True, "how": "duplicate"}
-            attempts.append({"send": send + 1, "kind": e.kind, "error": str(e)[:300]})
-            if e.kind in ("auth", "client"):
-                return {"landed": False, "error": str(e), "kind": e.kind, "attempts": attempts}
-        known = False
-        for r in range(_verify_rounds()):
-            _backoff(r)
+    """Send a grade ONCE, then count it done only when /assignments no longer deals the seat.
+    landed: True (assignments confirms) / None (sent or ambiguous, not yet confirmed) / False (rejected)."""
+    sent = None
+    try:
+        res = api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1)
+        sent = {"how": "response", "result": res}
+    except PoaHTTPError as e:
+        low = str(e).lower()
+        if "duplicate sealed grade" in low or "already graded" in low:
+            sent = {"how": "duplicate"}
+        elif e.kind == "network" and mcp_fallback_enabled():
             try:
-                seats = read_open_seats()
-            except PoaHTTPError:
-                continue
-            known = True
-            if txid not in seats:
-                return {"landed": True, "how": "read-back", "note": "Seat no longer listed after an ambiguous failure.", "attempts": attempts}
+                sent = {"how": "mcp", "result": mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60)}
+            except PoaHTTPError as e2:
+                sent = {"how": "unknown", "error": str(e2)[:300]}
+        elif e.kind in ("auth", "client"):
+            return {"landed": False, "error": str(e)[:300], "kind": e.kind}
+        else:
+            sent = {"how": "unknown", "error": str(e)[:300], "kind": e.kind}
+    conf = {"confirmed": None}
+    for r in range(_verify_rounds()):
+        conf = grade_shown_on_assignments(txid)
+        if conf.get("confirmed") is not None:
             break
-        if not known:
-            return {"landed": None, "error": "grade failed and seats could not be read back; NOT resending.", "attempts": attempts}
-    return {"landed": False, "error": "grade failed; seat still open; send budget exhausted", "attempts": attempts}
+        _backoff(r)
+    out = dict(sent)
+    out["assignments_check"] = conf
+    if conf.get("confirmed"):
+        out["landed"] = True
+    elif conf.get("confirmed") is False and sent["how"] == "unknown":
+        out["landed"] = False
+        out["note"] = "seat still dealt after an ambiguous send; safe to grade again next run"
+    else:
+        out["landed"] = None
+        out["note"] = "not counted as done until /assignments confirms; do not resend now"
+    return out
 
 
 def safe_mine() -> dict:
@@ -1343,6 +1532,12 @@ def main() -> None:
     p_check.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 draft answer file")
 
     p_ans = sub.add_parser("answer", help="Submit epoch challenge answer from UTF-8 file")
+    p_ans.add_argument("--epoch", type=int, default=None, help="Use the cached challenge for this epoch if live reads fail")
+    p_ans.add_argument("--no-confirm", action="store_true", help="Skip the >=3 min explorer confirmation wait")
+    p_ans.add_argument("--read-retries", type=int, default=3, help="Live challenge read attempts before falling back to cache")
+    p_st = sub.add_parser("answer-status", help="Keyless explorer check: did our answer for an epoch land? (never sends)")
+    p_st.add_argument("--epoch", type=int, default=None)
+    p_st.add_argument("--wait", type=int, default=0, help="Keep polling up to N seconds")
     p_ans.add_argument("--file", "--text-file", "-f", dest="file", required=True, help="Path to UTF-8 answer file")
 
     p_asgn = sub.add_parser("assignments", help="Fetch peer grading seats")
@@ -1445,37 +1640,64 @@ def main() -> None:
                 sys.exit(2)
         elif args.command == "answer":
             text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
-            ch = read_challenge()
-            if ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")):
-                print(json.dumps({
-                    "skipped": True,
-                    "epoch": ch.get("epoch"),
-                    "note": "Epoch already answered (on server, in ~/.poa/answers.log, or in poa-handoff/LOG.md)."
-                }, indent=2))
+            ch, source, read_err = None, "live", None
+            try:
+                ch = read_challenge(retries=args.read_retries)
+            except PoaHTTPError as e:
+                if e.kind == "auth":
+                    raise
+                read_err = str(e)[:200]
+            if ch is None:
+                # Outage path: answer from the words+seed cached by an earlier successful read this epoch.
+                cached = load_epoch_cache(args.epoch)
+                win = epoch_window()
+                first = cached.get("last_read") or cached.get("first_read") or ""
+                if not cached.get("words"):
+                    print(json.dumps({"landed": False, "error": "challenge unreadable and no cached words/seed", "read_error": read_err}, indent=2))
+                    sys.exit(2)
+                if first < win["window_start"] and args.epoch is None:
+                    print(json.dumps({"landed": False, "error": f"cached epoch {cached.get('epoch')} predates the current 6h window ({win['window_start']}); stale seed, not sending",
+                                      "read_error": read_err}, indent=2))
+                    sys.exit(2)
+                ch, source = {k: cached.get(k) for k in ("epoch", "words", "seed")}, "cache"
+            epoch = ch.get("epoch")
+            if ch.get("answered") or has_answered_epoch_locally(epoch):
+                print(json.dumps({"skipped": True, "epoch": epoch, "note": "Epoch already answered (on server, in ~/.poa/answers.log, or in poa-handoff/LOG.md)."}, indent=2))
                 return
             report = check_answer_quality(text, ch.get("words", []))
             if not report["passed"]:
                 raise RuntimeError(f"Pre-flight check failed: {json.dumps(report)}")
-            sub_res = submit_answer_safely(text, ch.get("epoch"))
-            if not sub_res.get("landed"):
-                print(json.dumps({"landed": sub_res.get("landed"), "epoch": ch.get("epoch"), **sub_res}, indent=2))
-                sys.exit(2 if sub_res.get("landed") is False else 3)
-            if sub_res.get("how") == "duplicate":
-                print(json.dumps({"skipped": True, "epoch": ch.get("epoch"), "note": sub_res.get("note")}, indent=2))
-                return
-            res = sub_res.get("result") or {"landed": True, "how": sub_res.get("how"), "note": sub_res.get("note")}
-            if sub_res.get("attempts"):
-                res = dict(res) if isinstance(res, dict) else {"result": res}
-                res["send_attempts"] = sub_res["attempts"]
-                res["landed_how"] = sub_res.get("how")
-            POA_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
-                fp.write(
-                    f"{ts}\tchain={MAINNET_CHAIN_ID}\tepoch={ch.get('epoch')}\twords={','.join(ch.get('words', []))}\t{text}\n"
-                )
-            print(json.dumps(res, indent=2))
-            print_notice(res)
+            sub_res = submit_answer_safely(text, epoch)
+            sub_res.update({"epoch": epoch, "words": ch.get("words"), "challenge_source": source, "transport": http_transport()})
+            if read_err:
+                sub_res["challenge_read_error"] = read_err
+            if sub_res.get("landed") is not False and sub_res.get("how") not in ("duplicate",) and not args.no_confirm:
+                conf = confirm_answer_landed(epoch, sub_res.get("txid"))
+                sub_res["confirm"] = conf
+                if conf.get("landed"):
+                    save_epoch_cache(epoch, landed=True, confirmed_via=conf.get("how"), txid_answer=(conf.get("evidence") or {}).get("txid") or sub_res.get("txid"))
+                    if sub_res.get("landed") is None:
+                        sub_res["landed"], sub_res["how"] = True, "explorer"
+            if sub_res.get("landed") and sub_res.get("how") not in ("sent_before",):
+                POA_DIR.mkdir(parents=True, exist_ok=True)
+                ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
+                    fp.write(f"{ts}\tchain={MAINNET_CHAIN_ID}\tepoch={epoch}\twords={','.join(ch.get('words', []))}\t{text}\n")
+            print(json.dumps(sub_res, indent=2, default=str))
+            if isinstance(sub_res.get("result"), dict):
+                print_notice(sub_res["result"])
+            if sub_res.get("landed") is False:
+                sys.exit(2)
+            if sub_res.get("landed") is None:
+                sys.exit(3)
+        elif args.command == "answer-status":
+            cached = load_epoch_cache(args.epoch)
+            ep = args.epoch if args.epoch is not None else cached.get("epoch")
+            conf = confirm_answer_landed(ep, cached.get("txid_answer"), min_wait=0, max_wait=args.wait)
+            if conf.get("landed"):
+                save_epoch_cache(ep, landed=True, confirmed_via=conf.get("how"), txid_answer=(conf.get("evidence") or {}).get("txid") or cached.get("txid_answer"))
+            print(json.dumps({"epoch": ep, "cache": {k: cached.get(k) for k in ("words", "sent_at", "send_outcome", "landed", "txid_answer")}, **conf}, indent=2, default=str))
+            sys.exit(0 if conf.get("landed") else 3)
         elif args.command == "mine":
             res = safe_mine()
             print(json.dumps(res, indent=2))
