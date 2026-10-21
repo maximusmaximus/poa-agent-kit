@@ -806,6 +806,121 @@ def print_ledger_human(act: str, res: dict) -> None:
         print(json.dumps(res, indent=2))
 
 
+def _latest_pending_basis(epochs_res) -> tuple:
+    """Return (epoch_number, pending_dict) from the newest close in GET /api/epochs."""
+    eps = epochs_res
+    if isinstance(eps, dict):
+        eps = eps.get("epochs") or eps.get("items") or [eps]
+    best_n, best = None, None
+    for e in eps or []:
+        if not isinstance(e, dict):
+            continue
+        basis = e.get("basis") or {}
+        pend = basis.get("pending") if isinstance(basis, dict) else None
+        if isinstance(pend, dict):
+            n = e.get("epoch", e.get("n", e.get("number")))
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                n = -1
+            if best_n is None or n >= best_n:
+                best_n, best = n, pend
+    return best_n, (best or {})
+
+
+def backlog_order_key(row: dict) -> tuple:
+    """Oldest first; within an epoch, smallest panel first (panel 0/1 rows can only reach quorum via extra seals)."""
+    since = row.get("since")
+    try:
+        since = int(since)
+    except (TypeError, ValueError):
+        since = 10**9
+    return (since, min(int(row.get("panel_size", 99)), 2), int(row.get("seals", 0)))
+
+
+def cmd_backlog(args: argparse.Namespace) -> None:
+    """Read-only: public GET /api/epochs (+ optional hosted assignments) -> backlog report for our address.
+
+    Reports, oldest first: our open panel seats on pending rows, grades we already sealed that are
+    still pending (and how far each row is from grade_quorum), and the panel-0/1 rows that need
+    outside seals. Never submits anything.
+    """
+    me = (args.address or local_address()).strip()
+    params = {}
+    try:
+        params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+    except Exception:
+        params = {}
+    quorum = int(params.get("grade_quorum", 4) or 4)
+    ttl = int(params.get("pending_ttl_epochs", 16) or 16)
+    epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    close_n, pending = _latest_pending_basis(epochs_res)
+
+    rows = []
+    for txid, r in pending.items():
+        if not isinstance(r, dict):
+            continue
+        panel = r.get("panel") or []
+        grades = r.get("grades") or []
+        graders = [g.get("grader") for g in grades if isinstance(g, dict)]
+        rows.append({
+            "txid": txid,
+            "since": r.get("since"),
+            "panel_size": len(panel),
+            "seals": len(grades),
+            "to_quorum": max(0, quorum - len(grades)),
+            "on_our_panel": bool(me) and me in panel,
+            "we_sealed": bool(me) and me in graders,
+            "expires_after_close": (int(r["since"]) + ttl) if isinstance(r.get("since"), int) else None,
+        })
+    rows.sort(key=backlog_order_key)
+
+    ours_open = [x for x in rows if x["on_our_panel"] and not x["we_sealed"]]
+    ours_sealed = [x for x in rows if x["we_sealed"]]
+    small = [x for x in rows if x["panel_size"] <= 1]
+
+    seats = None
+    if not args.no_key:
+        try:
+            a = api_call("GET", "/api/hosted/assignments", timeout=45, retries=1)
+            seats = a.get("assignments") or []
+        except Exception as e:
+            seats = {"error": redact(str(e))}
+    if isinstance(seats, list):
+        idx = {x["txid"]: x for x in rows}
+        dealt = []
+        for s in seats:
+            t = s.get("answer_txid") or s.get("txid")
+            info = idx.get(t, {})
+            dealt.append({"txid": t, "answer_epoch": s.get("answer_epoch") or s.get("epoch") or info.get("since"),
+                          "panel_size": info.get("panel_size"), "seals": info.get("seals"),
+                          "to_quorum": info.get("to_quorum")})
+        dealt.sort(key=lambda d: backlog_order_key({"since": d["answer_epoch"], "panel_size": d["panel_size"] if d["panel_size"] is not None else 99, "seals": d["seals"] or 0}))
+        seats = dealt
+
+    out = {
+        "read_only": True,
+        "close_epoch": close_n,
+        "grade_quorum": quorum,
+        "pending_ttl_epochs": ttl,
+        "address_configured": bool(me),
+        "pending_total": len(rows),
+        "pending_panel_0_or_1": len(small),
+        "our_open_panel_seats_on_pending": len(ours_open),
+        "our_sealed_still_pending": len(ours_sealed),
+        "our_sealed_reaching_quorum_soon": sum(1 for x in ours_sealed if x["to_quorum"] <= 1),
+        "dealt_seats_now": (len(seats) if isinstance(seats, list) else seats),
+        "dealt_seats_backlog_order": (seats[: args.limit] if isinstance(seats, list) else None),
+        "our_open_panel_seats_oldest_first": ours_open[: args.limit],
+        "our_sealed_still_pending_oldest_first": ours_sealed[: args.limit],
+        "note": ("Grade only seats the server deals you (hosted assignments), oldest first. "
+                 "Panel 0/1 rows need outside seals to reach quorum; we do not grade rows we were not dealt "
+                 "until the operator documents off-panel sealing. Seals on rows that already settled drop out of "
+                 "this read, so our_sealed_* is a lower bound."),
+    }
+    print(json.dumps(out, indent=2))
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     POA_DIR.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -926,6 +1041,12 @@ def main() -> None:
     p_ll.add_argument("--target-id", default="", help="Target ID for lableak vote")
     p_ll.add_argument("--value", type=int, default=1, choices=[-1, 0, 1], help="Vote value (-1, 0, 1)")
 
+    p_bl = sub.add_parser("backlog", help="Read-only grading backlog report: dealt seats oldest-first, our seals still pending vs quorum, panel 0/1 rows")
+    p_bl.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
+    p_bl.add_argument("--limit", type=int, default=25, help="Max rows per list (default 25)")
+    p_bl.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+    p_bl.add_argument("--no-key", action="store_true", help="Skip the keyed assignments read; public data only")
+
     p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
     p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
@@ -1001,7 +1122,8 @@ def main() -> None:
             if args.audit:
                 seats = res.get("assignments", []) or []
                 audited = audit_assignments_batch(seats)
-                print(json.dumps({"count": len(audited), "seats": audited}, indent=2))
+                audited.sort(key=lambda a: (a.get("epoch") if isinstance(a.get("epoch"), int) else 10**9))
+                print(json.dumps({"count": len(audited), "order": "oldest answer epoch first", "seats": audited}, indent=2))
             else:
                 print(json.dumps(res, indent=2))
             print_notice(res)
@@ -1018,6 +1140,8 @@ def main() -> None:
             )
             print(json.dumps(res, indent=2))
             print_notice(res)
+        elif args.command == "backlog":
+            cmd_backlog(args)
         elif args.command == "grade-batch":
             cmd_grade_batch(args)
         elif args.command == "ballots":
