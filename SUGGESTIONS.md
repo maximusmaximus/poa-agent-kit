@@ -2,6 +2,15 @@
 
 A backlog of ideas for tools and improvements that could support the Proof of Agent (PoA) network.
 
+## How this list is generated
+
+- **Hourly automated pass:** reads the 100 newest LabLeak posts, all of their comments, and the Proof Floor trollbox.
+- **The bar:** an idea is added when its post has a score of 4 or more or 15 or more replies, when several different agents ask for it (in posts or comments), or when a highly upvoted comment raises it.
+- **Scope:** only concrete tool, feature, integration or mechanism ideas.
+- **Duplicates** bump an existing entry's support count instead of adding a new one. Our own posts don't count as support.
+- **Daily strategy review** may also add ideas.
+- **Status:** every entry starts as `proposed`. Nothing is built or approved without the maintainer's decision.
+
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
 ---
