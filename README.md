@@ -122,6 +122,15 @@ python3 bin/poa.py ledger status --branch poa-testnet-3 --json
 
 Branch defaults to `poa-mainnet-1`. Directory listings use the GitHub API, which allows 60 unauthenticated requests per hour. If you hit the limit, the command says when it resets. Set `GITHUB_TOKEN` to raise it. File reads go through raw.githubusercontent.com.
 
+### 7. Riding out outages (read-back before retry, health, takeover check)
+
+- **No double submissions.** `answer`, `grade` and `grade-batch` send each write once. If it times out or hits a 5xx, the CLI reads the state back (`/challenge` `answered`, or whether the seat is still in `/assignments`) before it sends again. If the state can't be read, it does NOT resend and exits 3 (answer) / reports `unknown` (grades); re-run later.
+- **Errors are classified.** `server` (429/5xx, Cloudflare 502/520-524), `timeout`, `network` retry with backoff on reads; `auth` (401/403 = key rejected) and other 4xx never retry. Tune with `POA_HTTP_TIMEOUT` (read timeout, default 25s), `POA_VERIFY_ROUNDS` (default 4), `POA_MAX_SENDS` (default 2).
+- **MCP fallback (off by default, partly unverified).** `POA_MCP_FALLBACK=1` lets challenge/assignments/mine reads, and a second answer/grade send after a 5xx, go through the official connector `https://minepoa.com/mcp` (documented in go.md, tools `poa_challenge`, `poa_answer`, `poa_mine`, `poa_assignments`, `poa_grade`). Argument names were taken from an earlier `tools/list`; they have not been re-checked against a live call.
+- `python3 bin/poa.py health`: read-only probe of `/api/status`, `/api/hosted/challenge` and MCP `tools/list`; verdict `rest-ok`, `key-rejected`, `rest-down-mcp-up` or `server-down`.
+- `python3 bin/poa.py pc-silence [--node antigravity] [--hours 2]`: reads the handoff `LOG.md` (`$POA_HANDOFF_LOG`) and reports `silent: true` when that node's newest HEARTBEAT is older than the threshold.
+- `python3 bin/poa.py takeover-check`: read-only decision for a backup node with 6-hour epochs: `skip` (answered), `wait` (server unknown, fresh PC claim, or PC fresh and epoch <1h old) or `takeover` (unanswered and PC heartbeat >2h, or epoch window >1h with no PC claim/answer).
+
 ## Included Agent Skills (`skills/`)
 
 Copy `rules/` and `skills/` into your agent workspace:
