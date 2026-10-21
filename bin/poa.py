@@ -583,6 +583,219 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# Public ledger mirror reader (github.com/EmblemCompany/ProofOfAgent). No key.
+# ---------------------------------------------------------------------------
+LEDGER_REPO = os.environ.get("POA_LEDGER_REPO", "EmblemCompany/ProofOfAgent")
+LEDGER_DEFAULT_BRANCH = os.environ.get("POA_LEDGER_BRANCH", "poa-mainnet-1")
+ADDRESS_FILE = POA_DIR / "address"
+
+
+def _ledger_get(url: str, timeout: int = 30):
+    headers = {"User-Agent": "poa-agent-kit/1.3", "Accept": "application/vnd.github+json"}
+    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if gh_token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = f"Bearer {gh_token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            remaining = e.headers.get("X-RateLimit-Remaining") if e.headers else None
+            if e.code in (403, 429) and (remaining == "0" or e.code == 429):
+                reset = e.headers.get("X-RateLimit-Reset") or ""
+                when = ""
+                if reset.isdigit():
+                    when = datetime.datetime.fromtimestamp(int(reset), datetime.timezone.utc).isoformat()
+                raise RuntimeError(
+                    f"GitHub rate limit hit for {url} (resets {when or 'soon'}). "
+                    "Wait, or export GITHUB_TOKEN to raise the unauthenticated 60/hour API limit."
+                )
+            if e.code == 404:
+                raise RuntimeError(f"Not found on ledger mirror: {url}")
+            last_err = e
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Ledger fetch failed for {url}: {last_err}")
+
+
+def ledger_raw(branch: str, path: str):
+    return _ledger_get(f"https://raw.githubusercontent.com/{LEDGER_REPO}/{urllib.parse.quote(branch)}/{path}")
+
+
+def ledger_ls(branch: str, path: str) -> list:
+    res = _ledger_get(f"https://api.github.com/repos/{LEDGER_REPO}/contents/{path}?ref={urllib.parse.quote(branch)}")
+    return res if isinstance(res, list) else []
+
+
+def _iso(ts) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).isoformat()
+    except Exception:
+        return str(ts)
+
+
+def local_address() -> str:
+    env_a = os.environ.get("POA_ADDRESS", "").strip()
+    if env_a:
+        return env_a
+    if ADDRESS_FILE.is_file():
+        return ADDRESS_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def ledger_status(branch: str) -> dict:
+    cps = [x["name"][:-5] for x in ledger_ls(branch, "checkpoints") if x.get("type") == "file" and x["name"].endswith(".json")]
+    heights = sorted(int(h) for h in cps if h.isdigit())
+    out = {"repo": LEDGER_REPO, "branch": branch}
+    now = time.time()
+    if heights:
+        cp = ledger_raw(branch, f"checkpoints/{heights[-1]}.json")
+        out["latest_checkpoint"] = {
+            "height": cp.get("height"),
+            "time_utc": _iso(cp.get("ts")),
+            "covered_epochs": cp.get("covered_epochs"),
+            "state_root": cp.get("state_root"),
+            "signatures": len(cp.get("sigs") or []),
+        }
+        out["checkpoint_lag_seconds"] = int(now - int(cp.get("ts") or now))
+        out["checkpoint_lag_hours"] = round(out["checkpoint_lag_seconds"] / 3600, 2)
+    names = [x["name"] for x in ledger_ls(branch, "anchors") if x.get("type") == "file"]
+    latest = {}
+    for n in names:
+        m = re.match(r"^(\d+)(-base)?\.json$", n)
+        if m:
+            key = "base" if m.group(2) else "solana"
+            latest[key] = max(latest.get(key, 0), int(m.group(1)))
+    anchors = {}
+    for key, h in sorted(latest.items()):
+        a = ledger_raw(branch, f"anchors/{h}{'-base' if key == 'base' else ''}.json")
+        anchors[a.get("chain", key)] = {
+            "height": a.get("height"),
+            "anchored_at": a.get("anchored_at"),
+            "tx": a.get("tx_signature") or a.get("tx_hash"),
+        }
+    out["latest_anchors"] = anchors
+    eps = sorted(int(x["name"]) for x in ledger_ls(branch, "epochs") if x.get("type") == "dir" and x["name"].isdigit())
+    if eps:
+        files = [x["name"] for x in ledger_ls(branch, f"epochs/{eps[-1]}")]
+        out["latest_epoch"] = {"epoch": eps[-1], "files": files}
+    return out
+
+
+def ledger_params_diff(branch: str, ref: str) -> dict:
+    if ref == "prev":
+        commits = _ledger_get(
+            f"https://api.github.com/repos/{LEDGER_REPO}/commits?sha={urllib.parse.quote(branch)}&path=params.json&per_page=2"
+        )
+        if not isinstance(commits, list) or len(commits) < 2:
+            raise RuntimeError("No earlier params.json commit found on this branch")
+        ref = commits[1]["sha"]
+    new, old = ledger_raw(branch, "params.json"), ledger_raw(ref, "params.json")
+    changed = {k: {"old": old.get(k), "new": new.get(k)} for k in sorted(set(old) & set(new)) if old[k] != new[k]}
+    return {
+        "branch": branch,
+        "against": ref,
+        "added": {k: new[k] for k in sorted(set(new) - set(old))},
+        "removed": {k: old[k] for k in sorted(set(old) - set(new))},
+        "changed": changed,
+    }
+
+
+def ledger_pardons(branch: str, address: str) -> dict:
+    params = ledger_raw(branch, "params.json")
+    pardons = params.get("slash_pardons") or {}
+    out = {"branch": branch, "epochs": {k: len(v) for k, v in sorted(pardons.items(), key=lambda kv: int(kv[0]))}}
+    if address:
+        out["address"] = address
+        out["pardoned_in_epochs"] = [int(k) for k, v in pardons.items() if address in v]
+    else:
+        out["slash_pardons"] = pardons
+    return out
+
+
+def ledger_epoch(branch: str, n: int, address: str, full: bool) -> dict:
+    files = [x["name"] for x in ledger_ls(branch, f"epochs/{n}")]
+    if "emission.json" not in files:
+        return {"branch": branch, "epoch": n, "files": files}
+    em = ledger_raw(branch, f"epochs/{n}/emission.json")
+    if full:
+        return em
+    rewards = em.get("rewards") or {}
+
+    def amt(v):
+        try:
+            return float(v if not isinstance(v, dict) else (v.get("total") or v.get("amount") or 0))
+        except Exception:
+            return 0.0
+
+    top = sorted(rewards.items(), key=lambda kv: amt(kv[1]), reverse=True)[:10]
+    out = {
+        "branch": branch,
+        "epoch": em.get("epoch"),
+        "time_utc": _iso(em.get("ts")),
+        "pool": em.get("pool"),
+        "note": em.get("note"),
+        "files": files,
+        "counts": {k: len(em.get(k) or {}) for k in ("weights", "challenges", "propagation", "rewards")},
+        "top_rewards": [{"address": a, "reward": v} for a, v in top],
+    }
+    if address:
+        out["address"] = address
+        out["address_reward"] = rewards.get(address)
+        for part in ("challenges", "weights", "propagation"):
+            out[f"address_{part}_share"] = (em.get(part) or {}).get(address)
+    return out
+
+
+def cmd_ledger(args: argparse.Namespace) -> None:
+    b = args.branch
+    act = args.action
+    if act == "status":
+        res = ledger_status(b)
+    elif act == "params":
+        res = ledger_params_diff(b, args.diff) if args.diff else ledger_raw(b, "params.json")
+    elif act == "pardons":
+        res = ledger_pardons(b, (args.address or local_address()).strip())
+    elif act == "epoch":
+        if args.n is None:
+            raise RuntimeError("ledger epoch requires an epoch number, e.g. `ledger epoch 5`")
+        res = ledger_epoch(b, int(args.n), (args.address or local_address()).strip(), args.full)
+    else:
+        raise RuntimeError(f"Unknown ledger action: {act}")
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print_ledger_human(act, res)
+
+
+def print_ledger_human(act: str, res: dict) -> None:
+    if act == "status":
+        cp = res.get("latest_checkpoint") or {}
+        print(f"Ledger {res['repo']}@{res['branch']}")
+        print(f"  checkpoint  h{cp.get('height')} at {cp.get('time_utc')} (epochs covered {cp.get('covered_epochs')}, sigs {cp.get('signatures')})")
+        print(f"  lag         {res.get('checkpoint_lag_hours')} h since last checkpoint")
+        for chain, a in (res.get("latest_anchors") or {}).items():
+            print(f"  anchor      {chain}: h{a.get('height')} at {a.get('anchored_at')} tx {a.get('tx')}")
+        ep = res.get("latest_epoch") or {}
+        print(f"  epoch       {ep.get('epoch')} files {', '.join(ep.get('files') or [])}")
+    elif act == "pardons":
+        for e, c in res.get("epochs", {}).items():
+            print(f"  epoch {e}: {c} pardoned")
+        if "address" in res:
+            hits = res.get("pardoned_in_epochs") or []
+            print(f"  {res['address']}: {'pardoned in epoch(s) ' + ', '.join(map(str, hits)) if hits else 'no pardons'}")
+        else:
+            for e, addrs in res.get("slash_pardons", {}).items():
+                for a in addrs:
+                    print(f"    e{e} {a}")
+    else:
+        print(json.dumps(res, indent=2))
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     POA_DIR.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -701,6 +914,15 @@ def main() -> None:
     p_ll.add_argument("--target-type", default="post", choices=["post", "comment"], help="Target type for lableak vote")
     p_ll.add_argument("--target-id", default="", help="Target ID for lableak vote")
     p_ll.add_argument("--value", type=int, default=1, choices=[-1, 0, 1], help="Vote value (-1, 0, 1)")
+
+    p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
+    p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
+    p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
+    p_led.add_argument("--branch", default=LEDGER_DEFAULT_BRANCH, help="Ledger branch (default poa-mainnet-1)")
+    p_led.add_argument("--diff", default="", help="For params: compare against a commit/branch, or 'prev' for the prior params.json commit")
+    p_led.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
+    p_led.add_argument("--full", action="store_true", help="For epoch: print the raw emission.json")
+    p_led.add_argument("--json", action="store_true", help="Machine-readable JSON output")
 
     args = parser.parse_args()
     try:
@@ -899,6 +1121,8 @@ def main() -> None:
             else:
                 raise RuntimeError(f"Unknown lableak action: {act}")
             print(json.dumps(res, indent=2))
+        elif args.command == "ledger":
+            cmd_ledger(args)
         elif args.command == "pulse":
             mine_res = None
             mine_err = None
