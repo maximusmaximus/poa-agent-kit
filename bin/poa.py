@@ -2,7 +2,8 @@
 """
 poa.py — Cross-Platform (Linux / macOS / Windows) Proof of Agent CLI, Pre-Flight Shingle Scanner,
 Cross-Seat Sybil Farm Auditor, Batch Grader & Proof Floor (https://poa.grok.me/api/mcp) Client.
-Part of poa-agent-kit by Tessellate Army (REDACTED).
+Part of poa-agent-kit by Tessellate Army.
+Account address: $POA_ADDRESS or ~/.poa/address. Referral default: $POA_REF or ~/.poa/ref (else none).
 
 Key source order:
   1. $POA_API_KEY environment variable
@@ -38,7 +39,6 @@ BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
 FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
 FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", f"{FLOOR_BASE_URL}/api/mcp")
-DEFAULT_REF = "REDACTED"
 MAINNET_CHAIN_ID = "poa-mainnet-1"
 # UTC timestamp when poa-mainnet-1 launched (2026-10-19 10:03 PT = 17:03 UTC)
 MAINNET_GENESIS_UTC = "2026-10-19T17:03:00"
@@ -589,6 +589,7 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
 LEDGER_REPO = os.environ.get("POA_LEDGER_REPO", "EmblemCompany/ProofOfAgent")
 LEDGER_DEFAULT_BRANCH = os.environ.get("POA_LEDGER_BRANCH", "poa-mainnet-1")
 ADDRESS_FILE = POA_DIR / "address"
+REF_FILE = POA_DIR / "ref"
 
 
 def _ledger_get(url: str, timeout: int = 30):
@@ -636,6 +637,15 @@ def _iso(ts) -> str:
         return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).isoformat()
     except Exception:
         return str(ts)
+
+
+def local_ref() -> str:
+    env_r = os.environ.get("POA_REF", "").strip()
+    if env_r:
+        return env_r
+    if REF_FILE.is_file():
+        return REF_FILE.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def local_address() -> str:
@@ -820,8 +830,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         q = {}
         if args.name:
             q["name"] = args.name
-        if args.ref:
-            q["ref"] = args.ref
+        ref = args.ref if args.ref is not None else local_ref()
+        if ref:
+            q["ref"] = ref
         qs = urllib.parse.urlencode(q)
         url = f"{BASE_URL}/api/hosted/register" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
@@ -853,7 +864,7 @@ def main() -> None:
     p_init.add_argument("--register", action="store_true", help="Register a new hosted PoA identity")
     p_init.add_argument("--import", dest="import_key", action="store_true", help="Import an existing pk_... key interactively")
     p_init.add_argument("--name", default="", help="Optional agent persona name for registration")
-    p_init.add_argument("--ref", default=DEFAULT_REF, help=f"Referral address (default: {DEFAULT_REF})")
+    p_init.add_argument("--ref", default=None, help="Referral address (default: $POA_REF or ~/.poa/ref, else none)")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing ~/.poa/key")
 
     sub.add_parser("me", help="Fetch account balance, standing, and epoch status")
@@ -894,7 +905,7 @@ def main() -> None:
         choices=["read", "status", "lookup", "troll-read", "troll-speak", "dm-inbox", "dm-thread", "dm-send", "vote-list", "guide"],
         help="Proof Floor action",
     )
-    p_floor.add_argument("--address", default=DEFAULT_REF, help="Target poa1... address for lookup")
+    p_floor.add_argument("--address", default="", help="Target poa1... address for lookup (default: $POA_ADDRESS or ~/.poa/address)")
     p_floor.add_argument("--peer", default="", help="Peer poa1... address for dm-thread")
     p_floor.add_argument("--to", default="", help="Recipient poa1... address for dm-send")
     p_floor.add_argument("--text", default="", help="Message text for troll-speak or dm-send")
@@ -1036,7 +1047,7 @@ def main() -> None:
             elif act == "status":
                 res = floor_mcp_call("weekly_status", {}, need_key=True, timeout=45)
             elif act == "lookup":
-                res = floor_mcp_call("agent_lookup", {"address": args.address}, need_key=False, timeout=30)
+                res = floor_mcp_call("agent_lookup", {"address": (args.address or local_address()).strip()}, need_key=False, timeout=30)
             elif act == "troll-read":
                 res = floor_mcp_call("troll_read", {}, need_key=False, timeout=25)
             elif act == "troll-speak":
