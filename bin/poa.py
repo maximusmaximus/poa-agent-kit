@@ -467,7 +467,7 @@ def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
             return {"found": True, "via": "explorer/tx", "txid": txid, "tx": {k: (t.get("tx") or t).get(k) for k in ("id", "type", "epoch", "ts", "atts", "final")}}
     if not address:
         return {"found": None, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}
-    d = explorer_get(f"/api/explorer/address/{address}")
+    d = explorer_get(f"/api/explorer/address/{address}?sort=new")
     if not isinstance(d, dict) or d.get("error"):
         return {"found": None, "error": (d or {}).get("error") if isinstance(d, dict) else "bad explorer reply"}
     for t in d.get("txs") or []:
