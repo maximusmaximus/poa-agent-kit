@@ -247,9 +247,12 @@ def _classify(exc: Exception, path: str, raw_key: str) -> PoaHTTPError:
         except Exception:
             body = str(exc)
         body = redact(body, raw_key)
+        low_body = body.lower()[:2000]
         if exc.code in (401, 403):
             kind = "auth"
-        elif exc.code in SERVER_STATUSES or "cloudflare" in body.lower()[:2000]:
+        elif exc.code == 503 and ("temporarily halted" in low_body or "api hardening" in low_body):
+            kind = "halted"
+        elif exc.code in SERVER_STATUSES or "cloudflare" in low_body:
             kind = "server"
         else:
             kind = "client"
@@ -314,7 +317,7 @@ def api_call(
                 raise PoaHTTPError("server", f"Non-JSON response on {path}: {clean[:300]}")
         except Exception as e:
             last = _classify(e, path, raw_key)
-            if last.kind in ("auth", "client"):
+            if last.kind in ("auth", "client", "halted"):
                 raise last
             if attempt < retries - 1:
                 _backoff(attempt)
@@ -430,6 +433,80 @@ def cache_challenge(ch: dict) -> None:
         pass
 
 
+def edge_read_challenge(address: str = None, timeout: int = 12) -> dict:
+    """Read-only edge fallback: GET /api/challenge/<addr> (keyless; stays up during /hosted/* halts/outages)."""
+    addr = (address or local_address()).strip()
+    if not addr:
+        return {}
+    try:
+        res = api_call("GET", f"/api/challenge/{addr}", need_key=False, timeout=timeout, retries=1)
+        if isinstance(res, dict) and res.get("words"):
+            cache_challenge(res)
+            ep = res.get("epoch")
+            local_ans = has_answered_epoch_locally(ep)
+            exp_ans = explorer_find_answer(addr, ep)
+            res["answered_in_local_log"] = local_ans
+            res["answered_on_explorer"] = bool(exp_ans.get("found"))
+            if exp_ans.get("txid"):
+                res["explorer_answer_txid"] = exp_ans.get("txid")
+            res["answered"] = bool(res.get("answered") or local_ans or exp_ans.get("found"))
+            res["_via"] = "edge:/api/challenge"
+            return res
+    except Exception:
+        pass
+    return {}
+
+
+def edge_read_epochs_summary(address: str = None, timeout: int = 25) -> dict:
+    """Read-only edge fallback: GET /api/epochs (keyless) -> cumulative settled rewards, established state & pending answers."""
+    addr = (address or local_address()).strip()
+    if not addr:
+        return {}
+    try:
+        eps = api_call("GET", "/api/epochs", need_key=False, timeout=timeout, retries=1)
+        if isinstance(eps, dict):
+            eps = eps.get("epochs") or eps.get("items") or []
+        if not isinstance(eps, list) or not eps:
+            return {}
+        total_settled = 0.0
+        rewards_by_epoch = {}
+        established = None
+        for e in eps:
+            if not isinstance(e, dict):
+                continue
+            ep = e.get("epoch")
+            rf = 0.0
+            rew = (e.get("rewards") or {}).get(addr)
+            if rew is not None:
+                try:
+                    rf = float(rew)
+                    total_settled += rf
+                    if rf > 0:
+                        rewards_by_epoch[str(ep)] = f"{rf:.6f}"
+                except Exception:
+                    rf = 0.0
+            b = e.get("basis") or {}
+            if isinstance(b, dict):
+                if addr in (b.get("established_after") or []) or (b.get("graders_served") or {}).get(addr):
+                    established = True
+                if established is None and rf and rf > 0:
+                    established = True
+                if addr in (b.get("established_removed") or []) or addr in (b.get("slashed") or []) or addr in (b.get("ejected") or []):
+                    established = False
+        latest = eps[-1] if isinstance(eps[-1], dict) else {}
+        return {
+            "address": addr,
+            "epochs_settled_count": len(eps),
+            "latest_closed_epoch": latest.get("epoch"),
+            "cumulative_settled_balance": f"{total_settled:.6f}",
+            "rewards_by_epoch": rewards_by_epoch,
+            "established_from_epochs": established,
+            "_via": "edge:/api/epochs",
+        }
+    except Exception:
+        return {}
+
+
 def read_challenge(retries: int = None) -> dict:
     """GET /api/hosted/challenge (cached on success), falling back to MCP poa_challenge (flagged, last resort)."""
     try:
@@ -439,6 +516,9 @@ def read_challenge(retries: int = None) -> dict:
             res = mcp_call("poa_challenge", {})
             res["_rest_error"] = str(e)[:200]
         else:
+            edge_ch = edge_read_challenge()
+            if edge_ch:
+                e.edge_challenge = edge_ch
             raise
     cache_challenge(res)
     return res
@@ -535,7 +615,7 @@ def submit_answer_safely(text: str, epoch) -> dict:
     MCP is used only when POA_MCP_FALLBACK=1 and REST failed before reaching the server (network).
     """
     cache = load_epoch_cache(epoch)
-    if cache.get("sent_at"):
+    if cache.get("sent_at") and cache.get("send_outcome") not in ("halted", "rejected", "stale"):
         return {"landed": cache.get("landed"), "how": "sent_before", "note": f"already sent for epoch {epoch} at {cache['sent_at']} ({cache.get('send_outcome')}); not resending",
                 "txid": cache.get("txid_answer")}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -559,6 +639,9 @@ def submit_answer_safely(text: str, epoch) -> dict:
         if any(m in low for m in STALE_MARKERS):
             save_epoch_cache(epoch, send_outcome="stale", landed=False, error=str(e)[:300])
             return {"landed": False, "how": "stale", "error": str(e)[:300], "kind": e.kind}
+        if e.kind == "halted":
+            save_epoch_cache(epoch, send_outcome="halted", landed=False, error=str(e)[:300])
+            return {"landed": False, "how": "halted", "error": str(e)[:300], "kind": "halted"}
         if e.kind in ("auth", "client"):
             save_epoch_cache(epoch, send_outcome="rejected", landed=False, error=str(e)[:300])
             return {"landed": False, "error": str(e)[:300], "kind": e.kind}
@@ -706,6 +789,10 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
             out["via"] = ch["_via"]
     except PoaHTTPError as e:
         out["api_error"] = {"kind": e.kind, "error": str(e)[:300]}
+        edge_ch = getattr(e, "edge_challenge", None)
+        if isinstance(edge_ch, dict) and edge_ch.get("epoch") is not None:
+            out["edge_epoch"] = edge_ch.get("epoch")
+            out["edge_words"] = edge_ch.get("words", [])
     now = datetime.datetime.now(datetime.timezone.utc)
     if out["epoch"] is not None:
         claim_ttl = datetime.timedelta(minutes=15)
@@ -716,7 +803,9 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
                 if r.get("event") == "CLAIM" and now - r["ts"] < claim_ttl:
                     out["pc_claim_or_answer"] = True
                     out["pc_claim_fresh"] = True
-    if out["epoch"] is None:
+    if (out.get("api_error") or {}).get("kind") == "halted":
+        decision, why = "wait", "operator maintenance halt (HTTP 503); do not submit"
+    elif out["epoch"] is None:
         decision, why = "wait", "server state unknown (API unreachable); never answer blind"
     elif out["answered"]:
         decision, why = "skip", "epoch already answered"
@@ -742,7 +831,7 @@ def cmd_health(args: argparse.Namespace) -> None:
         try:
             r = fn()
             probes.append({"probe": name, "ok": True, "seconds": round(time.time() - t0, 2),
-                           "detail": {k: r.get(k) for k in ("epoch", "answered", "epochs_closed", "as_of", "tools") if isinstance(r, dict) and k in r}})
+                           "detail": {k: r.get(k) for k in ("epoch", "words", "answered", "epochs_closed", "as_of", "tools") if isinstance(r, dict) and k in r}})
         except PoaHTTPError as e:
             probes.append({"probe": name, "ok": False, "kind": e.kind, "seconds": round(time.time() - t0, 2), "error": str(e)[:200]})
         except Exception as e:
@@ -750,6 +839,9 @@ def cmd_health(args: argparse.Namespace) -> None:
 
     probe("rest:/api/status", lambda: api_call("GET", "/api/status", need_key=False, retries=1, timeout=args.timeout))
     probe("rest:/api/hosted/challenge", lambda: api_call("GET", "/api/hosted/challenge", retries=1, timeout=args.timeout))
+    addr = local_address()
+    if addr:
+        probe("edge:/api/challenge/<addr>", lambda: edge_read_challenge(addr, timeout=int(max(5, args.timeout))))
     probe("mcp:tools/list", lambda: _mcp_list(args.timeout))
     if args.mcp_keyed:
         probe("mcp:poa_challenge", lambda: mcp_call("poa_challenge", {}, timeout=args.timeout))
@@ -758,6 +850,8 @@ def cmd_health(args: argparse.Namespace) -> None:
         verdict = "rest-ok"
     elif kinds.get("rest:/api/hosted/challenge") == "auth":
         verdict = "key-rejected"
+    elif kinds.get("rest:/api/hosted/challenge") == "halted":
+        verdict = "halted"
     elif kinds.get("mcp:tools/list") == "ok":
         verdict = "rest-down-mcp-up"
     else:
@@ -1509,6 +1603,13 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    for _stream in ("stdout", "stderr"):
+        _s = getattr(sys, _stream, None)
+        if hasattr(_s, "reconfigure"):
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     parser = argparse.ArgumentParser(description="poa-agent-kit CLI (cross-platform zero-leak PoA client & auditor)")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1618,23 +1719,65 @@ def main() -> None:
         if args.command == "init":
             cmd_init(args)
         elif args.command == "me":
-            res = api_call("GET", "/api/hosted/me")
-            res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
-            print(json.dumps(res, indent=2))
-            print_notice(res)
+            try:
+                res = api_call("GET", "/api/hosted/me")
+                res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
+                print(json.dumps(res, indent=2))
+                print_notice(res)
+            except PoaHTTPError as e:
+                if e.kind == "auth":
+                    raise
+                edge_me = edge_read_epochs_summary()
+                edge_ch = edge_read_challenge()
+                if not edge_me and not edge_ch:
+                    raise
+                fallback = {
+                    "hosted_status": e.kind,
+                    "hosted_error": str(e)[:200],
+                    "epoch": edge_ch.get("epoch"),
+                    "answered": edge_ch.get("answered"),
+                    "answered_in_local_log": edge_ch.get("answered_in_local_log"),
+                    "answered_on_explorer": edge_ch.get("answered_on_explorer"),
+                    "balance": edge_me.get("cumulative_settled_balance"),
+                    "established": edge_me.get("established_from_epochs"),
+                    "rewards_by_epoch": edge_me.get("rewards_by_epoch"),
+                    "_via": "edge:/api/epochs+/api/challenge",
+                }
+                if edge_ch.get("system_notice"):
+                    fallback["system_notice"] = edge_ch["system_notice"]
+                print(json.dumps(fallback, indent=2))
+                print_notice(fallback)
         elif args.command == "challenge":
-            res = read_challenge()
-            res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
-            print(json.dumps(res, indent=2))
-            print_notice(res)
+            try:
+                res = read_challenge()
+                res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
+                print(json.dumps(res, indent=2))
+                print_notice(res)
+            except PoaHTTPError as e:
+                edge_ch = getattr(e, "edge_challenge", None)
+                if not isinstance(edge_ch, dict) or not edge_ch.get("words"):
+                    raise
+                edge_ch["hosted_status"] = e.kind
+                edge_ch["hosted_error"] = str(e)[:200]
+                print(json.dumps(edge_ch, indent=2))
+                print_notice(edge_ch)
         elif args.command == "check":
             text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
-            ch = read_challenge()
+            try:
+                ch = read_challenge()
+            except PoaHTTPError as e:
+                edge_ch = getattr(e, "edge_challenge", None)
+                if isinstance(edge_ch, dict) and edge_ch.get("words"):
+                    ch = edge_ch
+                else:
+                    raise
             report = check_answer_quality(text, ch.get("words", []))
             report["epoch"] = ch.get("epoch")
             report["already_answered"] = bool(ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")))
             report["answered_in_local_log"] = has_answered_epoch_locally(ch.get("epoch"))
             report["required_words"] = ch.get("words", [])
+            if ch.get("_via"):
+                report["challenge_source"] = ch.get("_via")
             print(json.dumps(report, indent=2))
             if not report["passed"]:
                 sys.exit(2)
@@ -1646,6 +1789,10 @@ def main() -> None:
             except PoaHTTPError as e:
                 if e.kind == "auth":
                     raise
+                if e.kind == "halted":
+                    print(json.dumps({"landed": False, "kind": "halted", "error": str(e)[:300],
+                                      "note": "Operator maintenance halt (HTTP 503); do not submit until surface re-enables."}, indent=2))
+                    sys.exit(2)
                 read_err = str(e)[:200]
             if ch is None:
                 # Outage path: answer from the words+seed cached by an earlier successful read this epoch.
@@ -1852,9 +1999,31 @@ def main() -> None:
                     mine_res = safe_mine()
                 except Exception as e:
                     mine_err = redact(str(e))
-            me_res = api_call("GET", "/api/hosted/me")
-            ch_res = read_challenge()
-            asgn_res = api_call("GET", "/api/hosted/assignments")
+            hosted_status = "ok"
+            hosted_err = None
+            try:
+                me_res = api_call("GET", "/api/hosted/me")
+            except PoaHTTPError as e:
+                if e.kind == "auth":
+                    raise
+                hosted_status = e.kind
+                hosted_err = str(e)[:200]
+                me_res = {}
+            try:
+                ch_res = read_challenge()
+            except PoaHTTPError as e:
+                if e.kind == "auth":
+                    raise
+                hosted_status = e.kind
+                hosted_err = hosted_err or str(e)[:200]
+                ch_res = getattr(e, "edge_challenge", None) or {}
+            try:
+                asgn_res = api_call("GET", "/api/hosted/assignments") if hosted_status != "halted" else {"assignments": []}
+            except PoaHTTPError as e:
+                if e.kind == "auth":
+                    raise
+                asgn_res = {"assignments": [], "assignments_error": str(e)[:200]}
+            edge_me = edge_read_epochs_summary() if not me_res.get("balance") else {}
             try:
                 bal_res = api_call("GET", "/api/ballots", need_key=False)
             except Exception as e:
@@ -1881,15 +2050,16 @@ def main() -> None:
             epoch_num = ch_res.get("epoch")
             local_ans = has_answered_epoch_locally(epoch_num)
             summary = {
+                "hosted_status": hosted_status,
                 "epoch": epoch_num,
                 "answered": bool(ch_res.get("answered") or local_ans),
                 "server_answered_flag": ch_res.get("answered"),
                 "answered_in_local_log": local_ans,
                 "words": ch_res.get("words", []),
-                "balance": me_res.get("balance"),
+                "balance": me_res.get("balance") or edge_me.get("cumulative_settled_balance"),
                 "spendable": me_res.get("spendable"),
                 "locked": me_res.get("locked"),
-                "established": me_res.get("established"),
+                "established": me_res.get("established") if "established" in me_res else edge_me.get("established_from_epochs"),
                 "attestations_by_me": me_res.get("attestations_by_me"),
                 "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else 0,
                 "open_grading_seats_count": len(seats),
@@ -1897,6 +2067,13 @@ def main() -> None:
                 "open_ballots": compact_ballots,
                 "notices": me_res.get("notices", []),
             }
+            if edge_me.get("rewards_by_epoch") and not me_res.get("balance"):
+                summary["rewards_by_epoch"] = edge_me.get("rewards_by_epoch")
+                summary["balance_source"] = "edge:/api/epochs"
+            if ch_res.get("_via"):
+                summary["challenge_source"] = ch_res.get("_via")
+            if hosted_err:
+                summary["hosted_error"] = hosted_err
             if mine_err:
                 summary["mine_error"] = mine_err
             print(json.dumps(summary, indent=2))

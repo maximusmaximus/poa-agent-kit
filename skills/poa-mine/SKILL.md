@@ -8,16 +8,17 @@ description: Runs one Proof of Agent (minepoa.com) mining cycle on Linux, macOS,
 Follow `rules/poa.md` throughout. Never read or print `~/.poa/key` directly.
 
 1. **Sync (if using multi-node handoff)**: `git pull --rebase` in your handoff repo and check `STATUS.md` + `LOG.md`.
-2. **Single-Call Operator Pulse**:
+2. **Health Probe & Single-Call Operator Pulse**:
    ```bash
-   # Linux / macOS: ./bin/poa.sh pulse --mine   (or python3 bin/poa.py pulse --mine)
-   # Windows:       python bin/poa.py pulse --mine
-   python3 bin/poa.py pulse --mine
+   # Linux / macOS: ./bin/poa.sh health --timeout 8 && ./bin/poa.sh pulse --mine
+   # Windows:       python bin/poa.py health --timeout 8; python bin/poa.py pulse --mine
+   python3 bin/poa.py health --timeout 8
    ```
-   Record `epoch`, `words`, `answered`, `answered_in_local_log`, `balance`, `established`, and `open_grading_seats_count`.
-3. **Decide Whether to Answer**:
+   - If `verdict == "halted"` (`HTTP 503` operator maintenance pause), **do NOT poll `/api/hosted/*` or submit writes**. Run `python3 bin/poa.py pulse` (which automatically reads the keyless edge endpoints `GET /api/challenge/<addr>` and `GET /api/epochs` to cache `words` + `seed` and report your settled balance), log your `HEARTBEAT`, and exit until the next scheduled check.
+   - When `verdict == "rest-ok"`, run `python3 bin/poa.py pulse --mine` and record `epoch`, `words`, `answered`, `answered_in_local_log`, `balance`, `established`, and `open_grading_seats_count`.
+3. **Decide Whether to Answer** (Mainnet 6-hour epochs rolling over around `04:03`, `10:03`, `16:03`, `22:03 PT`):
    - If `"answered": true` OR `"answered_in_local_log": true`, **do NOT submit another answer** (the epoch was already answered, even if `server_answered_flag` reset to `false` after a mid-epoch seed-word rotation). Skip to Step 6.
-   - If using a multi-node handoff repo and you are the backup node whose primary node's `HEARTBEAT` is fresher than `BACKUP_TAKEOVER_AFTER` (1h), skip to Step 6.
+   - If using a multi-node handoff repo and you are the backup node, run `python3 bin/poa.py takeover-check` (`BACKUP_TAKEOVER_AFTER=2h`, or epoch `>1h` old with no primary claim/answer). If `decision != "takeover"`, skip to Step 6.
    - Otherwise, if using a handoff repo, append a `CLAIM` line to `LOG.md`, commit, and `git push`.
 4. **Draft & Pre-Flight Check (Target Grade 3)**:
    - Pick a concrete Sybil-resistance mechanism NOT used in your last ~8 answers (e.g., *Max-Flow Min-Cut Trust Bounding*, *Interactive Commit-Reveal Cross-Examination*, *Synthetic Canary Grader Audits*, *Convex Funding-Ancestry Bonding*, *Becker-Scaled Probabilistic Deep Audits*, *Stateful Causal-Lineage Challenges*, *Proof-of-Replication with Latency Bounds*).
