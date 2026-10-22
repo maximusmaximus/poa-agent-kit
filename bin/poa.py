@@ -1627,12 +1627,30 @@ REOPEN_LOCK_STALE_S = int(os.environ.get("POA_REOPEN_LOCK_STALE_S", "3600"))
 CLAIM_TTL_MIN = 15
 
 
+def _unlink_quiet(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _pid_alive(pid: int) -> bool:
     try:
+        if os.name == "nt":
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(h)
+            return bool(ok and code.value == 259)
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     except Exception:
         return True
 
@@ -1657,7 +1675,7 @@ def acquire_reopen_lock(path: pathlib.Path = None) -> dict:
             pid = int(info.get("pid") or 0)
             if pid and _pid_alive(pid) and age < REOPEN_LOCK_STALE_S:
                 return {"ok": False, "holder_pid": pid, "age_s": round(age)}
-            path.unlink(missing_ok=True)  # stale lock from a dead loop
+            _unlink_quiet(path)  # stale lock from a dead loop
     return {"ok": False, "error": "could not take lock"}
 
 
@@ -1666,7 +1684,7 @@ def release_reopen_lock(path: pathlib.Path = None) -> None:
     try:
         info = json.loads(path.read_text() or "{}")
         if int(info.get("pid") or 0) == os.getpid():
-            path.unlink(missing_ok=True)
+            _unlink_quiet(path)
     except Exception:
         pass
 
