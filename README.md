@@ -90,6 +90,7 @@ python3 bin/poa.py mine
 ```bash
 python3 bin/poa.py assignments --audit
 python3 bin/poa.py backlog
+python3 bin/poa.py backlog --mine --table   # keyless: OUR pending answers, quorum gap, expiry, cannot-settle flag
 python3 bin/poa.py grade --assignment <answer_txid> --score 3 --reasoning "Concrete convex funding-ancestry bonding schedule O(k^2) with clear per-identity collateral cost and natural word integration."
 # Or submit a batch oldest-first with automatic timeout read-back verification:
 python3 bin/poa.py grade-batch --file work/grades.json --mine
