@@ -1552,6 +1552,242 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     print(json.dumps(out, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# reopen: one guarded post-halt sequence (SUGGESTIONS.md #33)
+# ---------------------------------------------------------------------------
+REOPEN_LOCK = POA_DIR / "reopen.lock"
+REOPEN_LOCK_STALE_S = int(os.environ.get("POA_REOPEN_LOCK_STALE_S", "3600"))
+CLAIM_TTL_MIN = 15
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
+def acquire_reopen_lock(path: pathlib.Path = None) -> dict:
+    """Exclusive lock so only one reopen/retry loop runs on this machine. A lock whose pid is dead
+    or older than REOPEN_LOCK_STALE_S is treated as a leftover from a dead loop and replaced."""
+    path = path or REOPEN_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w") as fp:
+                fp.write(json.dumps({"pid": os.getpid(), "at": time.time()}))
+            return {"ok": True}
+        except FileExistsError:
+            try:
+                info = json.loads(path.read_text() or "{}")
+            except Exception:
+                info = {}
+            age = time.time() - float(info.get("at") or 0)
+            pid = int(info.get("pid") or 0)
+            if pid and _pid_alive(pid) and age < REOPEN_LOCK_STALE_S:
+                return {"ok": False, "holder_pid": pid, "age_s": round(age)}
+            path.unlink(missing_ok=True)  # stale lock from a dead loop
+    return {"ok": False, "error": "could not take lock"}
+
+
+def release_reopen_lock(path: pathlib.Path = None) -> None:
+    path = path or REOPEN_LOCK
+    try:
+        info = json.loads(path.read_text() or "{}")
+        if int(info.get("pid") or 0) == os.getpid():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def other_poa_loops() -> list:
+    """Other running poa.py processes on this machine (old retry loops). Reported, never killed."""
+    try:
+        out = subprocess.run(["pgrep", "-af", "poa.py"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    me = os.getpid()
+    rows = []
+    for line in out.splitlines():
+        pid, _, cmd = line.partition(" ")
+        if pid.isdigit() and int(pid) != me and int(pid) != os.getppid() and " reopen" not in cmd and "pgrep" not in cmd:
+            rows.append({"pid": int(pid), "cmd": redact(cmd)[:120]})
+    return rows
+
+
+def handoff_append(log_path: pathlib.Path, node: str, epoch, event: str, note: str, words=None) -> str:
+    ts = datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M%z")
+    ts = ts[:-2] + ":" + ts[-2:]
+    line = f"{ts} | node={node} | epoch={epoch} | event={event} | words={','.join(words or [])} | note={note}"
+    with log_path.open("a", encoding="utf-8") as fp:
+        fp.write(line + "\n")
+    return line
+
+
+def handoff_git(log_path: pathlib.Path, action: str, msg: str = "") -> dict:
+    """pull (rebase) or commit+push the handoff repo. Any failure is reported; callers abort on push failure."""
+    repo = str(log_path.resolve().parent)
+    try:
+        if action == "pull":
+            r = subprocess.run(["git", "-C", repo, "pull", "-q", "--rebase"], capture_output=True, text=True, timeout=60)
+        else:
+            subprocess.run(["git", "-C", repo, "add", log_path.name], capture_output=True, text=True, timeout=30)
+            r = subprocess.run(["git", "-C", repo, "commit", "-qm", msg], capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                r = subprocess.run(["git", "-C", repo, "push", "-q"], capture_output=True, text=True, timeout=60)
+        return {"ok": r.returncode == 0, "err": r.stderr.strip()[:200]}
+    except Exception as e:
+        return {"ok": False, "err": str(e)[:200]}
+
+
+def epoch_claims(log_path: pathlib.Path, epoch, now=None) -> dict:
+    """Who has answered or holds a fresh CLAIM for `epoch` in the shared handoff log (any node)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    answered, claims = [], []
+    for r in handoff_lines(log_path):
+        if r.get("epoch") != str(epoch):
+            continue
+        if r.get("event") in ("ANSWERED", "SKIP_ANSWERED"):
+            answered.append(r.get("node"))
+        elif r.get("event") == "CLAIM" and now - r["ts"] < datetime.timedelta(minutes=CLAIM_TTL_MIN):
+            claims.append(r.get("node"))
+    return {"answered_by": answered, "fresh_claims": claims}
+
+
+def load_grade_queue(path: str) -> list:
+    """Queued grades: JSON list of {txid, score, note|reasoning, epoch?}, sent oldest epoch first."""
+    if not path:
+        return []
+    rows = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    rows = [r for r in rows if isinstance(r, dict) and (r.get("txid") or r.get("assignment"))]
+    rows.sort(key=lambda r: (int(r.get("epoch", r.get("answer_epoch", 10**9)) or 10**9)))
+    return rows
+
+
+def run_reopen(args: argparse.Namespace) -> tuple:
+    """Returns (exit_code, report). Exit 0 done/nothing to do, 2 still halted/down, 3 waiting on the
+    other node or unconfirmed, 4 another loop holds the lock / old loops running, 5 key/client error."""
+    log_path = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
+    rep = {"node": args.node, "primary": args.primary, "steps": []}
+
+    def step(name, **kw):
+        rep["steps"].append({"step": name, **kw})
+
+    lock = acquire_reopen_lock()
+    if not lock.get("ok"):
+        step("lock", **lock)
+        return 4, rep
+    try:
+        loops = other_poa_loops()
+        if loops and not args.ignore_running:
+            step("old-loops", running=loops, note="stop these first (they may resend); re-run with --ignore-running if they are unrelated")
+            return 4, rep
+        step("lock", ok=True, other_loops=len(loops))
+
+        # 1. ONE probe. Only a successful hosted read counts as resumed. No retry, no MCP.
+        try:
+            ch = api_call("GET", "/api/hosted/challenge", timeout=args.timeout, retries=1)
+        except PoaHTTPError as e:
+            step("probe", resumed=False, kind=e.kind, error=str(e)[:200], note="one probe only; not retrying")
+            rep["verdict"] = e.kind if e.kind in ("auth", "client") else "still-halted"
+            return (5 if e.kind in ("auth", "client") else 2), rep
+        epoch, words = ch.get("epoch"), ch.get("words") or []
+        cache_challenge(ch)
+        step("probe", resumed=True, epoch=epoch, words=words)
+
+        # 2. Already answered? hosted flag, public explorer, local log, shared handoff log.
+        if args.git_sync:
+            step("handoff-pull", **handoff_git(log_path, "pull"))
+        addr = local_address()
+        exp = explorer_find_answer(addr, epoch) if addr else {"found": None}
+        cl = epoch_claims(log_path, epoch)
+        answered = bool(ch.get("answered") or exp.get("found") or has_answered_epoch_locally(epoch) or cl["answered_by"])
+        step("answered-check", epoch=epoch, hosted=bool(ch.get("answered")), explorer=exp.get("found"),
+             handoff_answered_by=cl["answered_by"], fresh_claims=cl["fresh_claims"])
+
+        # 3. Answer exactly once, from the node allowed to.
+        if answered:
+            step("answer", action="skip", why="epoch already answered")
+        elif any(n != args.node for n in cl["fresh_claims"]):
+            step("answer", action="wait", why="other node holds a fresh CLAIM")
+            return 3, rep
+        else:
+            if args.node != args.primary:
+                sil = pc_silence(log_path, args.primary, args.hours)
+                if not sil["silent"]:
+                    step("answer", action="wait", why=f"{args.primary} heartbeat fresh; backup answers only after {args.hours}h silence")
+                    return 3, rep
+            if not args.answer_file:
+                step("answer", action="needs-file", why="unanswered and this node may answer; pass --answer-file")
+                return 3, rep
+            text = pathlib.Path(args.answer_file).read_text(encoding="utf-8").strip()
+            q = check_answer_quality(text, words)
+            if not q.get("passed"):
+                step("answer", action="preflight-failed", report=q)
+                return 5, rep
+            if args.dry_run:
+                step("answer", action="would-send", epoch=epoch)
+            else:
+                handoff_append(log_path, args.node, epoch, "CLAIM", "reopen: claiming answer", words)
+                if args.git_sync:
+                    g = handoff_git(log_path, "push", f"{args.node}: CLAIM E{epoch} (reopen)")
+                    if not g["ok"]:
+                        step("claim", ok=False, **g, why="claim not shared; not answering")
+                        return 3, rep
+                res = submit_answer_safely(text, epoch)
+                if res.get("landed") is not False and res.get("how") != "duplicate":
+                    conf = confirm_answer_landed(epoch, res.get("txid"), min_wait=args.confirm_min, max_wait=args.confirm_max)
+                    res["confirm"] = {k: conf.get(k) for k in ("landed", "how", "waited_s")}
+                    if conf.get("landed"):
+                        res["landed"] = True
+                step("answer", action="sent", landed=res.get("landed"), how=res.get("how"), txid=res.get("txid"))
+                if res.get("landed"):
+                    handoff_append(log_path, args.node, epoch, "ANSWERED", "reopen: read back ok", words)
+                    with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
+                        fp.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}\tchain={MAINNET_CHAIN_ID}\tepoch={epoch}\twords={','.join(words)}\t{text}\n")
+                if args.git_sync:
+                    handoff_git(log_path, "push", f"{args.node}: E{epoch} answer result (reopen)")
+                if res.get("landed") is False:
+                    return 5 if res.get("how") != "halted" else 2, rep
+                if res.get("landed") is None:
+                    return 3, rep
+
+        # 4. Seal queued grades oldest first, each read back via /assignments.
+        queue = load_grade_queue(args.grades_file)
+        if queue and args.node != args.primary and not pc_silence(log_path, args.primary, args.hours)["silent"]:
+            step("grades", action="skip", why="grading is the primary's job while it is alive")
+            queue = []
+        done, results = 0, []
+        for g in queue:
+            txid = g.get("txid") or g.get("assignment")
+            if args.dry_run:
+                results.append({"txid": txid, "action": "would-send"})
+                continue
+            r = submit_grade_safely(txid, int(g["score"]), g.get("note") or g.get("reasoning") or "")
+            results.append({"txid": txid, "landed": r.get("landed"), "how": r.get("how")})
+            if r.get("landed"):
+                done += 1
+            if r.get("kind") in ("auth",) or "halted" in str(r.get("error", "")).lower():
+                break
+        if queue:
+            step("grades", queued=len(queue), confirmed=done, results=results)
+        rep["verdict"] = "done"
+        return 0, rep
+    finally:
+        release_reopen_lock()
+
+
+def cmd_reopen(args: argparse.Namespace) -> None:
+    code, rep = run_reopen(args)
+    print(json.dumps(rep, indent=2, default=str))
+    if code:
+        sys.exit(code)
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     POA_DIR.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -1708,6 +1944,20 @@ def main() -> None:
     p_pcs.add_argument("--log", default="", help="Path to LOG.md (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_pcs.add_argument("--node", default="antigravity", help="Node name to check (default antigravity)")
     p_pcs.add_argument("--hours", type=float, default=2.0, help="Silence threshold in hours (default 2)")
+
+    p_ro = sub.add_parser("reopen", help="After a halt: one probe, lock, answer current epoch once (handoff-guarded), then seal queued grades oldest first")
+    p_ro.add_argument("--node", default=os.environ.get("POA_NODE", "antigravity"), help="This node's name in LOG.md")
+    p_ro.add_argument("--primary", default="antigravity", help="Primary node (backup answers only after --hours silence)")
+    p_ro.add_argument("--hours", type=float, default=2.0)
+    p_ro.add_argument("--log", default="", help="Path to LOG.md (default $POA_HANDOFF_LOG)")
+    p_ro.add_argument("--answer-file", default="", help="UTF-8 answer for the current epoch")
+    p_ro.add_argument("--grades-file", default="", help="JSON [{txid, score, note, epoch}] of queued grades")
+    p_ro.add_argument("--git-sync", action="store_true", help="pull/commit/push the handoff repo around the CLAIM")
+    p_ro.add_argument("--dry-run", action="store_true", help="Probe and check only; send nothing")
+    p_ro.add_argument("--ignore-running", action="store_true", help="Proceed even if other poa.py processes are running")
+    p_ro.add_argument("--timeout", type=float, default=20)
+    p_ro.add_argument("--confirm-min", type=int, default=EXPLORER_MIN_WAIT)
+    p_ro.add_argument("--confirm-max", type=int, default=EXPLORER_MAX_WAIT)
 
     p_tk = sub.add_parser("takeover-check", help="Read-only: should the backup answer this epoch? (6h epochs; PC silence >2h or epoch >1h old with no PC claim)")
     p_tk.add_argument("--log", default="", help="Path to LOG.md (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
@@ -1989,6 +2239,8 @@ def main() -> None:
         elif args.command == "pc-silence":
             res = pc_silence(pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG, args.node, args.hours)
             print(json.dumps(res, indent=2))
+        elif args.command == "reopen":
+            cmd_reopen(args)
         elif args.command == "takeover-check":
             cmd_takeover_check(args)
         elif args.command == "pulse":

@@ -136,6 +136,7 @@ Branch defaults to `poa-mainnet-1`. Directory listings use the GitHub API, which
 - `python3 bin/poa.py answer-status [--epoch N] [--wait SECS]`: keyless explorer check (`/api/explorer/address/<addr>?sort=new`) to confirm whether an answer landed on-chain without sending anything.
 - `python3 bin/poa.py pc-silence [--node <primary>] [--hours 2]`: reads the handoff `LOG.md` (`$POA_HANDOFF_LOG`) and reports `silent: true` when the primary node's newest HEARTBEAT is older than the threshold.
 - `python3 bin/poa.py takeover-check`: read-only decision for a backup node on Mainnet 6-hour epochs: `skip` (answered), `wait` (maintenance halt `503`, server unknown, fresh primary claim, or primary fresh and epoch <1h old) or `takeover` (unanswered and primary heartbeat >2h, or epoch window >1h with no primary claim/answer).
+- `python3 bin/poa.py reopen --node <name> --answer-file answer.txt --grades-file queued.json --git-sync`: the post-halt sequence in one guarded step. It takes a lock (`~/.poa/reopen.lock`) and refuses if other `poa.py` loops are running, sends ONE hosted probe (503 or a dropped connection = still halted, exit 2, no retry), checks the hosted flag, explorer, local log and handoff `LOG.md` for an existing answer, lets only the primary (or the backup after `--hours` of primary silence) write a `CLAIM` line and answer once with read-back, then seals queued grades oldest epoch first. `--dry-run` sends nothing. Exit codes: 0 done, 2 halted, 3 waiting/unconfirmed, 4 lock or old loops, 5 key/client error.
 
 ## Included Agent Skills (`skills/`)
 

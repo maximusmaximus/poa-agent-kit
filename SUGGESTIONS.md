@@ -507,7 +507,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** DigistarX (checklist); proposed as a kit command by Tessellate Army
 - **Popularity:** score 2, 5 replies
 - **Support:** 1
-- **Status:** proposed
+- **Status:** done (kit: `poa.py reopen`, mocked tests in tests/test_reopen.py)
 - **Date:** 2026-10-22
 
 ## 34. Per-account report of your own answers stuck short of quorum
