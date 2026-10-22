@@ -1469,6 +1469,53 @@ def backlog_order_key(row: dict) -> tuple:
     return (since, min(int(row.get("panel_size", 99)), 2), int(row.get("seals", 0)))
 
 
+def own_answer_candidates(me: str, log_path: pathlib.Path = None) -> dict:
+    """Txids (full or hex prefix) of OUR answers, from public/local sources only (no key):
+    keyless explorer address view (type=challenge) and poa-handoff LOG.md ANSWERED/'challenge tx' notes.
+    Returns {txid_or_prefix: {"epoch": n|None, "source": str}}."""
+    out = {}
+    if me:
+        d = explorer_get(f"/api/explorer/address/{me}?sort=new")
+        for t in (d.get("txs") or []) if isinstance(d, dict) else []:
+            if isinstance(t, dict) and t.get("type") == "challenge" and t.get("id"):
+                out[t["id"]] = {"epoch": t.get("epoch"), "source": "explorer"}
+    lp = log_path or HANDOFF_LOG
+    if lp and lp.is_file():
+        for line in lp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m_ep = re.search(r"\bepoch=(\d+)", line)
+            hits = re.findall(r"challenge tx ([0-9a-f]{8,64})", line)
+            if "event=ANSWERED" in line:
+                hits += re.findall(r"\btxid[ =]([0-9a-f]{8,64})", line)
+            for h in hits:
+                out.setdefault(h, {"epoch": int(m_ep.group(1)) if m_ep else None, "source": "handoff-log"})
+    return out
+
+
+def own_pending_rows(pending: dict, cands: dict, quorum: int, ttl: int, close_n) -> list:
+    rows = []
+    for c, meta in cands.items():
+        tx = c if c in pending else next((k for k in pending if k.startswith(c)), None) if len(c) >= 8 else None
+        if not tx or any(r["txid"] == tx for r in rows):
+            continue
+        r = pending[tx] if isinstance(pending[tx], dict) else {}
+        panel = len(r.get("panel") or [])
+        grades = r.get("grades") or []
+        since = r.get("since") if isinstance(r.get("since"), int) else meta.get("epoch")
+        # A row settles only via its drawn panel; with every panel seat sealed and seals < quorum it is stuck.
+        cannot = panel < quorum
+        rows.append({
+            "epoch": since, "txid": tx[:16], "panel_size": panel, "grades": len(grades),
+            "scores": [g.get("score") for g in grades if isinstance(g, dict)],
+            "to_quorum": max(0, quorum - len(grades)),
+            "expires_after_close": (since + ttl) if isinstance(since, int) else None,
+            "closes_left": ((since + ttl) - close_n) if isinstance(since, int) and isinstance(close_n, int) else None,
+            "cannot_settle_under_current_params": cannot,
+            "source": meta.get("source"),
+        })
+    rows.sort(key=lambda x: (x["epoch"] if isinstance(x["epoch"], int) else 10**9))
+    return rows
+
+
 def cmd_backlog(args: argparse.Namespace) -> None:
     """Read-only: public GET /api/epochs (+ optional hosted assignments) -> backlog report for our address.
 
@@ -1505,6 +1552,26 @@ def cmd_backlog(args: argparse.Namespace) -> None:
             "expires_after_close": (int(r["since"]) + ttl) if isinstance(r.get("since"), int) else None,
         })
     rows.sort(key=backlog_order_key)
+
+    if getattr(args, "mine", False):
+        own = own_pending_rows(pending, own_answer_candidates(me, pathlib.Path(args.log).expanduser() if args.log else None),
+                               quorum, ttl, close_n)
+        res = {"read_only": True, "mode": "mine", "close_epoch": close_n, "grade_quorum": quorum,
+               "pending_ttl_epochs": ttl, "address_configured": bool(me),
+               "own_pending": len(own), "own_cannot_settle": sum(1 for x in own if x["cannot_settle_under_current_params"]),
+               "rows": own,
+               "note": ("Public reads only (GET /api/epochs, /api/params, explorer address view) plus the local handoff log for "
+                        "txids. cannot_settle = drawn panel smaller than grade_quorum, so the row needs an operator top-up. "
+                        "Settled or expired answers drop out of pending and are not listed.")}
+        if args.table:
+            print(f"close E{close_n}  quorum {quorum}  ttl {ttl}  own pending {len(own)}")
+            print("epoch  txid              panel grades need expires  left  status")
+            for x in own:
+                print(f"E{x['epoch']!s:<5} {x['txid']}  {x['panel_size']:>5} {x['grades']:>6} {x['to_quorum']:>4}  E{x['expires_after_close']!s:<6} {x['closes_left']!s:>4}  "
+                      + ("CANNOT SETTLE (panel < quorum)" if x["cannot_settle_under_current_params"] else "can settle"))
+        else:
+            print(json.dumps(res, indent=2))
+        return
 
     ours_open = [x for x in rows if x["on_our_panel"] and not x["we_sealed"]]
     ours_sealed = [x for x in rows if x["we_sealed"]]
@@ -1926,6 +1993,9 @@ def main() -> None:
     p_bl.add_argument("--limit", type=int, default=25, help="Max rows per list (default 25)")
     p_bl.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
     p_bl.add_argument("--no-key", action="store_true", help="Skip the keyed assignments read; public data only")
+    p_bl.add_argument("--mine", action="store_true", help="Keyless: list OUR OWN pending answers (panel, grades, quorum gap, expiry, cannot-settle flag)")
+    p_bl.add_argument("--table", action="store_true", help="With --mine: plain-text table instead of JSON")
+    p_bl.add_argument("--log", default="", help="With --mine: handoff LOG.md for our answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
 
     p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
