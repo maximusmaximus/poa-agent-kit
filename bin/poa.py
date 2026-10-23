@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -1665,6 +1666,144 @@ def cmd_backlog(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# close-health: keyless read of the newest epoch close (SUGGESTIONS.md #39)
+# ---------------------------------------------------------------------------
+CLOSE_THIN_RATIO = 0.5  # eligible below half the median of earlier closes = thin (signal only)
+
+
+def _f(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _epoch_list(epochs_res) -> list:
+    eps = epochs_res
+    if isinstance(eps, dict):
+        eps = eps.get("epochs") or eps.get("items") or [eps]
+    out = [e for e in (eps or []) if isinstance(e, dict) and e.get("epoch") is not None]
+    out.sort(key=lambda e: int(e.get("epoch")))
+    return out
+
+
+def close_health(epochs_res, k: int = 5, epoch: int = None, address: str = "") -> dict:
+    """Summarize one close record from GET /api/epochs. Pure function: no network."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    if epoch is None:
+        idx = len(eps) - 1
+    else:
+        idx = next((i for i, e in enumerate(eps) if int(e["epoch"]) == int(epoch)), None)
+        if idx is None:
+            return {"ok": False, "error": f"epoch {epoch} not found (closes {eps[0]['epoch']}..{eps[-1]['epoch']})"}
+    e = eps[idx]
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    atts = b.get("attestations") or {}
+    attesters = len(atts) if isinstance(atts, (dict, list)) else 0
+    eligible = b.get("challenge_eligible") or []
+    pool = _f(e.get("pool"))
+    fp = b.get("final_payout") if isinstance(b.get("final_payout"), dict) else {}
+    burned = _f(fp.get("burned"))
+    rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+    paid = {a: _f(v) for a, v in rewards.items() if _f(v) > 0}
+    earlier = [len((x.get("basis") or {}).get("challenge_eligible") or []) for x in eps[:idx] if int(x["epoch"]) > 0]
+    median_prev = statistics.median(earlier) if earlier else None
+    ts = e.get("ts")
+    prev_ts = eps[idx - 1].get("ts") if idx > 0 else None
+
+    flags = []
+    if attesters < k:
+        flags.append("attesters_below_k")
+    if median_prev and len(eligible) < CLOSE_THIN_RATIO * median_prev:
+        flags.append("eligible_thin")
+    if pool and burned / pool > 0.75:
+        flags.append("mostly_burned")
+    verdict = "halted-like" if "attesters_below_k" in flags else ("thin" if flags else "healthy")
+
+    res = {
+        "ok": True,
+        "read_only": True,
+        "epoch": int(e["epoch"]),
+        "closed_at": _iso(ts) if ts else None,
+        "hours_since_previous_close": round((ts - prev_ts) / 3600, 2) if isinstance(ts, (int, float)) and isinstance(prev_ts, (int, float)) else None,
+        "verdict": verdict,
+        "flags": flags,
+        "distinct_attesters": attesters,
+        "k": k,
+        "challenge_eligible": len(eligible),
+        "median_eligible_earlier_closes": median_prev,
+        "settled": len(b.get("settled") or []),
+        "pending": len(b.get("pending") or {}),
+        "established_after": len(b.get("established_after") or []),
+        "established_removed": len(b.get("established_removed") or []),
+        "slashed": len(b.get("slashed") or []),
+        "ejected": len(b.get("ejected") or []),
+        "addresses_paid": len(paid),
+        "rewards_total": f"{sum(paid.values()):.6f}",
+        "pool": f"{pool:.6f}",
+        "burned": f"{burned:.6f}",
+        "burned_share": round(burned / pool, 4) if pool else None,
+        "note": ("Public read of GET /api/epochs only. halted-like = fewer distinct attesters than K; "
+                 "thin = challenge-eligible under half the median of earlier closes, or over 75% of the pool burned. "
+                 "These are signals for humans, not anything the network itself uses."),
+    }
+    me = (address or "").strip()
+    if me:
+        res["you"] = {
+            "challenge_eligible": me in eligible,
+            "attested": me in atts,
+            "reward": f"{_f(rewards.get(me)):.6f}",
+            "established_after": me in (b.get("established_after") or []),
+            "established_removed": me in (b.get("established_removed") or []),
+            "slashed": me in (b.get("slashed") or []),
+            "ejected": me in (b.get("ejected") or []),
+        }
+    return res
+
+
+def print_close_health(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-health: {r.get('error')}")
+        return
+    print(f"E{r['epoch']} closed {r['closed_at']} ({r['hours_since_previous_close']}h after the previous close): {r['verdict'].upper()}"
+          + (f"  [{', '.join(r['flags'])}]" if r["flags"] else ""))
+    print(f"  attesters {r['distinct_attesters']} vs K {r['k']} | eligible {r['challenge_eligible']} (earlier median {r['median_eligible_earlier_closes']})"
+          f" | settled {r['settled']} | pending {r['pending']}")
+    print(f"  established +{r['established_after']} / removed {r['established_removed']} | slashed {r['slashed']} | ejected {r['ejected']}")
+    print(f"  paid {r['addresses_paid']} addresses {r['rewards_total']} POA | burned {r['burned']} of {r['pool']} ({r['burned_share']})")
+    y = r.get("you")
+    if y:
+        print(f"  you: eligible {y['challenge_eligible']} | attested {y['attested']} | reward {y['reward']} | "
+              f"established_after {y['established_after']} | removed {y['established_removed']} | slashed {y['slashed']}")
+
+
+def cmd_close_health(args: argparse.Namespace) -> None:
+    k = args.k
+    if k is None:
+        try:
+            k = int(api_call("GET", "/api/status", need_key=False, timeout=20, retries=1).get("K", 5) or 5)
+        except Exception:
+            k = 5
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-health: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    me = "" if args.no_address else (args.address or local_address())
+    r = close_health(epochs_res, k=k, epoch=args.epoch, address=me)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_close_health(r)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["verdict"] != "healthy":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # reopen: one guarded post-halt sequence (SUGGESTIONS.md #33)
 # ---------------------------------------------------------------------------
 REOPEN_LOCK = POA_DIR / "reopen.lock"
@@ -2063,6 +2202,14 @@ def main() -> None:
     p_bl.add_argument("--table", action="store_true", help="With --mine: plain-text table instead of JSON")
     p_bl.add_argument("--log", default="", help="With --mine: handoff LOG.md for our answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
 
+    p_ch = sub.add_parser("close-health", help="Keyless: health of the newest epoch close (attesters vs K, eligible, settled, removed, burned, your address)")
+    p_ch.add_argument("--epoch", type=int, default=None, help="Close to read (default: newest)")
+    p_ch.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
+    p_ch.add_argument("--no-address", action="store_true", help="Skip the per-address lines")
+    p_ch.add_argument("--k", type=int, default=None, help="Attester threshold (default: K from /api/status, else 5)")
+    p_ch.add_argument("--json", action="store_true", help="JSON output")
+    p_ch.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
     p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
@@ -2259,6 +2406,8 @@ def main() -> None:
                 sys.exit(2)
         elif args.command == "backlog":
             cmd_backlog(args)
+        elif args.command == "close-health":
+            cmd_close_health(args)
         elif args.command == "grade-batch":
             cmd_grade_batch(args)
         elif args.command == "ballots":

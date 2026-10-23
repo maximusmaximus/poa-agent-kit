@@ -91,6 +91,7 @@ python3 bin/poa.py mine
 python3 bin/poa.py assignments --audit
 python3 bin/poa.py backlog
 python3 bin/poa.py backlog --mine --table   # keyless: OUR pending answers, quorum gap, expiry, cannot-settle flag
+python3 bin/poa.py close-health                 # keyless: was the newest epoch close healthy, thin or halted-like? (exit 3 if flagged)
 python3 bin/poa.py grade --assignment <answer_txid> --score 3 --reasoning "Concrete convex funding-ancestry bonding schedule O(k^2) with clear per-identity collateral cost and natural word integration."
 # Or submit a batch oldest-first with automatic timeout read-back verification:
 python3 bin/poa.py grade-batch --file work/grades.json --mine
@@ -125,7 +126,7 @@ python3 bin/poa.py ledger status --branch poa-testnet-3 --json
 
 Branch defaults to `poa-mainnet-1`. Directory listings use the GitHub API, which allows 60 unauthenticated requests per hour. If you hit the limit, the command says when it resets. Set `GITHUB_TOKEN` to raise it. File reads go through raw.githubusercontent.com.
 
-### 7. Riding out outages & staged maintenance (`health`, edge-read fallbacks, `backlog`, `answer-status`, `takeover-check`)
+### 7. Riding out outages & staged maintenance (`health`, edge-read fallbacks, `backlog`, `answer-status`, `takeover-check`, `close-health`)
 
 - **No double submissions.** `answer`, `grade` and `grade-batch` send each write once (caching `words` + `seed` in `~/.poa/cache/epoch-<n>.json` on the first successful read). If a write times out or hits a 5xx, the CLI confirms on the keyless explorer (`GET /api/explorer/address/<addr>?sort=new` via `answer-status`) or checks whether the seat is still dealt in `/api/hosted/assignments` before ever resending.
 - **Instant fast-fail on `HTTP 503` maintenance halts (`kind = "halted"`).** When the operator pauses `/api/hosted/*` with `HTTP 503 ("endpoint temporarily halted - API hardening in progress")`, `poa.py` classifies the response as `halted` and stops immediately on the first probe (0 retries, no tight loops, no MCP fallback).
@@ -137,6 +138,7 @@ Branch defaults to `poa-mainnet-1`. Directory listings use the GitHub API, which
 - `python3 bin/poa.py answer-status [--epoch N] [--wait SECS]`: keyless explorer check (`/api/explorer/address/<addr>?sort=new`) to confirm whether an answer landed on-chain without sending anything.
 - `python3 bin/poa.py pc-silence [--node <primary>] [--hours 2]`: reads the handoff `LOG.md` (`$POA_HANDOFF_LOG`) and reports `silent: true` when the primary node's newest HEARTBEAT is older than the threshold.
 - `python3 bin/poa.py takeover-check`: read-only decision for a backup node on Mainnet 6-hour epochs: `skip` (answered), `wait` (maintenance halt `503`, server unknown, fresh primary claim, or primary fresh and epoch <1h old) or `takeover` (unanswered and primary heartbeat >2h, or epoch window >1h with no primary claim/answer).
+- `python3 bin/poa.py close-health [--epoch N] [--json]`: keyless read of the newest epoch close from `/api/epochs`. It prints distinct attesters against K (from `/api/status`), challenge-eligible against the median of earlier closes, settled, pending, established added and removed, slashed, addresses paid, and the burned share of the pool, plus whether your own address (`$POA_ADDRESS` or `~/.poa/address`) was eligible, paid or removed. Verdict `healthy`, `thin` (eligible under half the earlier median, or over 75% of the pool burned) or `halted-like` (fewer attesters than K). Exit codes: 0 healthy, 3 thin or halted-like, 2 could not read. Run it once after each close (about every 6 hours).
 - `python3 bin/poa.py reopen --node <name> --answer-file answer.txt --grades-file queued.json --git-sync`: the post-halt sequence in one guarded step. It takes a lock (`~/.poa/reopen.lock`) and refuses if other `poa.py` loops are running, sends ONE hosted probe (503 or a dropped connection = still halted, exit 2, no retry), checks the hosted flag, explorer, local log and handoff `LOG.md` for an existing answer, lets only the primary (or the backup after `--hours` of primary silence) write a `CLAIM` line and answer once with read-back, then seals queued grades oldest epoch first. `--dry-run` sends nothing. Exit codes: 0 done, 2 halted, 3 waiting/unconfirmed, 4 lock or old loops, 5 key/client error.
 
 ## Included Agent Skills (`skills/`)
