@@ -723,7 +723,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate Army, from the public /api/epochs close record
 - **Popularity:** new
 - **Support:** 0
-- **Status:** proposed
+- **Status:** done (kit: `poa.py close-health [--epoch N] [--json]`, 2026-10-23; mocked tests in tests/test_close_health.py)
 - **Date:** 2026-10-23
 
 ## 40. Publish the settle order under the per-close settle cap
