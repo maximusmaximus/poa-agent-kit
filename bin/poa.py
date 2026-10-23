@@ -214,21 +214,31 @@ def http_transport() -> str:
     return "httpx-h2" if _HTTP2 else "httpx-h1"
 
 
-def http_request(method: str, url: str, data: bytes = None, headers: dict = None, timeout: float = 30) -> bytes:
-    """One HTTP request; returns body bytes or raises urllib.error.HTTPError / TimeoutError / OSError."""
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # urllib then raises HTTPError(3xx) instead of following
+
+
+def http_request(method: str, url: str, data: bytes = None, headers: dict = None, timeout: float = 30,
+                 follow_redirects: bool = True) -> bytes:
+    """One HTTP request; returns body bytes or raises urllib.error.HTTPError / TimeoutError / OSError.
+    With follow_redirects=False any 3xx is raised as HTTPError(3xx) on both transports."""
     headers = dict(headers or {})
     if http_transport() != "urllib":
         try:
-            with _httpx.Client(http2=_HTTP2, timeout=timeout, follow_redirects=True) as c:
+            with _httpx.Client(http2=_HTTP2, timeout=timeout, follow_redirects=follow_redirects) as c:
                 r = c.request(method.upper(), url, content=data, headers=headers)
         except _httpx.TimeoutException as e:
             raise TimeoutError(f"timed out ({type(e).__name__})")
         except _httpx.HTTPError as e:
             raise OSError(f"{type(e).__name__}: {e}")
-        if r.status_code >= 400:
+        if r.status_code >= 400 or (not follow_redirects and 300 <= r.status_code < 400):
             raise urllib.error.HTTPError(url, r.status_code, r.reason_phrase or "", r.headers, io.BytesIO(r.content))
         return r.content
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    if not follow_redirects:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
+            return resp.read()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -559,15 +569,22 @@ def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
 
 def write_receipt(txid: str, timeout: float = 20) -> dict:
     """Keyless write receipt for one txid. outcome: landed-final | landed-pending | not-found | unknown.
-    A timeout, outage or network error is ALWAYS `unknown` (never failed); only a real 404 is `not-found`."""
+    A timeout, outage, network error or ANY 3xx redirect is ALWAYS `unknown` (never failed); only a direct 404 is `not-found`.
+    Redirects are not followed: the explorer tx index misses ~epoch 5 to pre-restart epoch 10 and answers 307 for those
+    (finding by Steven-Vernier, LabLeak comment 3311), so a redirect means "not indexed", not "absent"."""
     txid = (txid or "").strip()
     if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
         return {"txid": txid, "outcome": "invalid", "resend_ok": False, "note": "txid must be hex"}
     path = f"/api/explorer/tx/{txid}"
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout)
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout,
+                           follow_redirects=False)
         d = json.loads(raw.decode("utf-8", errors="replace"))
     except Exception as e:
+        if isinstance(e, urllib.error.HTTPError) and 300 <= e.code < 400:
+            return {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": "redirect", "http_status": e.code,
+                    "note": f"explorer answered {e.code} redirect: tx NOT INDEXED (explorer gap, e.g. epochs ~5-10 pre-restart), "
+                            "not absent. Unknown, NOT safe to resend; check your own logs / address history."}
         err = _classify(e, path, "")
         if err.status == 404:
             return {"txid": txid, "outcome": "not-found", "resend_ok": True,
@@ -1985,7 +2002,7 @@ def main() -> None:
     p_ans.add_argument("--epoch", type=int, default=None, help="Use the cached challenge for this epoch if live reads fail")
     p_ans.add_argument("--no-confirm", action="store_true", help="Skip the >=3 min explorer confirmation wait")
     p_ans.add_argument("--read-retries", type=int, default=3, help="Live challenge read attempts before falling back to cache")
-    p_rc = sub.add_parser("receipt", help="Keyless write receipt by txid: landed-final / landed-pending / not-found (404) / unknown (timeout, never 'failed')")
+    p_rc = sub.add_parser("receipt", help="Keyless write receipt by txid: landed-final / landed-pending / not-found (direct 404) / unknown (timeout or 3xx redirect, never 'failed')")
     p_rc.add_argument("txid", nargs="+")
     p_rc.add_argument("--timeout", type=float, default=20)
     p_st = sub.add_parser("answer-status", help="Keyless explorer check: did our answer for an epoch land? (never sends)")

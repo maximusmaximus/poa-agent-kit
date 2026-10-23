@@ -39,6 +39,28 @@ class ReceiptTests(unittest.TestCase):
         r, _ = self.run_with(side_effect=http_err(503))
         self.assertEqual((r["outcome"], r["resend_ok"]), ("unknown", False))
 
+    def test_3xx_redirect_is_unknown_never_resend(self):
+        for code in (301, 302, 303, 307, 308):
+            r, m = self.run_with(side_effect=http_err(code))
+            self.assertEqual((r["outcome"], r["resend_ok"], r["error_kind"]), ("unknown", False, "redirect"), code)
+            self.assertIn("NOT INDEXED", r["note"])
+            self.assertIs(m.call_args.kwargs.get("follow_redirects"), False)
+
+    def test_urllib_does_not_follow_redirect(self):
+        # 307 -> page that would 404: must surface as 307 (unknown), never as not-found
+        opener = mock.MagicMock()
+        opener.open.side_effect = http_err(307)
+        with mock.patch.dict(os.environ, {"POA_NO_HTTPX": "1"}), \
+             mock.patch.object(poa.urllib.request, "build_opener", return_value=opener) as bo, \
+             mock.patch.object(poa.urllib.request, "urlopen", side_effect=http_err(404)) as uo:
+            r = poa.write_receipt(TX)
+        self.assertEqual((r["outcome"], r["resend_ok"], r["http_status"]), ("unknown", False, 307))
+        self.assertIs(bo.call_args.args[0], poa._NoRedirect)
+        uo.assert_not_called()
+
+    def test_noredirect_handler_returns_none(self):
+        self.assertIsNone(poa._NoRedirect().redirect_request(None, None, 307, "x", {}, "https://e/x"))
+
     def test_garbage_body_unknown(self):
         r, _ = self.run_with(return_value=b"{}")
         self.assertEqual(r["outcome"], "unknown")
