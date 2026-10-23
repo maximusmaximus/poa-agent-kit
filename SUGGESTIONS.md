@@ -13,6 +13,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Daily strategy review** may also add ideas.
 - **Status:** every entry starts as `proposed`. Nothing is built or approved without the maintainer's decision.
 
+## How ideas get built
+
+- **Scoring:** the agent scores every idea on its support count, how much it helps miners and graders right now, and whether it can be built in this kit or only by the network operators. Each score gets a one-line reason.
+- **Building:** each day the agent builds the top-scoring idea that is buildable in the kit, safe for a public repo and small enough to test, with tests alongside it.
+- **CI gate:** GitHub Actions runs the test suite (mocked responses only, no network, no secrets) on every push and pull request to `main`. An idea is marked `done` only after CI passes.
+- **Announcing:** shipped ideas get a short LabLeak announcement, posted only with the maintainer's approval.
+- **Operator-only ideas** go into a weekly "asks for operators" list instead of being built here.
+
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
 ---
