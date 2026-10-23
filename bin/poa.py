@@ -557,6 +557,34 @@ def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
     return {"found": False, "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height"), "txs_listed": len(d.get("txs") or [])}
 
 
+def write_receipt(txid: str, timeout: float = 20) -> dict:
+    """Keyless write receipt for one txid. outcome: landed-final | landed-pending | not-found | unknown.
+    A timeout, outage or network error is ALWAYS `unknown` (never failed); only a real 404 is `not-found`."""
+    txid = (txid or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
+        return {"txid": txid, "outcome": "invalid", "resend_ok": False, "note": "txid must be hex"}
+    path = f"/api/explorer/tx/{txid}"
+    try:
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout)
+        d = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as e:
+        err = _classify(e, path, "")
+        if err.status == 404:
+            return {"txid": txid, "outcome": "not-found", "resend_ok": True,
+                    "note": "explorer returned 404: the write did not land; resending is safe (re-check once if it was sent seconds ago)"}
+        return {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": err.kind,
+                "note": "read failed (" + err.kind + "): unknown, NOT failed. Do not resend; re-run `receipt` later."}
+    t = (d.get("tx") if isinstance(d, dict) and isinstance(d.get("tx"), dict) else d) or {}
+    if not isinstance(t, dict) or not (t.get("id") or t.get("type")):
+        return {"txid": txid, "outcome": "unknown", "resend_ok": False, "note": "unexpected explorer body; treat as unknown"}
+    atts = t.get("atts", t.get("attestations"))
+    atts_n = len(atts) if isinstance(atts, list) else atts
+    final = bool(t.get("final"))
+    return {"txid": txid, "outcome": "landed-final" if final else "landed-pending", "resend_ok": False,
+            "type": t.get("type"), "epoch": t.get("epoch"), "ts": t.get("ts"), "final": final, "attestations": atts_n,
+            "note": "on the ledger; do not resend (a resend creates a duplicate for graders)"}
+
+
 def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wait: int = None, sleep=time.sleep) -> dict:
     """Wait >= min_wait (explorer lags), then poll the explorer (and /challenge when it answers) until max_wait.
     Never sends anything. Result landed: True / None (unknown); never False from silence alone."""
@@ -1957,6 +1985,9 @@ def main() -> None:
     p_ans.add_argument("--epoch", type=int, default=None, help="Use the cached challenge for this epoch if live reads fail")
     p_ans.add_argument("--no-confirm", action="store_true", help="Skip the >=3 min explorer confirmation wait")
     p_ans.add_argument("--read-retries", type=int, default=3, help="Live challenge read attempts before falling back to cache")
+    p_rc = sub.add_parser("receipt", help="Keyless write receipt by txid: landed-final / landed-pending / not-found (404) / unknown (timeout, never 'failed')")
+    p_rc.add_argument("txid", nargs="+")
+    p_rc.add_argument("--timeout", type=float, default=20)
     p_st = sub.add_parser("answer-status", help="Keyless explorer check: did our answer for an epoch land? (never sends)")
     p_st.add_argument("--epoch", type=int, default=None)
     p_st.add_argument("--wait", type=int, default=0, help="Keep polling up to N seconds")
@@ -2175,6 +2206,11 @@ def main() -> None:
                 sys.exit(2)
             if sub_res.get("landed") is None:
                 sys.exit(3)
+        elif args.command == "receipt":
+            res = [write_receipt(t, timeout=args.timeout) for t in args.txid]
+            print(json.dumps(res[0] if len(res) == 1 else res, indent=2, default=str))
+            codes = {"landed-final": 0, "landed-pending": 0, "not-found": 4, "unknown": 3, "invalid": 2}
+            sys.exit(max(codes[r["outcome"]] for r in res))
         elif args.command == "answer-status":
             cached = load_epoch_cache(args.epoch)
             ep = args.epoch if args.epoch is not None else cached.get("epoch")
