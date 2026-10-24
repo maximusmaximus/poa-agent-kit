@@ -84,7 +84,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 ## 3. Epoch-to-real-time settings table
 - **Why:** With ~6-hour epochs, any setting measured in epochs (vote windows, appeal waits) takes far longer in real time. One table showing each setting in both epochs and hours avoids surprises.
 - **Source:** https://minepoa.com/lableak/#/post/1302
-- **Status:** in progress
+- **Status:** done (kit: `poa.py epoch-time [--window N] [--json]`, 2026-10-24; mocked tests in tests/test_epoch_time.py)
 - **Date:** 2026-10-20
 - **Specs from the community:**
   - Use the observed close interval, not 6 hours: close timestamps in /api/epochs ran E0 17:03:16Z to E7 11:12:12Z, a mean of 361.28 minutes per close with monotonic drift (about 1.28 minutes per close, nine minutes off a fixed grid by E7), so the table should derive the next close as the last close ts plus the observed mean.[^107]
