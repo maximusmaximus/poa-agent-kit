@@ -43,9 +43,9 @@ LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstr
 FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
 FLOOR_MCP_URL = os.environ.get("POA_FLOOR_MCP_URL", f"{FLOOR_BASE_URL}/api/mcp")
 MAINNET_CHAIN_ID = "poa-mainnet-1"
-# UTC timestamp when poa-mainnet-1 launched (2026-10-19 10:03 PT = 17:03 UTC)
-MAINNET_GENESIS_UTC = "2026-10-19T17:03:00"
-MAINNET_GENESIS_PT = "2026-10-19T10:03"
+# UTC/PT timestamp of the Segment 2 genesis cut (2026-10-24-genesis-cut: 2026-10-24 14:00 PT = 21:00 UTC)
+MAINNET_GENESIS_UTC = "2026-10-24T21:00:00"
+MAINNET_GENESIS_PT = "2026-10-24T14:00"
 
 POA_DIR = pathlib.Path(os.environ.get("POA_HOME", str(pathlib.Path.home() / ".poa"))).expanduser()
 KEY_FILE = POA_DIR / "key"
@@ -153,7 +153,7 @@ def has_answered_epoch_locally(epoch) -> bool:
             for line in ANSWERS_LOG.read_text(encoding="utf-8", errors="ignore").splitlines():
                 if marker in line or line.endswith(f"\tepoch={epoch}"):
                     ts_part = line.split("\t", 1)[0].strip()
-                    if f"chain={MAINNET_CHAIN_ID}" in line or ts_part >= MAINNET_GENESIS_UTC:
+                    if ts_part >= MAINNET_GENESIS_UTC:
                         return True
         except Exception:
             pass
@@ -424,7 +424,15 @@ def load_epoch_cache(epoch=None) -> dict:
         epoch = max(nums)
     f = epoch_cache_path(epoch)
     try:
-        return json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
+        if not f.is_file():
+            return {}
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        ts_ref = str(data.get("last_read") or data.get("first_read") or data.get("sent_at") or "").strip()
+        if ts_ref and ts_ref < MAINNET_GENESIS_UTC:
+            return {}
+        return data
     except Exception:
         return {}
 
@@ -800,7 +808,8 @@ def safe_mine() -> dict:
 # Handoff helpers: PC silence + takeover decision for 6-hour epochs
 # ---------------------------------------------------------------------------
 EPOCH_SECONDS = int(os.environ.get("POA_EPOCH_SECONDS", "21600"))
-EPOCH_ANCHOR_UTC = os.environ.get("POA_EPOCH_ANCHOR_UTC", "2026-10-19T17:03:00+00:00")
+EPOCH_ANCHOR_UTC = os.environ.get("POA_EPOCH_ANCHOR_UTC", "2026-10-24T21:01:00+00:00")
+SEGMENT2_GENESIS_DT = datetime.datetime.fromisoformat("2026-10-24T21:00:00+00:00")
 
 
 def _parse_log_ts(ts: str):
@@ -905,6 +914,8 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
     if out["epoch"] is not None:
         claim_ttl = datetime.timedelta(minutes=15)
         for r in handoff_lines(log_path):
+            if r["ts"] < SEGMENT2_GENESIS_DT:
+                continue
             if r.get("node") == args.node and r.get("epoch") == str(out["epoch"]):
                 if r.get("event") in ("ANSWERED", "SKIP_ANSWERED"):
                     out["pc_claim_or_answer"] = True
@@ -2228,7 +2239,7 @@ def epoch_claims(log_path: pathlib.Path, epoch, now=None) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
     answered, claims = [], []
     for r in handoff_lines(log_path):
-        if r.get("epoch") != str(epoch):
+        if r["ts"] < SEGMENT2_GENESIS_DT or r.get("epoch") != str(epoch):
             continue
         if r.get("event") in ("ANSWERED", "SKIP_ANSWERED"):
             answered.append(r.get("node"))
