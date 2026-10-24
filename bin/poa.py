@@ -2979,7 +2979,7 @@ def main() -> None:
             try:
                 asgn_res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200}) if hosted_status != "halted" else {"assignments": []}
             except PoaHTTPError as e:
-                if e.kind == "auth":
+                if e.kind == "auth" and not me_res.get("address") and not ch_res.get("words"):
                     raise
                 asgn_res = {"assignments": [], "assignments_error": str(e)[:200]}
             edge_me = edge_read_epochs_summary() if not me_res.get("balance") else {}
@@ -3006,13 +3006,16 @@ def main() -> None:
                     "voting_ends": b.get("voting_ends"),
                     "topics": clean_topics,
                 })
-            epoch_num = ch_res.get("epoch")
+            me_ch = me_res.get("challenge") if isinstance(me_res.get("challenge"), dict) else {}
+            epoch_num = ch_res.get("epoch") if ch_res.get("epoch") is not None else me_ch.get("epoch")
             local_ans = has_answered_epoch_locally(epoch_num)
+            ans_txid = ch_res.get("answered_txid") or me_ch.get("answered_txid")
             summary = {
                 "hosted_status": hosted_status,
                 "epoch": epoch_num,
-                "answered": is_challenge_answered(ch_res, epoch_num),
-                "server_answered_flag": ch_res.get("answered"),
+                "answered": bool(is_challenge_answered(ch_res, epoch_num) or me_ch.get("answered") or ans_txid),
+                "server_answered_flag": bool(ch_res.get("answered") or me_ch.get("answered")),
+                "answered_txid": ans_txid,
                 "answered_in_local_log": local_ans,
                 "words": ch_res.get("words", []),
                 "balance": me_res.get("balance") or edge_me.get("cumulative_settled_balance"),
@@ -3026,6 +3029,8 @@ def main() -> None:
                 "open_ballots": compact_ballots,
                 "notices": me_res.get("notices", []),
             }
+            if asgn_res.get("assignments_error"):
+                summary["assignments_error"] = asgn_res["assignments_error"]
             if asgn_res.get("backlog") is not None:
                 summary["assignments_backlog"] = asgn_res.get("backlog")
             if edge_me.get("rewards_by_epoch") and not me_res.get("balance"):
