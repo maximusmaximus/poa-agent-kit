@@ -812,16 +812,36 @@ def pc_silence(log_path: pathlib.Path, node: str, hours: float) -> dict:
     }
 
 
-def epoch_window(now=None) -> dict:
-    """Estimated start of the current 6h epoch window (boundaries anchored at mainnet genesis,
-    10:03 PT = 04:03/10:03/16:03/22:03 PT). Words can appear up to ~15 min after a boundary,
-    and the server's own epoch number can lag (e.g. a delayed close), so this is a clock
-    estimate only; always trust /challenge for the epoch number."""
+def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True) -> dict:
+    """Start of the current 6h epoch window. Anchors on the newest close timestamp in
+    GET /api/epochs when available (handles post-pause boundary drift), falling back to
+    the static genesis clock if /api/epochs is unreachable."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    if epochs_res is None and fetch_epochs:
+        try:
+            epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=15, retries=1)
+        except Exception:
+            epochs_res = None
+    eps = _epoch_list(epochs_res) if epochs_res is not None else []
+    if eps and isinstance(eps[-1].get("ts"), (int, float)):
+        close_dt = datetime.datetime.fromtimestamp(int(eps[-1]["ts"]), datetime.timezone.utc)
+        if close_dt <= now:
+            k = int((now - close_dt).total_seconds() // EPOCH_SECONDS)
+            start = close_dt + datetime.timedelta(seconds=k * EPOCH_SECONDS)
+            return {
+                "window_start": start.isoformat(),
+                "window_age_hours": round((now - start).total_seconds() / 3600, 2),
+                "anchor_source": f"epochs:E{eps[-1]['epoch']}",
+                "last_close_utc": close_dt.isoformat(),
+            }
     anchor = datetime.datetime.fromisoformat(EPOCH_ANCHOR_UTC)
     k = int((now - anchor).total_seconds() // EPOCH_SECONDS)
     start = anchor + datetime.timedelta(seconds=k * EPOCH_SECONDS)
-    return {"window_start": start.isoformat(), "window_age_hours": round((now - start).total_seconds() / 3600, 2)}
+    return {
+        "window_start": start.isoformat(),
+        "window_age_hours": round((now - start).total_seconds() / 3600, 2),
+        "anchor_source": "static_genesis",
+    }
 
 
 def cmd_takeover_check(args: argparse.Namespace) -> None:
