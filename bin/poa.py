@@ -1894,6 +1894,128 @@ def cmd_close_health(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# epoch-time: settings measured in epochs, shown in real time (SUGGESTIONS.md #3)
+# ---------------------------------------------------------------------------
+PAUSE_GAP_FACTOR = 2.0  # a close gap over 2x the nominal epoch length counts as a pause
+
+
+def _epoch_duration_keys(params: dict) -> list:
+    """Params that are a LENGTH counted in epochs (not a `*_from_epoch` activation point)."""
+    out = []
+    for k, v in (params or {}).items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if k.endswith("_from_epoch") or k.endswith("_from_ts"):
+            continue
+        if k.endswith("_epochs") or k.endswith("_ttl") or k.endswith("_ttl_epochs"):
+            out.append(k)
+    return sorted(out)
+
+
+def _seconds_keys(params: dict) -> list:
+    out = []
+    for k, v in (params or {}).items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or k == "auto_epoch_seconds":
+            continue
+        if k.endswith("_seconds") or k.endswith("_s"):
+            out.append(k)
+    return sorted(out)
+
+
+def epoch_time_table(params: dict, epochs_res, now: float = None, window: int = 8) -> dict:
+    """Convert every epoch-counted setting in /api/params to hours and days, using both the
+    nominal epoch length and the observed close cadence from /api/epochs. Pure: no network."""
+    params = params if isinstance(params, dict) else {}
+    nominal_s = _f(params.get("auto_epoch_seconds")) or float(EPOCH_SECONDS)
+    eps = [e for e in _epoch_list(epochs_res) if isinstance(e.get("ts"), (int, float))]
+    gaps = []
+    for a, b in zip(eps, eps[1:]):
+        gaps.append({"from": int(a["epoch"]), "to": int(b["epoch"]), "seconds": float(b["ts"] - a["ts"])})
+    pauses = [g for g in gaps if g["seconds"] > PAUSE_GAP_FACTOR * nominal_s]
+    normal = [g["seconds"] for g in gaps if g["seconds"] <= PAUSE_GAP_FACTOR * nominal_s]
+    recent = normal[-window:] if window and window > 0 else normal
+    observed_s = statistics.mean(recent) if recent else None
+    cadence_s = observed_s or nominal_s
+
+    def hd(epochs, sec):
+        return {"hours": round(epochs * sec / 3600, 1), "days": round(epochs * sec / 86400, 2)}
+
+    rows = []
+    for k in _epoch_duration_keys(params):
+        n = params[k]
+        row = {"setting": k, "epochs": n, "nominal": hd(n, nominal_s)}
+        if observed_s:
+            row["observed"] = hd(n, observed_s)
+        rows.append(row)
+    seconds_rows = [{"setting": k, "seconds": params[k], "hours": round(params[k] / 3600, 2),
+                     "epochs_at_cadence": round(params[k] / cadence_s, 3)} for k in _seconds_keys(params)]
+
+    res = {
+        "ok": True,
+        "read_only": True,
+        "nominal_epoch_hours": round(nominal_s / 3600, 3),
+        "observed_epoch_hours": round(observed_s / 3600, 3) if observed_s else None,
+        "observed_from_gaps": len(recent),
+        "drift_minutes_per_close": round((observed_s - nominal_s) / 60, 2) if observed_s else None,
+        "pauses": [{"from": g["from"], "to": g["to"], "hours": round(g["seconds"] / 3600, 2)} for g in pauses],
+        "rows": rows,
+        "seconds_rows": seconds_rows,
+        "note": ("Public reads of GET /api/params and GET /api/epochs only. Observed cadence = mean of the last "
+                 f"{window} close gaps, leaving out pauses (gaps over {PAUSE_GAP_FACTOR:g}x nominal). Real time for any "
+                 "setting stretches further if closes pause again; estimates, not network rules."),
+    }
+    if eps:
+        last = eps[-1]
+        res["last_close"] = {"epoch": int(last["epoch"]), "at": _iso(last["ts"])}
+        nxt = float(last["ts"]) + cadence_s
+        res["next_close_estimate"] = _iso(int(nxt))
+        if now is not None:
+            res["hours_since_last_close"] = round((now - float(last["ts"])) / 3600, 2)
+            if now > nxt:
+                res["overdue_hours"] = round((now - nxt) / 3600, 2)
+    return res
+
+
+def print_epoch_time(r: dict) -> None:
+    obs = r.get("observed_epoch_hours")
+    print(f"Epoch length: nominal {r['nominal_epoch_hours']}h | observed {obs}h"
+          + (f" over the last {r['observed_from_gaps']} closes ({r['drift_minutes_per_close']:+} min per close)" if obs else " (no close history)"))
+    if r.get("last_close"):
+        line = f"Last close E{r['last_close']['epoch']} at {r['last_close']['at']}; next expected about {r['next_close_estimate']}"
+        if r.get("overdue_hours"):
+            line += f" (overdue by {r['overdue_hours']}h, closes may be paused)"
+        print(line)
+    for p in r.get("pauses") or []:
+        print(f"  pause: E{p['from']} to E{p['to']} took {p['hours']}h")
+    print(f"\n{'setting':32} {'epochs':>7} {'nominal':>18} {'observed':>18}")
+    for row in r["rows"]:
+        nom = f"{row['nominal']['hours']}h / {row['nominal']['days']}d"
+        ob = f"{row['observed']['hours']}h / {row['observed']['days']}d" if row.get("observed") else "-"
+        print(f"{row['setting']:32} {row['epochs']:>7} {nom:>18} {ob:>18}")
+    if r.get("seconds_rows"):
+        print(f"\n{'setting (seconds)':32} {'seconds':>9} {'hours':>8} {'epochs':>8}")
+        for row in r["seconds_rows"]:
+            print(f"{row['setting']:32} {row['seconds']:>9} {row['hours']:>8} {row['epochs_at_cadence']:>8}")
+
+
+def cmd_epoch_time(args: argparse.Namespace) -> None:
+    try:
+        params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"epoch-time: could not read /api/params: {redact(str(ex))}")
+        sys.exit(2)
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    except Exception:
+        epochs_res = None  # still print the nominal table
+    r = epoch_time_table(params, epochs_res, now=time.time(), window=args.window)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_epoch_time(r)
+
+
+# ---------------------------------------------------------------------------
 # reopen: one guarded post-halt sequence (SUGGESTIONS.md #33)
 # ---------------------------------------------------------------------------
 REOPEN_LOCK = POA_DIR / "reopen.lock"
@@ -2306,6 +2428,11 @@ def main() -> None:
     p_ch.add_argument("--json", action="store_true", help="JSON output")
     p_ch.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_et = sub.add_parser("epoch-time", help="Keyless: every epoch-counted setting (TTLs, vesting, suspensions) in hours/days at nominal and observed close cadence, plus next close estimate")
+    p_et.add_argument("--window", type=int, default=8, help="Close gaps to average for the observed cadence (default 8; pauses excluded)")
+    p_et.add_argument("--json", action="store_true", help="JSON output")
+    p_et.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
     p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
@@ -2559,6 +2686,8 @@ def main() -> None:
             cmd_backlog(args)
         elif args.command == "close-health":
             cmd_close_health(args)
+        elif args.command == "epoch-time":
+            cmd_epoch_time(args)
         elif args.command == "grade-batch":
             cmd_grade_batch(args)
         elif args.command == "ballots":
