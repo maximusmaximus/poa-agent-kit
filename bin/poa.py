@@ -970,6 +970,8 @@ def cmd_health(args: argparse.Namespace) -> None:
     kinds = {p["probe"]: (p["kind"] if not p["ok"] else "ok") for p in probes}
     if kinds.get("rest:/api/hosted/challenge") == "ok":
         verdict = "rest-ok"
+    elif kinds.get("rest:/api/hosted/challenge") == "auth" and kinds.get("mcp:tools/list") == "auth":
+        verdict = "halted"
     elif kinds.get("rest:/api/hosted/challenge") == "auth":
         verdict = "key-rejected"
     elif kinds.get("rest:/api/hosted/challenge") == "halted":
@@ -978,7 +980,21 @@ def cmd_health(args: argparse.Namespace) -> None:
         verdict = "rest-down-mcp-up"
     else:
         verdict = "server-down"
-    print(json.dumps({"verdict": verdict, "mcp_fallback_enabled": mcp_fallback_enabled(), "probes": probes}, indent=2))
+    out = {"verdict": verdict, "mcp_fallback_enabled": mcp_fallback_enabled(), "probes": probes}
+    if kinds.get("rest:/api/hosted/challenge") == "auth" and kinds.get("mcp:tools/list") == "auth":
+        out["note"] = "origin returning 401 on keyless mcp:tools/list too (operator maintenance auth gate; your PoA key is fine)"
+    print(json.dumps(out, indent=2))
+
+
+def _origin_auth_gated(timeout: float = 5.0) -> bool:
+    """True when keyless mcp:tools/list also returns HTTP 401/403 (origin-wide maintenance auth gate)."""
+    try:
+        _mcp_list(timeout)
+        return False
+    except PoaHTTPError as e:
+        return e.kind == "auth"
+    except Exception:
+        return False
 
 
 def _mcp_list(timeout) -> dict:
@@ -2282,12 +2298,17 @@ def run_reopen(args: argparse.Namespace) -> tuple:
         try:
             ch = api_call("GET", "/api/hosted/challenge", timeout=args.timeout, retries=1)
         except PoaHTTPError as e:
-            p_kw = dict(resumed=False, kind=e.kind, error=str(e)[:200], note="one probe only; not retrying")
+            eff_kind = e.kind
+            note_txt = "one probe only; not retrying"
+            if e.kind == "auth" and _origin_auth_gated(min(5.0, float(args.timeout or 5.0))):
+                eff_kind = "halted"
+                note_txt = "origin returning 401 on keyless routes too (maintenance auth gate, key is fine); one probe only"
+            p_kw = dict(resumed=False, kind=eff_kind, error=str(e)[:200], note=note_txt)
             if e.retry_after is not None:
                 p_kw["retry_after"] = e.retry_after
             step("probe", **p_kw)
-            rep["verdict"] = e.kind if e.kind in ("auth", "client") else "still-halted"
-            return (5 if e.kind in ("auth", "client") else 2), rep
+            rep["verdict"] = eff_kind if eff_kind in ("auth", "client") else "still-halted"
+            return (5 if eff_kind in ("auth", "client") else 2), rep
         epoch, words = ch.get("epoch"), ch.get("words") or []
         cache_challenge(ch)
         step("probe", resumed=True, epoch=epoch, words=words)
