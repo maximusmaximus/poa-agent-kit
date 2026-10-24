@@ -626,14 +626,20 @@ def write_receipt(txid: str, timeout: float = 20) -> dict:
         return {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": err.kind,
                 "note": "read failed (" + err.kind + "): unknown, NOT failed. Do not resend; re-run `receipt` later."}
     t = (d.get("tx") if isinstance(d, dict) and isinstance(d.get("tx"), dict) else d) or {}
-    if not isinstance(t, dict) or not (t.get("id") or t.get("type")):
+    if not isinstance(t, dict) or not (t.get("id") or t.get("txid") or t.get("type")):
         return {"txid": txid, "outcome": "unknown", "resend_ok": False, "note": "unexpected explorer body; treat as unknown"}
     atts = t.get("atts", t.get("attestations"))
     atts_n = len(atts) if isinstance(atts, list) else atts
-    final = bool(t.get("final"))
-    return {"txid": txid, "outcome": "landed-final" if final else "landed-pending", "resend_ok": False,
-            "type": t.get("type"), "epoch": t.get("epoch"), "ts": t.get("ts"), "final": final, "attestations": atts_n,
-            "note": "on the ledger; do not resend (a resend creates a duplicate for graders)"}
+    cp_info = t.get("checkpointed") or (d.get("checkpointed") if isinstance(d, dict) else None)
+    final = bool(t.get("final") or cp_info or t.get("checkpoint_covered"))
+    out = {"txid": txid, "outcome": "landed-final" if final else "landed-pending", "resend_ok": False,
+           "type": t.get("type"), "epoch": t.get("epoch"), "ts": t.get("ts"), "final": final, "attestations": atts_n,
+           "note": "on the ledger; do not resend (a resend creates a duplicate for graders)"}
+    if cp_info is not None or t.get("checkpoint_covered") is not None:
+        out["checkpointed"] = cp_info if cp_info is not None else t.get("checkpoint_covered")
+    if t.get("next_nonce") is not None:
+        out["next_nonce"] = t.get("next_nonce")
+    return out
 
 
 def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wait: int = None, sleep=time.sleep) -> dict:
