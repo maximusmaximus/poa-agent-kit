@@ -44,7 +44,7 @@ class ReceiptTests(unittest.TestCase):
             r, m = self.run_with(side_effect=http_err(code))
             self.assertEqual((r["outcome"], r["resend_ok"], r["error_kind"]), ("unknown", False, "redirect"), code)
             self.assertIn("NOT INDEXED", r["note"])
-            self.assertIs(m.call_args.kwargs.get("follow_redirects"), False)
+            self.assertIs(m.call_args[1].get("follow_redirects"), False)
 
     def test_urllib_does_not_follow_redirect(self):
         # 307 -> page that would 404: must surface as 307 (unknown), never as not-found
@@ -55,7 +55,7 @@ class ReceiptTests(unittest.TestCase):
              mock.patch.object(poa.urllib.request, "urlopen", side_effect=http_err(404)) as uo:
             r = poa.write_receipt(TX)
         self.assertEqual((r["outcome"], r["resend_ok"], r["http_status"]), ("unknown", False, 307))
-        self.assertIs(bo.call_args.args[0], poa._NoRedirect)
+        self.assertIs(bo.call_args[0][0], poa._NoRedirect)
         uo.assert_not_called()
 
     def test_noredirect_handler_returns_none(self):
