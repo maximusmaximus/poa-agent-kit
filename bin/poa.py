@@ -170,6 +170,14 @@ def has_answered_epoch_locally(epoch) -> bool:
     return False
 
 
+def is_challenge_answered(ch: dict, epoch=None) -> bool:
+    """True when the server challenge payload (answered, superseded, answered_txid) or local log shows the epoch is answered."""
+    if not isinstance(ch, dict):
+        ch = {}
+    ep = epoch if epoch is not None else ch.get("epoch")
+    return bool(ch.get("answered") or ch.get("superseded") or ch.get("answered_txid") or has_answered_epoch_locally(ep))
+
+
 class PoaHTTPError(RuntimeError):
     """HTTP failure with a coarse kind so callers can tell server outages from key problems.
 
@@ -178,12 +186,14 @@ class PoaHTTPError(RuntimeError):
           "network" (DNS/TLS/connection refused)
           "auth"    (401/403: key rejected or rotated; retrying will not help)
           "client"  (other 4xx: bad request, duplicate, not found)
+          "halted"  (503 operator maintenance / API hardening halt)
     """
 
-    def __init__(self, kind: str, message: str, status: int = None):
+    def __init__(self, kind: str, message: str, status: int = None, retry_after: int = None):
         super().__init__(message)
         self.kind = kind
         self.status = status
+        self.retry_after = retry_after
 
 
 SERVER_STATUSES = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
@@ -267,7 +277,18 @@ def _classify(exc: Exception, path: str, raw_key: str) -> PoaHTTPError:
             kind = "server"
         else:
             kind = "client"
-        return PoaHTTPError(kind, f"HTTP {exc.code} ({kind}) on {path}: {body[:600]}", exc.code)
+        retry_after = None
+        try:
+            hdr_ra = exc.headers.get("Retry-After") if getattr(exc, "headers", None) else None
+            if hdr_ra and str(hdr_ra).strip().isdigit():
+                retry_after = int(str(hdr_ra).strip())
+            elif body.strip().startswith("{"):
+                parsed_err = json.loads(body)
+                if isinstance(parsed_err, dict) and isinstance(parsed_err.get("retry_after"), (int, float)):
+                    retry_after = int(parsed_err["retry_after"])
+        except Exception:
+            retry_after = None
+        return PoaHTTPError(kind, f"HTTP {exc.code} ({kind}) on {path}: {body[:600]}", exc.code, retry_after=retry_after)
     msg = redact(str(exc), raw_key)
     reason = getattr(exc, "reason", None)
     if isinstance(exc, TimeoutError) or "timed out" in msg.lower() or isinstance(reason, TimeoutError):
@@ -432,12 +453,16 @@ def cache_challenge(ch: dict) -> None:
             return
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         cur = load_epoch_cache(ep)
-        fields = {k: ch.get(k) for k in ("words", "seed", "challenge", "prompt", "challenge_txid", "txid") if ch.get(k) is not None}
+        fields = {
+            k: ch.get(k)
+            for k in ("words", "seed", "challenge", "prompt", "challenge_txid", "txid", "superseded", "answered_txid", "seed_rotated_this_epoch")
+            if ch.get(k) is not None
+        }
         if cur.get("words") and cur.get("words") != ch.get("words"):
             fields["previous_words"] = cur.get("words")
         fields["last_read"] = now
         fields.setdefault("first_read", cur.get("first_read") or now)
-        if ch.get("answered"):
+        if ch.get("answered") or ch.get("superseded") or ch.get("answered_txid"):
             fields["server_answered"] = True
         save_epoch_cache(ep, **fields)
     except Exception:
@@ -460,7 +485,7 @@ def edge_read_challenge(address: str = None, timeout: int = 12) -> dict:
             res["answered_on_explorer"] = bool(exp_ans.get("found"))
             if exp_ans.get("txid"):
                 res["explorer_answer_txid"] = exp_ans.get("txid")
-            res["answered"] = bool(res.get("answered") or local_ans or exp_ans.get("found"))
+            res["answered"] = bool(is_challenge_answered(res, ep) or exp_ans.get("found"))
             res["_via"] = "edge:/api/challenge"
             return res
     except Exception:
@@ -621,7 +646,7 @@ def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wai
         try:
             ch = api_call("GET", "/api/hosted/challenge", timeout=20, retries=1)
             cache_challenge(ch)
-            if ch.get("epoch") == epoch and ch.get("answered"):
+            if ch.get("epoch") == epoch and (ch.get("answered") or ch.get("superseded") or ch.get("answered_txid")):
                 return {"landed": True, "how": "challenge-read-back", "waited_s": waited, "checks": checks}
         except Exception:
             pass
@@ -635,7 +660,7 @@ def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wai
 def read_open_seats():
     """Set of open assignment txids, or None if unknown."""
     try:
-        res = api_call("GET", "/api/hosted/assignments")
+        res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
             res = mcp_call("poa_assignments", {})
@@ -649,7 +674,18 @@ def _verify_rounds():
     return int(os.environ.get("POA_VERIFY_ROUNDS", "4"))
 
 
-STALE_MARKERS = ("stale seed", "stale words", "wrong words", "words changed", "seed mismatch", "stale challenge", "epoch closed", "not the current epoch")
+STALE_MARKERS = (
+    "stale seed",
+    "stale_seed",
+    "seed_rotated_this_epoch",
+    "stale words",
+    "wrong words",
+    "words changed",
+    "seed mismatch",
+    "stale challenge",
+    "epoch closed",
+    "not the current epoch",
+)
 DUP_MARKERS = ("duplicate challenge for epoch", "already answered", "duplicate answer")
 
 
@@ -684,8 +720,9 @@ def submit_answer_safely(text: str, epoch) -> dict:
             save_epoch_cache(epoch, send_outcome="duplicate", landed=True)
             return {"landed": True, "how": "duplicate", "note": "Server says this epoch is already answered."}
         if any(m in low for m in STALE_MARKERS):
-            save_epoch_cache(epoch, send_outcome="stale", landed=False, error=str(e)[:300])
-            return {"landed": False, "how": "stale", "error": str(e)[:300], "kind": e.kind}
+            rotated = ("seed_rotated_this_epoch" in low) or ("stale_seed" in low) or ("stale seed" in low)
+            save_epoch_cache(epoch, send_outcome="stale", landed=False, seed_rotated_this_epoch=rotated, error=str(e)[:300])
+            return {"landed": False, "how": "stale", "seed_rotated_this_epoch": rotated, "error": str(e)[:300], "kind": e.kind}
         if e.kind == "halted":
             save_epoch_cache(epoch, send_outcome="halted", landed=False, error=str(e)[:300])
             return {"landed": False, "how": "halted", "error": str(e)[:300], "kind": "halted"}
@@ -853,11 +890,13 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
         ch = read_challenge()
         out["epoch"] = ch.get("epoch")
         out["words"] = ch.get("words", [])
-        out["answered"] = bool(ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")))
+        out["answered"] = is_challenge_answered(ch, ch.get("epoch"))
         if ch.get("_via"):
             out["via"] = ch["_via"]
     except PoaHTTPError as e:
         out["api_error"] = {"kind": e.kind, "error": str(e)[:300]}
+        if e.retry_after is not None:
+            out["api_error"]["retry_after"] = e.retry_after
         edge_ch = getattr(e, "edge_challenge", None)
         if isinstance(edge_ch, dict) and edge_ch.get("epoch") is not None:
             out["edge_epoch"] = edge_ch.get("epoch")
@@ -900,9 +939,12 @@ def cmd_health(args: argparse.Namespace) -> None:
         try:
             r = fn()
             probes.append({"probe": name, "ok": True, "seconds": round(time.time() - t0, 2),
-                           "detail": {k: r.get(k) for k in ("epoch", "words", "answered", "epochs_closed", "as_of", "tools") if isinstance(r, dict) and k in r}})
+                           "detail": {k: r.get(k) for k in ("epoch", "words", "answered", "superseded", "epochs_closed", "as_of", "tools") if isinstance(r, dict) and k in r}})
         except PoaHTTPError as e:
-            probes.append({"probe": name, "ok": False, "kind": e.kind, "seconds": round(time.time() - t0, 2), "error": str(e)[:200]})
+            row = {"probe": name, "ok": False, "kind": e.kind, "seconds": round(time.time() - t0, 2), "error": str(e)[:200]}
+            if e.retry_after is not None:
+                row["retry_after"] = e.retry_after
+            probes.append(row)
         except Exception as e:
             probes.append({"probe": name, "ok": False, "kind": "other", "seconds": round(time.time() - t0, 2), "error": redact(str(e))[:200]})
 
@@ -1052,15 +1094,57 @@ def lableak_call(method: str, path: str, query: dict = None, body: dict = None, 
             raise RuntimeError(f"LabLeak request failed on {path}: {redact(redact(str(e), raw_key), tok)}")
 
 
+NOTICE_SUSPICIOUS_PATTERNS = (
+    r"(?i)\b(?:pk_[A-Za-z0-9_-]*|private\s+key|seed\s+phrase|secret\s+key|\.poa/key)\b",
+    r"(?i)\b(?:send\s+poa|transfer\s+\d|poa_send|curl\s+http|wget\s+http)\b",
+)
+
+
+def inspect_notice(sn: dict, now: float = None) -> dict:
+    """Inspect a system_notice object for provenance (signed ledger txid vs server-override),
+    expiration, and suspicious credential/transfer instructions (SUGGESTIONS.md #20, #46)."""
+    if not isinstance(sn, dict) or not sn.get("msg"):
+        return {}
+    now = time.time() if now is None else float(now)
+    msg = redact(str(sn.get("msg", "")))
+    txid = sn.get("txid")
+    source = sn.get("source") or ("signed-ledger" if txid else "server-override")
+    exp = sn.get("expires_ts")
+    expired = bool(isinstance(exp, (int, float)) and exp > 0 and now > float(exp))
+    suspicious = any(re.search(pat, msg) for pat in NOTICE_SUSPICIOUS_PATTERNS)
+    return {
+        "id": sn.get("id", ""),
+        "severity": sn.get("severity", "info"),
+        "msg": msg,
+        "txid": txid,
+        "source": source,
+        "signed_on_ledger": bool(txid),
+        "expired": expired,
+        "untrusted_warning": suspicious,
+    }
+
+
 def print_notice(obj: dict) -> None:
     if isinstance(obj, dict) and "system_notice" in obj and obj["system_notice"]:
-        sn = obj["system_notice"]
-        if isinstance(sn, dict) and sn.get("msg"):
-            sev = sn.get("severity", "info")
-            nid = sn.get("id", "")
-            msg = redact(str(sn.get("msg", "")))
-            print(f"\nSYSTEM_NOTICE [{sev}] {nid}: {msg}")
-            print("  (Notices are informational only. Never share keys or funds.)")
+        info = inspect_notice(obj["system_notice"])
+        if info:
+            tag = f"{info['severity']}" + (",EXPIRED" if info["expired"] else "") + f",src={info['source']}"
+            print(f"\nSYSTEM_NOTICE [{tag}] {info['id']}: {info['msg']}")
+            if info["untrusted_warning"]:
+                print("  [SECURITY WARNING] Notice contains credential/transfer/command keywords — NEVER execute or share keys/funds!")
+            else:
+                print("  (Notices are informational only. Never share keys or funds.)")
+
+
+def normalize_seed_slots(text: str, seed_words: list) -> str:
+    """Replace each seed word (and simple suffixes) with a fixed token `seedslot` so template reuse
+    across epochs is caught even when the 3 seed words change (SUGGESTIONS.md #6)."""
+    out = text.lower()
+    for w in (seed_words or []):
+        w_clean = str(w).strip().lower()
+        if w_clean:
+            out = re.sub(rf"\b{re.escape(w_clean)}[a-z]*\b", "seedslot", out)
+    return out
 
 
 def word_shingles(text: str, k: int = 3) -> set:
@@ -1206,16 +1290,24 @@ def audit_assignment_seat(seat: dict) -> dict:
     injections = [pat for pat in INJECTION_PATTERNS if re.search(pat, ans)]
     farm_hits = [label for pat, label in KNOWN_FARM_PATTERNS if re.search(pat, ans)]
 
-    # Compare against author_prior for single-account template farming
+    # Compare against author_prior for single-account template farming (both raw and seed-slot normalized)
     priors = seat.get("author_prior", []) or []
     cur_sh = word_shingles(ans, 3)
+    cur_norm_sh = word_shingles(normalize_seed_slots(ans, words), 3)
     max_prior_sim = 0.0
     for p in priors:
-        psh = word_shingles(str(p.get("answer_text", "")), 3)
+        p_txt = str(p.get("answer_text", ""))
+        p_words = p.get("seed_words") or p.get("words") or []
+        psh = word_shingles(p_txt, 3)
         if cur_sh and psh:
             sim = len(cur_sh & psh) / len(cur_sh | psh)
             if sim > max_prior_sim:
                 max_prior_sim = sim
+        p_norm_sh = word_shingles(normalize_seed_slots(p_txt, p_words), 3)
+        if cur_norm_sh and p_norm_sh:
+            nsim = len(cur_norm_sh & p_norm_sh) / len(cur_norm_sh | p_norm_sh)
+            if nsim > max_prior_sim:
+                max_prior_sim = nsim
 
     flags = []
     if injections:
@@ -1232,7 +1324,8 @@ def audit_assignment_seat(seat: dict) -> dict:
     for fh in farm_hits:
         flags.append(f"KNOWN_BOT_FARM_SIGNATURE ({fh})")
 
-    return {
+    pmeta = seat.get("pending_meta") if isinstance(seat.get("pending_meta"), dict) else {}
+    out = {
         "answer_txid": seat.get("answer_txid"),
         "from": seat.get("from"),
         "epoch": seat.get("answer_epoch") or seat.get("epoch"),
@@ -1245,6 +1338,11 @@ def audit_assignment_seat(seat: dict) -> dict:
         "flags": flags,
         "answer_preview": redact(ans),
     }
+    if seat.get("expires_at_epoch") is not None:
+        out["expires_at_epoch"] = seat.get("expires_at_epoch")
+    if pmeta.get("to_quorum") is not None:
+        out["to_quorum"] = pmeta.get("to_quorum")
+    return out
 
 
 def audit_assignments_batch(raw_seats: list) -> list:
@@ -1290,7 +1388,7 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
     # Check currently open assignments so we skip any already-sealed seats on re-runs
     open_txids = set()
     try:
-        asgn_res = api_call("GET", "/api/hosted/assignments")
+        asgn_res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
         for s in (asgn_res.get("assignments") or []):
             if s.get("answer_txid"):
                 open_txids.add(s["answer_txid"])
@@ -1716,7 +1814,7 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     seats = None
     if not args.no_key:
         try:
-            a = api_call("GET", "/api/hosted/assignments", timeout=45, retries=1)
+            a = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200}, timeout=45, retries=1)
             seats = a.get("assignments") or []
         except Exception as e:
             seats = {"error": redact(str(e))}
@@ -2173,22 +2271,26 @@ def run_reopen(args: argparse.Namespace) -> tuple:
         try:
             ch = api_call("GET", "/api/hosted/challenge", timeout=args.timeout, retries=1)
         except PoaHTTPError as e:
-            step("probe", resumed=False, kind=e.kind, error=str(e)[:200], note="one probe only; not retrying")
+            p_kw = dict(resumed=False, kind=e.kind, error=str(e)[:200], note="one probe only; not retrying")
+            if e.retry_after is not None:
+                p_kw["retry_after"] = e.retry_after
+            step("probe", **p_kw)
             rep["verdict"] = e.kind if e.kind in ("auth", "client") else "still-halted"
             return (5 if e.kind in ("auth", "client") else 2), rep
         epoch, words = ch.get("epoch"), ch.get("words") or []
         cache_challenge(ch)
         step("probe", resumed=True, epoch=epoch, words=words)
 
-        # 2. Already answered? hosted flag, public explorer, local log, shared handoff log.
+        # 2. Already answered? hosted flag (answered / superseded / answered_txid), public explorer, local log, shared handoff log.
         if args.git_sync:
             step("handoff-pull", **handoff_git(log_path, "pull"))
         addr = local_address()
         exp = explorer_find_answer(addr, epoch) if addr else {"found": None}
         cl = epoch_claims(log_path, epoch)
-        answered = bool(ch.get("answered") or exp.get("found") or has_answered_epoch_locally(epoch) or cl["answered_by"])
-        step("answered-check", epoch=epoch, hosted=bool(ch.get("answered")), explorer=exp.get("found"),
-             handoff_answered_by=cl["answered_by"], fresh_claims=cl["fresh_claims"])
+        answered = bool(is_challenge_answered(ch, epoch) or exp.get("found") or cl["answered_by"])
+        step("answered-check", epoch=epoch, hosted=bool(ch.get("answered") or ch.get("superseded") or ch.get("answered_txid")),
+             superseded=bool(ch.get("superseded")), answered_txid=ch.get("answered_txid"),
+             explorer=exp.get("found"), handoff_answered_by=cl["answered_by"], fresh_claims=cl["fresh_claims"])
 
         # 3. Answer exactly once, from the node allowed to.
         if answered:
@@ -2208,7 +2310,7 @@ def run_reopen(args: argparse.Namespace) -> tuple:
             text = pathlib.Path(args.answer_file).read_text(encoding="utf-8").strip()
             q = check_answer_quality(text, words)
             if not q.get("passed"):
-                step("answer", action="preflight-failed", report=q)
+                step("answer", action="preflight-failed", live_words=words, missing_words=q.get("missing_words"), report=q)
                 return 5, rep
             if args.dry_run:
                 step("answer", action="would-send", epoch=epoch)
@@ -2529,7 +2631,7 @@ def main() -> None:
                     raise
             report = check_answer_quality(text, ch.get("words", []))
             report["epoch"] = ch.get("epoch")
-            report["already_answered"] = bool(ch.get("answered") or has_answered_epoch_locally(ch.get("epoch")))
+            report["already_answered"] = is_challenge_answered(ch, ch.get("epoch"))
             report["answered_in_local_log"] = has_answered_epoch_locally(ch.get("epoch"))
             report["required_words"] = ch.get("words", [])
             if ch.get("_via"):
@@ -2617,9 +2719,9 @@ def main() -> None:
                     print(json.dumps({"landed": False, "error": f"cached epoch {cached.get('epoch')} predates the current 6h window ({win['window_start']}); stale seed, not sending",
                                       "read_error": read_err}, indent=2))
                     sys.exit(2)
-                ch, source = {k: cached.get(k) for k in ("epoch", "words", "seed")}, "cache"
+                ch, source = {k: cached.get(k) for k in ("epoch", "words", "seed", "superseded", "answered_txid")}, "cache"
             epoch = ch.get("epoch")
-            if ch.get("answered") or has_answered_epoch_locally(epoch):
+            if is_challenge_answered(ch, epoch):
                 print(json.dumps({"skipped": True, "epoch": epoch, "note": "Epoch already answered (on server, in ~/.poa/answers.log, or in poa-handoff/LOG.md)."}, indent=2))
                 return
             report = check_answer_quality(text, ch.get("words", []))
@@ -2666,12 +2768,15 @@ def main() -> None:
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "assignments":
-            res = api_call("GET", "/api/hosted/assignments")
+            res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
             if args.audit:
                 seats = res.get("assignments", []) or []
                 audited = audit_assignments_batch(seats)
                 audited.sort(key=lambda a: (a.get("epoch") if isinstance(a.get("epoch"), int) else 10**9))
-                print(json.dumps({"count": len(audited), "order": "oldest answer epoch first", "seats": audited}, indent=2))
+                out = {"count": len(audited), "order": "oldest answer epoch first", "seats": audited}
+                if res.get("backlog") is not None:
+                    out["backlog"] = res.get("backlog")
+                print(json.dumps(out, indent=2))
             else:
                 print(json.dumps(res, indent=2))
             print_notice(res)
@@ -2840,7 +2945,7 @@ def main() -> None:
                 hosted_err = hosted_err or str(e)[:200]
                 ch_res = getattr(e, "edge_challenge", None) or {}
             try:
-                asgn_res = api_call("GET", "/api/hosted/assignments") if hosted_status != "halted" else {"assignments": []}
+                asgn_res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200}) if hosted_status != "halted" else {"assignments": []}
             except PoaHTTPError as e:
                 if e.kind == "auth":
                     raise
@@ -2874,7 +2979,7 @@ def main() -> None:
             summary = {
                 "hosted_status": hosted_status,
                 "epoch": epoch_num,
-                "answered": bool(ch_res.get("answered") or local_ans),
+                "answered": is_challenge_answered(ch_res, epoch_num),
                 "server_answered_flag": ch_res.get("answered"),
                 "answered_in_local_log": local_ans,
                 "words": ch_res.get("words", []),
@@ -2889,6 +2994,8 @@ def main() -> None:
                 "open_ballots": compact_ballots,
                 "notices": me_res.get("notices", []),
             }
+            if asgn_res.get("backlog") is not None:
+                summary["assignments_backlog"] = asgn_res.get("backlog")
             if edge_me.get("rewards_by_epoch") and not me_res.get("balance"):
                 summary["rewards_by_epoch"] = edge_me.get("rewards_by_epoch")
                 summary["balance_source"] = "edge:/api/epochs"
