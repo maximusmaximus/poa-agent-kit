@@ -2531,6 +2531,186 @@ def cmd_epoch_time(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# close-pull: close-synced, keyless assignments pull with a seconds-since-close log (SUGGESTIONS.md #52)
+# ---------------------------------------------------------------------------
+CLOSE_PULL_LOG = POA_DIR / "close-pull.jsonl"
+CLOSE_PULL_MIN_INTERVAL_S = 15
+CLOSE_PULL_MAX_FOLLOWUPS = 3
+
+
+def newest_close(epochs_res):
+    """(epoch, ts) of the newest close record in GET /api/epochs, or (None, None). Pure."""
+    eps = [e for e in _epoch_list(epochs_res) if isinstance(e.get("ts"), (int, float))]
+    if not eps:
+        return None, None
+    return int(eps[-1]["epoch"]), float(eps[-1]["ts"])
+
+
+def classify_pull(res, http_code, close_epoch, close_ts, sent_ts, recv_ts, label: str = "") -> dict:
+    """Turn one keyless /api/assignments/<addr>/ response into a comparable data row. Pure: no network.
+
+    outcome:
+      error         non-200 (or unreadable) response
+      no-seat       200, has_seat false, no rows
+      seat-no-rows  200, has_seat true, no rows
+      pool-only     200, rows listed but none backlog and none with seals_seen > 0 (listed, not yet dealt)
+      dealt         200, at least one backlog row or one row with seals_seen > 0
+    This tool never submits a grade, so it cannot tell seal from 400 not-on-panel; it records what was listed.
+    """
+    row = {
+        "label": label or None,
+        "close_epoch": close_epoch,
+        "close_at": _iso(close_ts) if close_ts is not None else None,
+        "sent_s": round(sent_ts - close_ts, 1) if close_ts is not None else None,
+        "returned_s": round(recv_ts - close_ts, 1) if close_ts is not None else None,
+        "http": http_code,
+    }
+    if http_code != 200 or not isinstance(res, dict):
+        row["outcome"] = "error"
+        return row
+    rows = [r for r in (res.get("assignments") or []) if isinstance(r, dict)]
+    backlog = [r for r in rows if r.get("backlog")]
+    fresh = [r for r in rows if not r.get("backlog")]
+    seals = [int(_f(r.get("seals_seen"))) for r in rows]
+    by_epoch = {}
+    for r in rows:
+        k = str(r.get("epoch")) if r.get("epoch") is not None else "?"
+        by_epoch[k] = by_epoch.get(k, 0) + 1
+    seals_hist = {}
+    for s in seals:
+        seals_hist[str(s)] = seals_hist.get(str(s), 0) + 1
+    has_seat = bool(res.get("has_seat"))
+    if not rows:
+        outcome = "seat-no-rows" if has_seat else "no-seat"
+    elif backlog or any(s > 0 for s in seals):
+        outcome = "dealt"
+    else:
+        outcome = "pool-only"
+    row.update({
+        "open_epoch": res.get("epoch"),
+        "has_seat": has_seat,
+        "rows": len(rows),
+        "total": res.get("total"),
+        "already_graded": res.get("already_graded"),
+        "backlog_rows": len(backlog),
+        "fresh_rows": len(fresh),
+        "rows_by_epoch": dict(sorted(by_epoch.items())),
+        "seals_seen": dict(sorted(seals_hist.items(), key=lambda kv: int(kv[0]))),
+        "outcome": outcome,
+    })
+    return row
+
+
+def _keyless_assignments(address: str, timeout: float = 30):
+    """(http_code, parsed_json_or_None). Keyless public route; never sends a key."""
+    path = f"/api/assignments/{urllib.parse.quote(address)}/"
+    try:
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"},
+                           timeout=timeout)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return None, None
+    try:
+        return 200, json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return 200, None
+
+
+def _epochs_closed(timeout: float = 15):
+    st = api_call("GET", "/api/status", need_key=False, timeout=timeout, retries=1)
+    return int(st.get("epochs_closed")) if isinstance(st, dict) and st.get("epochs_closed") is not None else None
+
+
+def close_pull(address: str, followups=(300,), wait: bool = True, max_wait: int = 900, interval: int = 20,
+               fetch_status=None, fetch_assignments=None, fetch_epochs=None, clock=time.time, sleep=time.sleep) -> dict:
+    """Wait (lightly) for the next close, then pull keyless assignments once right away and once at each
+    follow-up offset (seconds after the close record). Network calls are injectable for tests."""
+    fetch_status = fetch_status or _epochs_closed
+    fetch_assignments = fetch_assignments or (lambda: _keyless_assignments(address))
+    fetch_epochs = fetch_epochs or (lambda: api_call("GET", "/api/epochs", need_key=False, timeout=90, retries=2))
+    interval = max(CLOSE_PULL_MIN_INTERVAL_S, int(interval))
+    followups = sorted({int(f) for f in (followups or []) if int(f) > 0})[:CLOSE_PULL_MAX_FOLLOWUPS]
+    polls = 0
+    if wait:
+        start_closed = fetch_status()
+        polls = 1
+        deadline = clock() + max_wait
+        while True:
+            if clock() >= deadline:
+                return {"ok": False, "read_only": True, "error": f"no new close within {max_wait}s (epochs_closed stayed {start_closed})",
+                        "status_polls": polls, "pulls": []}
+            sleep(interval)
+            try:
+                now_closed = fetch_status()
+            except Exception:
+                now_closed = None
+            polls += 1
+            if now_closed is not None and start_closed is not None and now_closed > start_closed:
+                break
+    pulls_raw = []
+    t0 = clock()
+    code, res = fetch_assignments()
+    pulls_raw.append(("first", t0, clock(), code, res))
+    try:
+        close_epoch, close_ts = newest_close(fetch_epochs())
+    except Exception:
+        close_epoch, close_ts = None, None
+    for off in followups:
+        if close_ts is not None:
+            delay = close_ts + off - clock()
+        else:
+            delay = off - (clock() - t0)
+        if delay > 0:
+            sleep(delay)
+        t = clock()
+        code, res = fetch_assignments()
+        pulls_raw.append((f"+{off}s", t, clock(), code, res))
+    pulls = [classify_pull(r, c, close_epoch, close_ts, s, e, label=lab) for lab, s, e, c, r in pulls_raw]
+    return {"ok": True, "read_only": True, "close_epoch": close_epoch,
+            "close_at": _iso(close_ts) if close_ts is not None else None,
+            "waited_for_close": wait, "status_polls": polls, "pulls": pulls,
+            "note": ("Keyless reads only: /api/status (small) to spot the close, one /api/epochs read for the close time, "
+                     "and the public /api/assignments/<addr>/ route. Never grades, so it records what was listed, not seal-or-400. "
+                     "The address is not written to the output.")}
+
+
+def print_close_pull(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-pull: {r.get('error')}")
+        return
+    print(f"Close E{r.get('close_epoch')} at {r.get('close_at')} (status polls: {r.get('status_polls')})")
+    print(f"{'pull':8} {'sent_s':>8} {'ret_s':>8} {'http':>5} {'seat':>5} {'rows':>5} {'backlog':>8} {'fresh':>6}  outcome / seals_seen")
+    for p in r["pulls"]:
+        print(f"{(p.get('label') or ''):8} {str(p.get('sent_s')):>8} {str(p.get('returned_s')):>8} {str(p.get('http')):>5} "
+              f"{str(p.get('has_seat', '-')):>5} {str(p.get('rows', '-')):>5} {str(p.get('backlog_rows', '-')):>8} "
+              f"{str(p.get('fresh_rows', '-')):>6}  {p.get('outcome')} {p.get('seals_seen', '')}")
+
+
+def cmd_close_pull(args: argparse.Namespace) -> None:
+    address = args.address or local_address()
+    if not address:
+        msg = "close-pull: no address (pass --address or set POA_ADDRESS / ~/.poa/address)"
+        print(json.dumps({"ok": False, "error": msg}) if args.json else msg)
+        sys.exit(2)
+    followups = [] if args.no_followup else (args.followup or [300])
+    r = close_pull(address, followups=followups, wait=not args.now, max_wait=args.max_wait, interval=args.interval)
+    if r.get("ok") and not args.no_log:
+        log = pathlib.Path(args.log).expanduser() if args.log else CLOSE_PULL_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            for p in r["pulls"]:
+                fh.write(json.dumps(p, sort_keys=True) + "\n")
+        r["log"] = str(log)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_close_pull(r)
+    if not r.get("ok"):
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
 # reopen: one guarded post-halt sequence (SUGGESTIONS.md #33)
 # ---------------------------------------------------------------------------
 REOPEN_LOCK = POA_DIR / "reopen.lock"
@@ -2964,6 +3144,17 @@ def main() -> None:
     p_et.add_argument("--json", action="store_true", help="JSON output")
     p_et.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_cp = sub.add_parser("close-pull", help="Keyless: wait for the next close, pull public assignments right away and a few minutes later, log seconds-since-close, rows, backlog vs fresh, seals_seen")
+    p_cp.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); not printed")
+    p_cp.add_argument("--now", action="store_true", help="Don't wait for a close; pull once now (times are since the newest close)")
+    p_cp.add_argument("--followup", type=int, action="append", help="Extra pull N seconds after the close record (repeatable, max 3; default 300)")
+    p_cp.add_argument("--no-followup", action="store_true", help="Only the first pull")
+    p_cp.add_argument("--max-wait", type=int, default=900, help="Give up if no close within this many seconds (default 900)")
+    p_cp.add_argument("--interval", type=int, default=20, help="Seconds between small /api/status polls while waiting (min 15, default 20)")
+    p_cp.add_argument("--log", default="", help="JSONL log path (default ~/.poa/close-pull.jsonl)")
+    p_cp.add_argument("--no-log", action="store_true", help="Don't append to the log")
+    p_cp.add_argument("--json", action="store_true", help="JSON output")
+
     p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
     p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
@@ -3224,6 +3415,8 @@ def main() -> None:
             cmd_close_check(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
+        elif args.command == "close-pull":
+            cmd_close_pull(args)
         elif args.command == "grade-batch":
             cmd_grade_batch(args)
         elif args.command == "ballots":
