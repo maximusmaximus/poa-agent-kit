@@ -985,7 +985,26 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
 
 def safe_mine() -> dict:
     """Mine once. /mine is a countersign sweep (re-running is harmless, it re-verifies pending
-    txs), but we still don't hammer a down server: one try, then MCP if flagged."""
+    txs), but we still don't hammer a down server: one try, then MCP if flagged.
+    Hourly lock: at most one mine per local clock hour per machine. An empty lock file
+    $POA_HOME/mine-locks/mined-YYYYMMDDHH (default ~/.poa) enforces it; a second call in the
+    same hour returns kind=already-mined-this-hour with no network call. The filename holds
+    only the hour (no address or key). Set POA_MINE_HOURLY_LOCK=0 to disable."""
+    if os.environ.get("POA_MINE_HOURLY_LOCK", "1") != "0":
+        import time as _t
+        lockdir = POA_DIR / "mine-locks"
+        lockdir.mkdir(parents=True, exist_ok=True)
+        hour = _t.strftime("%Y%m%d%H")
+        for old_lock in lockdir.glob("mined-*"):
+            if old_lock.name < f"mined-{hour}" and old_lock.name[6:14] < hour[:8]:
+                try: old_lock.unlink()
+                except OSError: pass
+        try:
+            fd = os.open(str(lockdir / f"mined-{hour}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            return {"ok": False, "kind": "already-mined-this-hour", "skipped": True,
+                    "note": "mine already ran this clock hour on this machine; not calling /mine again"}
     try:
         return hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1))
     except PoaHTTPError as e:
