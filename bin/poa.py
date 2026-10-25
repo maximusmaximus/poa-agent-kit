@@ -703,6 +703,185 @@ STALE_MARKERS = (
 DUP_MARKERS = ("duplicate challenge for epoch", "already answered", "duplicate answer")
 
 
+# ---------------------------------------------------------------------------
+# Nonce discipline for hosted writes (G0 notice 2026-10-24-nonce-client).
+# Hosted writes (answer, grade, vote, mine) are signed server-side and each one takes the
+# next nonce slot of OUR address. When two writes leave close together (a grade-batch firing
+# the next grade before the previous one is visible, or two processes on one box), the second
+# lands in a slot that is already taken: a duplicate-slot tx, rejected, and it burns rate limit.
+# Rules enforced here:
+#   1. Single-flight: every hosted write holds an exclusive file lock (~/.poa/cache/write.lock).
+#   2. After each submit, adopt the SERVER's next_nonce (response -> /api/receipt/<txid> -> /me).
+#      Never compute it locally, and never reuse a cached value across runs.
+#   3. Before the next write, /me must show at least the adopted next_nonce; if it lags past
+#      POA_NONCE_SETTLE_S the write is NOT sent (kind "nonce-lag", safe to retry next run).
+#   4. On a nonce rejection: refetch next_nonce once; retry once ONLY if the server's slot moved
+#      past the one that was rejected. Never resend into the same slot.
+# ---------------------------------------------------------------------------
+NONCE_SETTLE_S = float(os.environ.get("POA_NONCE_SETTLE_S", "15"))
+NONCE_POLL_S = float(os.environ.get("POA_NONCE_POLL_S", "3"))
+WRITE_LOCK_TIMEOUT_S = float(os.environ.get("POA_WRITE_LOCK_TIMEOUT_S", "300"))
+NONCE_MARKERS = ("nonce", "duplicate slot", "duplicate-slot", "dup-slot", "slot taken", "slot already")
+_NONCE = {"adopted": None, "source": None, "at": None}
+
+
+def is_nonce_error(e) -> bool:
+    low = str(e).lower()
+    return any(m in low for m in NONCE_MARKERS)
+
+
+def _as_int(v):
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_next_nonce() -> int:
+    """Fresh next_nonce for our address from GET /api/hosted/me (None if unreadable). Never cached."""
+    try:
+        me = api_call("GET", "/api/hosted/me", timeout=20, retries=1)
+    except PoaHTTPError:
+        return None
+    return _as_int(me.get("next_nonce")) if isinstance(me, dict) else None
+
+
+def receipt_next_nonce(txid: str):
+    """Keyless GET /api/receipt/<txid> -> the sender's next_nonce (None if missing/unreadable)."""
+    txid = (txid or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
+        return None
+    try:
+        r = api_call("GET", f"/api/receipt/{txid}", need_key=False, timeout=20, retries=1)
+    except PoaHTTPError:
+        return None
+    return _as_int(r.get("next_nonce")) if isinstance(r, dict) else None
+
+
+def next_nonce_from_response(res):
+    """next_nonce carried by a write response (top level, or inside receipt/tx/result)."""
+    if not isinstance(res, dict):
+        return None
+    for holder in (res, res.get("receipt"), res.get("tx"), res.get("result")):
+        if isinstance(holder, dict) and _as_int(holder.get("next_nonce")) is not None:
+            return _as_int(holder.get("next_nonce"))
+    return None
+
+
+def adopt_next_nonce(res) -> dict:
+    """After a submit: take the server's next_nonce (response, then receipt, then /me) and remember it
+    for this process only. Returns {"next_nonce": n, "source": ...}."""
+    n, src = next_nonce_from_response(res), "response"
+    if n is None and isinstance(res, dict):
+        n, src = receipt_next_nonce(res.get("txid") or res.get("id") or ""), "receipt"
+    if n is None:
+        n, src = read_next_nonce(), "me"
+    if n is None:
+        src = None
+    elif _NONCE["adopted"] is None or n >= _NONCE["adopted"]:
+        _NONCE.update(adopted=n, source=src, at=time.time())
+    return {"next_nonce": n, "source": src}
+
+
+def wait_for_slot(target, sleep=time.sleep, settle=None) -> tuple:
+    """Poll /me until next_nonce >= target (bounded by settle seconds). Returns (ok, last_seen)."""
+    settle = NONCE_SETTLE_S if settle is None else settle
+    seen = read_next_nonce()
+    if target is None:
+        return True, seen
+    waited = 0.0
+    while seen is None or seen < target:
+        if waited >= settle:
+            return False, seen
+        sleep(NONCE_POLL_S)
+        waited += NONCE_POLL_S
+        seen = read_next_nonce()
+    return True, seen
+
+
+class _WriteLock:
+    """Exclusive cross-process lock for hosted writes (fcntl on POSIX, msvcrt on Windows)."""
+
+    def __init__(self, path: pathlib.Path = None, timeout: float = None):
+        self.path = path or (POA_DIR / "cache" / "write.lock")
+        self.timeout = WRITE_LOCK_TIMEOUT_S if timeout is None else timeout
+        self.fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "a+")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except (OSError, IOError):
+                if time.time() >= deadline:
+                    self.fh.close()
+                    self.fh = None
+                    raise PoaHTTPError("busy", "another poa.py write is still in flight (write.lock held); not sending")
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        if self.fh is None:
+            return False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        self.fh.close()
+        self.fh = None
+        return False
+
+
+def hosted_write(send, sleep=time.sleep) -> dict:
+    """Run one nonce-bearing hosted write `send()` under the nonce rules above.
+    Returns the response dict with `_nonce` info added. Raises PoaHTTPError; kind "nonce-lag" or
+    "nonce" means NOT landed and safe to try again on a later run."""
+    with _WriteLock():
+        ok, before = wait_for_slot(_NONCE["adopted"], sleep=sleep)
+        if not ok:
+            raise PoaHTTPError("nonce-lag", f"server next_nonce {before} is behind our last adopted {_NONCE['adopted']} "
+                                            f"after {NONCE_SETTLE_S:.0f}s; not sending into a possibly taken slot")
+        retried = False
+        try:
+            res = send()
+        except PoaHTTPError as e:
+            if not is_nonce_error(e):
+                raise
+            ok2, after = wait_for_slot((before + 1) if before is not None else None, sleep=sleep)
+            if not ok2 or after is None or before is None or after <= before:
+                raise PoaHTTPError("nonce", f"nonce rejected and the server slot did not move (before={before}, now={after}); "
+                                            f"not resending into the same slot: {str(e)[:300]}", e.status)
+            retried = True
+            try:
+                res = send()
+            except PoaHTTPError as e2:
+                if is_nonce_error(e2):
+                    raise PoaHTTPError("nonce", f"nonce rejected again after one refetch+retry; giving up: {str(e2)[:300]}", e2.status)
+                raise
+        info = adopt_next_nonce(res)
+        info.update(before=before, retried_after_nonce_error=retried)
+        if isinstance(res, dict):
+            res = dict(res)
+            res["_nonce"] = info
+        return res
+
+
 def submit_answer_safely(text: str, epoch) -> dict:
     """Send the answer ONCE for this epoch and record it in ~/.poa/cache/epoch-<n>.json.
 
@@ -719,10 +898,10 @@ def submit_answer_safely(text: str, epoch) -> dict:
     save_epoch_cache(epoch, sent_at=now, send_outcome="sending", answer_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
     try:
         try:
-            res = api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1)
+            res = hosted_write(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1))
         except PoaHTTPError as e:
             if e.kind == "network" and mcp_fallback_enabled():
-                res = mcp_call("poa_answer", {"answer": text}, timeout=60)
+                res = hosted_write(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60))
             else:
                 raise
         txid = res.get("txid") or res.get("id") if isinstance(res, dict) else None
@@ -730,6 +909,10 @@ def submit_answer_safely(text: str, epoch) -> dict:
         return {"landed": True, "how": "response", "result": res, "txid": txid}
     except PoaHTTPError as e:
         low = str(e).lower()
+        if e.kind in ("nonce", "nonce-lag", "busy"):
+            save_epoch_cache(epoch, send_outcome="rejected", landed=False, error=str(e)[:300])
+            return {"landed": False, "how": e.kind, "error": str(e)[:300], "kind": e.kind,
+                    "note": "not landed (nonce slot); safe to send again on the next run"}
         if any(m in low for m in DUP_MARKERS):
             save_epoch_cache(epoch, send_outcome="duplicate", landed=True)
             return {"landed": True, "how": "duplicate", "note": "Server says this epoch is already answered."}
@@ -761,15 +944,18 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
     landed: True (assignments confirms) / None (sent or ambiguous, not yet confirmed) / False (rejected)."""
     sent = None
     try:
-        res = api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1)
+        res = hosted_write(lambda: api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1))
         sent = {"how": "response", "result": res}
     except PoaHTTPError as e:
         low = str(e).lower()
+        if e.kind in ("nonce", "nonce-lag", "busy"):
+            return {"landed": False, "how": e.kind, "error": str(e)[:300], "kind": e.kind,
+                    "note": "not landed (nonce slot); safe to grade this seat again on the next run"}
         if "duplicate sealed grade" in low or "already graded" in low:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
             try:
-                sent = {"how": "mcp", "result": mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60)}
+                sent = {"how": "mcp", "result": hosted_write(lambda: mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60))}
             except PoaHTTPError as e2:
                 sent = {"how": "unknown", "error": str(e2)[:300]}
         elif e.kind == "halted":
@@ -801,10 +987,10 @@ def safe_mine() -> dict:
     """Mine once. /mine is a countersign sweep (re-running is harmless, it re-verifies pending
     txs), but we still don't hammer a down server: one try, then MCP if flagged."""
     try:
-        return api_call("GET", "/api/hosted/mine", timeout=60, retries=1)
+        return hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1))
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
-            r = mcp_call("poa_mine", {}, timeout=60)
+            r = hosted_write(lambda: mcp_call("poa_mine", {}, timeout=60))
             r["_rest_error"] = str(e)[:200]
             return r
         raise
@@ -1449,8 +1635,9 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
         elif r.get("landed") is None:
             unknown.append({"txid": txid, "score": score, "error": r.get("error")})
         else:
-            failed.append({"txid": txid, "score": score, "error": r.get("error")})
-            if r.get("kind") == "auth":
+            failed.append({"txid": txid, "score": score, "error": r.get("error"), "kind": r.get("kind")})
+            if r.get("kind") in ("auth", "nonce", "nonce-lag", "busy"):
+                # nonce trouble: stop instead of burning rate limit; the rest stay dealt for the next run
                 break
     retried_ok = [x["txid"] for x in sealed if x.get("how") == "read-back"]
 
@@ -2392,7 +2579,7 @@ def run_reopen(args: argparse.Namespace) -> tuple:
             results.append({"txid": txid, "landed": r.get("landed"), "how": r.get("how")})
             if r.get("landed"):
                 done += 1
-            if r.get("kind") in ("auth",) or "halted" in str(r.get("error", "")).lower():
+            if r.get("kind") in ("auth", "nonce", "nonce-lag", "busy") or "halted" in str(r.get("error", "")).lower():
                 break
         if queue:
             step("grades", queued=len(queue), confirmed=done, results=results)
@@ -2843,11 +3030,11 @@ def main() -> None:
                             del tval["recorded"]
             print(json.dumps(res, indent=2))
         elif args.command == "vote":
-            res = api_call(
+            res = hosted_write(lambda: api_call(
                 "GET",
                 "/api/hosted/vote",
                 query={"ballot": args.ballot, "topic": args.topic, "choice": args.choice},
-            )
+            ))
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "network":
