@@ -1050,43 +1050,69 @@ def pc_silence(log_path: pathlib.Path, node: str, hours: float) -> dict:
     }
 
 
-def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True) -> dict:
-    """Start of the current 6h epoch window. Anchors on the newest close timestamp in
-    GET /api/epochs when available (handles post-pause boundary drift), falling back to
-    the static genesis clock if /api/epochs is unreachable."""
+def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True, current_epoch=None,
+                 epoch_seconds: float = None) -> dict:
+    """Start of the epoch that is open now.
+
+    Preferred anchor: when the open epoch is N and GET /api/epochs has the close of N-1, the
+    window started exactly at that close, however long ago (an overdue close keeps the same
+    epoch open, so its age keeps growing). The old behaviour rolled a fixed 6h grid forward
+    from the newest close, which reset the age to ~0 whenever a close ran late and made the
+    takeover check wait forever. The fixed grid is now only a fallback, flagged
+    `anchor_exact=false`, for when the epoch number or the previous close is unknown."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    step = float(epoch_seconds or EPOCH_SECONDS)
     if epochs_res is None and fetch_epochs:
         try:
             epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=15, retries=1)
         except Exception:
             epochs_res = None
     eps = _epoch_list(epochs_res) if epochs_res is not None else []
-    if eps and isinstance(eps[-1].get("ts"), (int, float)):
+    eps = [e for e in eps if isinstance(e.get("ts"), (int, float))]
+    if current_epoch is not None and eps:
+        try:
+            cur = int(current_epoch)
+        except (TypeError, ValueError):
+            cur = None
+        prev = next((e for e in eps if int(e["epoch"]) == cur - 1), None) if cur is not None else None
+        if prev is not None:
+            start = datetime.datetime.fromtimestamp(int(prev["ts"]), datetime.timezone.utc)
+            age_h = round((now - start).total_seconds() / 3600, 2)
+            return {
+                "window_start": start.isoformat(),
+                "window_age_hours": age_h,
+                "anchor_source": f"epochs:E{prev['epoch']}-close",
+                "anchor_exact": True,
+                "last_close_utc": start.isoformat(),
+                "close_overdue": age_h * 3600 > step * 1.1,
+            }
+    if eps:
         close_dt = datetime.datetime.fromtimestamp(int(eps[-1]["ts"]), datetime.timezone.utc)
         if close_dt <= now:
-            k = int((now - close_dt).total_seconds() // EPOCH_SECONDS)
-            start = close_dt + datetime.timedelta(seconds=k * EPOCH_SECONDS)
+            k = int((now - close_dt).total_seconds() // step)
+            start = close_dt + datetime.timedelta(seconds=k * step)
             return {
                 "window_start": start.isoformat(),
                 "window_age_hours": round((now - start).total_seconds() / 3600, 2),
-                "anchor_source": f"epochs:E{eps[-1]['epoch']}",
+                "anchor_source": f"epochs:E{eps[-1]['epoch']}+grid",
+                "anchor_exact": k == 0,
                 "last_close_utc": close_dt.isoformat(),
             }
     anchor = datetime.datetime.fromisoformat(EPOCH_ANCHOR_UTC)
-    k = int((now - anchor).total_seconds() // EPOCH_SECONDS)
-    start = anchor + datetime.timedelta(seconds=k * EPOCH_SECONDS)
+    k = int((now - anchor).total_seconds() // step)
+    start = anchor + datetime.timedelta(seconds=k * step)
     return {
         "window_start": start.isoformat(),
         "window_age_hours": round((now - start).total_seconds() / 3600, 2),
         "anchor_source": "static_genesis",
+        "anchor_exact": False,
     }
 
 
 def cmd_takeover_check(args: argparse.Namespace) -> None:
     log_path = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
     sil = pc_silence(log_path, args.node, args.hours)
-    win = epoch_window()
-    out = {"pc": sil, "clock": win, "epoch": None, "answered": None, "pc_claim_or_answer": False}
+    out = {"pc": sil, "clock": None, "epoch": None, "answered": None, "pc_claim_or_answer": False}
     try:
         ch = read_challenge()
         out["epoch"] = ch.get("epoch")
@@ -1102,6 +1128,14 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
         if isinstance(edge_ch, dict) and edge_ch.get("epoch") is not None:
             out["edge_epoch"] = edge_ch.get("epoch")
             out["edge_words"] = edge_ch.get("words", [])
+    seconds = None
+    try:
+        seconds = _f((api_call("GET", "/api/params", need_key=False, timeout=15, retries=1) or {}).get("auto_epoch_seconds")) or None
+    except Exception:
+        seconds = None
+    win = epoch_window(current_epoch=out["epoch"] if out["epoch"] is not None else out.get("edge_epoch"),
+                       epoch_seconds=seconds)
+    out["clock"] = win
     now = datetime.datetime.now(datetime.timezone.utc)
     if out["epoch"] is not None:
         claim_ttl = datetime.timedelta(minutes=15)
@@ -2212,6 +2246,169 @@ def cmd_close_health(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# close-check: per close, was OUR answer graded, did it pass, were we paid? (keyless)
+# ---------------------------------------------------------------------------
+def own_answers_by_epoch(explorer_txs: list, log_text: str = "", since_dt=None) -> dict:
+    """{epoch: txid} for OUR challenge answers in the current chain segment.
+    Sources: keyless explorer address view (type=challenge) first, then handoff LOG.md
+    ANSWERED lines dated after `since_dt` (segment genesis), so old-segment epoch numbers
+    never collide with new ones. Pure function."""
+    out = {}
+    for t in explorer_txs or []:
+        if isinstance(t, dict) and t.get("type") == "challenge" and t.get("id") and t.get("epoch") is not None:
+            out.setdefault(int(t["epoch"]), t["id"])
+    for line in (log_text or "").splitlines():
+        if "event=ANSWERED" not in line:
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        ts = _parse_log_ts(parts[0]) if parts else None
+        if since_dt is not None and (ts is None or ts.tzinfo is None or ts < since_dt):
+            continue
+        m_ep = re.search(r"\bepoch=(\d+)", line)
+        m_tx = re.search(r"\btxid[ =]([0-9a-f]{8,64})", line)
+        if m_ep and m_tx:
+            out.setdefault(int(m_ep.group(1)), m_tx.group(1))
+    return out
+
+
+def _find_tx(keys, txid: str):
+    if not txid:
+        return None
+    if txid in keys:
+        return txid
+    return next((k for k in keys if k.startswith(txid)), None) if len(txid) >= 8 else None
+
+
+def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: int = 4, current_epoch=None) -> dict:
+    """Pure function. For each of the last `last` closes: did our answer for that epoch get
+    graded, pass, and get paid; how much was paid to us at that close; standing changes.
+    Output never contains the address, the key or a balance (only per-close payouts)."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    me = (address or "").strip()
+    settled_at, pending_latest = {}, (eps[-1].get("basis") or {}).get("pending") or {}
+    for e in eps:
+        for srow in (e.get("basis") or {}).get("settled") or []:
+            if isinstance(srow, dict) and srow.get("answer"):
+                settled_at[srow["answer"]] = (int(e["epoch"]), srow)
+    rows = []
+    for e in eps[-max(1, last):]:
+        n = int(e["epoch"])
+        b = e.get("basis") or {}
+        rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+        reward = _f(rewards.get(me)) if me else 0.0
+        tx = answers.get(n)
+        row = {"close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None,
+               "answer_txid": (tx or "")[:12] or None, "answer": "none", "graded": False, "grades": 0,
+               "panel": None, "passed": None, "settled_at_close": None,
+               "paid": reward > 0, "payout": f"{reward:.6f}",
+               "challenge_eligible": bool(me) and me in (b.get("challenge_eligible") or []),
+               "challenge_share": bool(me) and me in (e.get("challenges") or {}),
+               "attested": bool(me) and me in (b.get("attestations") or {}),
+               "established_after": bool(me) and me in (b.get("established_after") or []),
+               "established_removed": bool(me) and me in (b.get("established_removed") or []),
+               "slashed": bool(me) and me in (b.get("slashed") or []),
+               "flags": []}
+        if tx:
+            hit = _find_tx(settled_at.keys(), tx)
+            if hit:
+                at, srow = settled_at[hit]
+                row.update(answer="settled", passed=bool(srow.get("passed")), settled_at_close=at,
+                           graded=True, grades=len(srow.get("jury") or []))
+            else:
+                ph = _find_tx(pending_latest.keys(), tx)
+                if ph:
+                    pr = pending_latest[ph] if isinstance(pending_latest[ph], dict) else {}
+                    grades = pr.get("grades") or []
+                    row.update(answer="pending", grades=len(grades), graded=bool(grades),
+                               panel=len(pr.get("panel") or []))
+                    if row["panel"] < quorum:
+                        row["flags"].append("panel_below_quorum")
+                    if row["panel"] == 0:
+                        row["flags"].append("no_panel_drawn")
+                else:
+                    row["answer"] = "missing"
+                    row["flags"].append("answer_not_in_settled_or_pending")
+        else:
+            row["flags"].append("no_answer_recorded")
+        if row["passed"] is False:
+            row["flags"].append("answer_failed")
+        if not row["paid"]:
+            row["flags"].append("not_paid")
+        if row["established_removed"]:
+            row["flags"].append("established_removed")
+        if row["slashed"]:
+            row["flags"].append("slashed")
+        rows.append(row)
+    newest = rows[-1]
+    open_ep = current_epoch if current_epoch is not None else int(eps[-1]["epoch"]) + 1
+    res = {
+        "ok": True, "read_only": True, "newest_close": newest["close"], "open_epoch": open_ep,
+        "open_epoch_answer_txid": (answers.get(int(open_ep)) or "")[:12] or None,
+        "paid_at_newest_close": newest["paid"],
+        "paid_closes": sum(1 for r in rows if r["paid"]), "closes_checked": len(rows),
+        "answers_pending": sum(1 for r in rows if r["answer"] == "pending"),
+        "answers_stuck_no_panel": sum(1 for r in rows if "no_panel_drawn" in r["flags"]),
+        "rows": rows,
+        "verdict": "paid" if newest["paid"] else ("waiting" if newest["answer"] == "pending" else "not-paid"),
+        "note": ("Public reads only: GET /api/epochs and the explorer address view, plus the local handoff log. "
+                 "Payouts are per close, never a balance. A pending answer with panel 0 cannot settle until "
+                 "the operators draw graders for it."),
+    }
+    if open_ep is not None and not res["open_epoch_answer_txid"]:
+        res["open_epoch_unanswered"] = True
+    return res
+
+
+def print_close_check(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-check: {r.get('error')}")
+        return
+    print(f"close-check: newest close E{r['newest_close']} -> {r['verdict'].upper()} | paid in {r['paid_closes']}/{r['closes_checked']} closes"
+          f" | open epoch E{r['open_epoch']} answer {r['open_epoch_answer_txid'] or 'NONE'}")
+    print("close answer        status    graded passed panel payout        eligible flags")
+    for x in r["rows"]:
+        print(f"E{x['close']:<4} {str(x['answer_txid'] or '-'):<12} {x['answer']:<9} {str(x['graded']):<6} {str(x['passed']):<6} "
+              f"{str(x['panel']):<5} {x['payout']:<13} {str(x['challenge_eligible']):<8} {','.join(x['flags']) or '-'}")
+
+
+def cmd_close_check(args: argparse.Namespace) -> None:
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-check: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    me = (args.address or local_address()).strip()
+    if not me:
+        print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
+        sys.exit(2)
+    txs = []
+    try:
+        d = explorer_get(f"/api/explorer/address/{me}?sort=new")
+        txs = (d.get("txs") or []) if isinstance(d, dict) else []
+    except Exception:
+        txs = []
+    lp = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
+    log_text = lp.read_text(encoding="utf-8", errors="ignore") if lp.is_file() else ""
+    answers = own_answers_by_epoch(txs, log_text, SEGMENT2_GENESIS_DT)
+    quorum = 4
+    try:
+        quorum = int((api_call("GET", "/api/params", need_key=False, timeout=30, retries=1) or {}).get("grade_quorum", 4) or 4)
+    except Exception:
+        pass
+    r = close_check(epochs_res, answers, me, last=args.last, quorum=quorum)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_close_check(r)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["verdict"] != "paid":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # epoch-time: settings measured in epochs, shown in real time (SUGGESTIONS.md #3)
 # ---------------------------------------------------------------------------
 PAUSE_GAP_FACTOR = 2.0  # a close gap over 2x the nominal epoch length counts as a pause
@@ -2755,6 +2952,13 @@ def main() -> None:
     p_ch.add_argument("--json", action="store_true", help="JSON output")
     p_ch.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_cc = sub.add_parser("close-check", help="Keyless: per close, was our answer graded, did it pass, were we paid (payout per close; never a balance or address)")
+    p_cc.add_argument("--last", type=int, default=4, help="How many recent closes to check (default 4)")
+    p_cc.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_cc.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
+    p_cc.add_argument("--json", action="store_true", help="JSON output")
+    p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_et = sub.add_parser("epoch-time", help="Keyless: every epoch-counted setting (TTLs, vesting, suspensions) in hours/days at nominal and observed close cadence, plus next close estimate")
     p_et.add_argument("--window", type=int, default=8, help="Close gaps to average for the observed cadence (default 8; pauses excluded)")
     p_et.add_argument("--json", action="store_true", help="JSON output")
@@ -3016,6 +3220,8 @@ def main() -> None:
             cmd_backlog(args)
         elif args.command == "close-health":
             cmd_close_health(args)
+        elif args.command == "close-check":
+            cmd_close_check(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
         elif args.command == "grade-batch":
