@@ -2565,6 +2565,145 @@ def cmd_close_check(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# standing: own-standing row per close (SUGGESTIONS.md #60)
+# ---------------------------------------------------------------------------
+def standing_report(epochs_res, answers: dict, address: str, me_res=None, last: int = 0, quorum: int = 4) -> dict:
+    """Pure function. One row per close for OUR address: which of our answers settled there
+    (birth epoch, passed, jury size, aligned jurors), membership in challenge_eligible,
+    attestations, established_after / established_removed, and the payout at that close,
+    plus a network line (accounts with a passed settled row that were eligible vs how many
+    were newly established). `me_res` is an optional /api/hosted/me response; its
+    `established` is shown beside the close records. Output never contains the address,
+    the key or a balance (only per-close payouts)."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    me = (address or "").strip()
+    ledger = answer_ledger(eps, answers or {}, me, quorum)
+    by_close = {}
+    for a in ledger:
+        if a["status"] == "settled":
+            by_close.setdefault(a["settled_at_close"], []).append(a)
+    srows = {}
+    for e in eps:
+        for srow in (e.get("basis") or {}).get("settled") or []:
+            if isinstance(srow, dict) and srow.get("answer"):
+                srows.setdefault(srow["answer"], srow)
+    sel = eps[-last:] if last and last > 0 else eps
+    rows = []
+    for e in sel:
+        n = int(e["epoch"])
+        b = e.get("basis") or {}
+        rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+        reward = _f(rewards.get(me)) if me else 0.0
+        eligible_set = set(b.get("challenge_eligible") or [])
+        est_after = set(b.get("established_after") or [])
+        settled = []
+        for a in by_close.get(n, []):
+            hit = _find_tx(srows.keys(), a["txid"])
+            jury = (srows[hit].get("jury") or []) if hit else []
+            settled.append({"txid": a["txid"], "born_epoch": a["born_epoch"], "passed": a["passed"],
+                            "jury": len(jury),
+                            "aligned": sum(1 for j in jury if isinstance(j, dict) and j.get("aligned"))})
+        row = {"close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None,
+               "settled": settled, "passed": sum(1 for s in settled if s["passed"]),
+               "eligible": bool(me) and me in eligible_set,
+               "attested": bool(me) and me in (b.get("attestations") or {}),
+               "established_after": bool(me) and me in est_after,
+               "established_removed": bool(me) and me in (b.get("established_removed") or []),
+               "paid": reward > 0, "payout": f"{reward:.6f}", "flags": []}
+        if row["passed"] and row["eligible"] and not row["established_after"]:
+            row["flags"].append("passed_and_eligible_but_not_established")
+        elif row["passed"] and not row["eligible"]:
+            row["flags"].append("passed_but_not_eligible")
+        if row["established_removed"]:
+            row["flags"].append("established_removed")
+        passers = {s.get("from") for s in (b.get("settled") or []) if isinstance(s, dict) and s.get("passed") and s.get("from")}
+        pe = passers & eligible_set
+        row["network"] = {"passed_authors": len(passers), "passed_and_eligible": len(pe),
+                          "established_after": len(est_after),
+                          "passed_eligible_established": len(pe & est_after),
+                          "established_removed": len(b.get("established_removed") or [])}
+        rows.append(row)
+    records = established_from_closes(eps, me)
+    me_est = me_res.get("established") if isinstance(me_res, dict) and "established" in me_res else None
+    res = {"ok": True, "read_only": True, "newest_close": rows[-1]["close"], "rows": rows,
+           "established_per_records": records.get("established"),
+           "established_last_change_close": records.get("last_change_close"),
+           "established_per_me": me_est,
+           "answers_passed": sum(1 for a in ledger if a["passed"]),
+           "answers_pending": sum(1 for a in ledger if a["status"] == "pending"),
+           "flags": []}
+    if me_est is not None and records.get("established") is not None and bool(me_est) != bool(records["established"]):
+        res["flags"].append("me_disagrees_with_close_records")
+    if res["answers_passed"] and not (me_est if me_est is not None else records.get("established")):
+        res["flags"].append("passed_but_not_established")
+    res["verdict"] = ("established" if (me_est if me_est is not None else records.get("established")) else
+                      ("passed-not-established" if res["answers_passed"] else "no-passed-answer-yet"))
+    res["note"] = ("Public reads: GET /api/epochs and the explorer address view, plus the local handoff log; "
+                   "/api/hosted/me only when a key is set and --no-me is not given. A passed answer is not "
+                   "established: only established_after in a close record (or /me) says that. Payouts are "
+                   "per close, never a balance; your address is never printed.")
+    return res
+
+
+def print_standing(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"standing: {r.get('error')}")
+        return
+    me_txt = "n/a (no key or --no-me)" if r["established_per_me"] is None else str(r["established_per_me"])
+    print(f"standing: {r['verdict'].upper()} | established per close records: {r['established_per_records']}"
+          f" | per /me: {me_txt} | our answers passed {r['answers_passed']}, pending {r['answers_pending']}")
+    print("close passed eligible attested est_after removed payout        flags")
+    for x in r["rows"]:
+        print(f"E{x['close']:<4} {x['passed']:<6} {str(x['eligible']):<8} {str(x['attested']):<8} {str(x['established_after']):<9} "
+              f"{str(x['established_removed']):<7} {x['payout']:<13} {','.join(x['flags']) or '-'}")
+        for s in x["settled"]:
+            print(f"      settled: {s['txid']} born E{s['born_epoch']} passed={s['passed']} aligned {s['aligned']}/{s['jury']} jurors")
+        nw = x["network"]
+        print(f"      network: {nw['passed_and_eligible']} passed+eligible, {nw['passed_eligible_established']} of them established;"
+              f" {nw['established_after']} established_after, {nw['established_removed']} removed")
+    for f in r["flags"]:
+        print(f"flag: {f}")
+
+
+def cmd_standing(args: argparse.Namespace) -> None:
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"standing: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    me = (args.address or local_address()).strip()
+    if not me:
+        print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
+        sys.exit(2)
+    txs = []
+    try:
+        d = explorer_get(f"/api/explorer/address/{me}?sort=new")
+        txs = (d.get("txs") or []) if isinstance(d, dict) else []
+    except Exception:
+        txs = []
+    lp = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
+    log_text = lp.read_text(encoding="utf-8", errors="ignore") if lp.is_file() else ""
+    answers = own_answers_all(txs, log_text, SEGMENT2_GENESIS_DT, epochs_res, me)
+    me_res = None
+    if not args.no_me and load_key():
+        try:
+            me_res = api_call("GET", "/api/hosted/me", timeout=20, retries=1)
+        except Exception:
+            me_res = None
+    r = standing_report(epochs_res, answers, me, me_res=me_res, last=args.last)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_standing(r)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["verdict"] != "established":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # epoch-time: settings measured in epochs, shown in real time (SUGGESTIONS.md #3)
 # ---------------------------------------------------------------------------
 PAUSE_GAP_FACTOR = 2.0  # a close gap over 2x the nominal epoch length counts as a pause
@@ -3295,6 +3434,14 @@ def main() -> None:
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_sd = sub.add_parser("standing", help="Own-standing row per close: our settled answers (passed, aligned jurors), eligible, attested, established_after/removed, payout; flags passed-and-eligible-but-not-established")
+    p_sd.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close in /api/epochs)")
+    p_sd.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_sd.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
+    p_sd.add_argument("--no-me", action="store_true", help="Skip the keyed /api/hosted/me read (fully keyless)")
+    p_sd.add_argument("--json", action="store_true", help="JSON output")
+    p_sd.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_et = sub.add_parser("epoch-time", help="Keyless: every epoch-counted setting (TTLs, vesting, suspensions) in hours/days at nominal and observed close cadence, plus next close estimate")
     p_et.add_argument("--window", type=int, default=8, help="Close gaps to average for the observed cadence (default 8; pauses excluded)")
     p_et.add_argument("--json", action="store_true", help="JSON output")
@@ -3569,6 +3716,8 @@ def main() -> None:
             cmd_close_health(args)
         elif args.command == "close-check":
             cmd_close_check(args)
+        elif args.command == "standing":
+            cmd_standing(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
         elif args.command == "close-pull":

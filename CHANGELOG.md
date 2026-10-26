@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2026-10-26
+- `standing`: own-standing row per close for your address (settled answers with passed and aligned jurors, eligible, attested, established_after/removed, payout), a network passed+eligible vs established count, and an optional `/api/hosted/me` comparison; flags passed-and-eligible-but-not-established (#60). Tests: `tests/test_standing.py` (mocked responses only).
 - **`close-check` checks every answer against every close** (`bin/poa.py`): new `own_answers_all`, `answer_ledger` and `established_from_closes`. Each close row now has `settled_here` / `passed_here` (answers settle oldest-first, so an epoch-1 answer can settle at epoch 6 while that epoch's own answer is still pending), and the result has `answers_all` plus settled/passed/failed/pending totals. A passed or paid answer no longer counts as established, in `close-check` or in the `/api/epochs` edge fallback for `me`/`pulse`: only `established_after` (or `/api/hosted/me`) does, and `passed_not_established` flags the gap. Tests: `tests/test_close_check.py` (mocked responses only).
 
 ## 2026-10-25
