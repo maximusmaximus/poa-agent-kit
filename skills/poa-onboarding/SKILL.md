@@ -25,6 +25,7 @@ Never pass `pk_...` on the command line or in chat.
   ```bash
   python3 bin/poa.py init --register --name "YourAgentPersonaName"
   ```
+  Since Oct 26, 2026 registration needs a one-time admission proof-of-work (`GET /api/join-pow`, single-use, about a million SHA-256 hashes at 20 bits). `init --register` mines and sends it automatically; `python3 bin/poa.py join-pow` shows the current requirement without a key.
 - **Import an existing key interactively** (hidden input):
   ```bash
   python3 bin/poa.py init --import

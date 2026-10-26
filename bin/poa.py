@@ -284,8 +284,11 @@ def _classify(exc: Exception, path: str, raw_key: str) -> PoaHTTPError:
                 retry_after = int(str(hdr_ra).strip())
             elif body.strip().startswith("{"):
                 parsed_err = json.loads(body)
-                if isinstance(parsed_err, dict) and isinstance(parsed_err.get("retry_after"), (int, float)):
-                    retry_after = int(parsed_err["retry_after"])
+                if isinstance(parsed_err, dict):
+                    for ra_key in ("retry_after", "retry_after_seconds"):
+                        if isinstance(parsed_err.get(ra_key), (int, float)):
+                            retry_after = int(parsed_err[ra_key])
+                            break
         except Exception:
             retry_after = None
         return PoaHTTPError(kind, f"HTTP {exc.code} ({kind}) on {path}: {body[:600]}", exc.code, retry_after=retry_after)
@@ -569,6 +572,96 @@ def read_challenge(retries: int = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tx-lookup guard (server release v1.2-txlookup-hardening, Oct 26 2026)
+# The edge caps tx lookups at 30/min and caches misses for 60 s; an unknown txid on
+# /api/explorer/tx/<id> now answers 503 "origin busy" with Retry-After: 60.
+# Every /api/explorer/tx and /api/receipt lookup goes through two local guards:
+#   * a shared sliding window (default 25/min, under the 30/min cap), file-backed so
+#     separate processes on one machine share it;
+#   * a negative cache: a txid that came back 404/429/503 is not asked about again
+#     until its Retry-After (at least 60 s) has passed.
+# ---------------------------------------------------------------------------
+TXLOOKUP_PER_MIN = int(os.environ.get("POA_TXLOOKUP_PER_MIN", "25"))
+TXLOOKUP_NEG_TTL = int(os.environ.get("POA_TXLOOKUP_NEG_TTL", "60"))
+TXLOOKUP_MAX_WAIT = float(os.environ.get("POA_TXLOOKUP_MAX_WAIT", "65"))
+
+
+def _txl_path() -> pathlib.Path:
+    return POA_DIR / "cache" / "txlookup.json"
+
+
+def _txl_load() -> dict:
+    try:
+        st = json.loads(_txl_path().read_text(encoding="utf-8"))
+        if isinstance(st, dict):
+            st.setdefault("window", [])
+            st.setdefault("neg", {})
+            return st
+    except Exception:
+        pass
+    return {"window": [], "neg": {}}
+
+
+def _txl_save(st: dict) -> None:
+    try:
+        path = _txl_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def txlookup_negative(txid: str, now: float = None):
+    """Cached miss for txid ({"until", "status", "why"}) if still inside its window, else None."""
+    now = time.time() if now is None else now
+    hit = (_txl_load().get("neg") or {}).get((txid or "").lower())
+    if isinstance(hit, dict) and float(hit.get("until") or 0) > now:
+        return hit
+    return None
+
+
+def txlookup_mark_negative(txid: str, status=None, retry_after=None, why: str = "", now: float = None) -> dict:
+    now = time.time() if now is None else now
+    ttl = max(TXLOOKUP_NEG_TTL, int(retry_after or 0))
+    st = _txl_load()
+    neg = {k: v for k, v in (st.get("neg") or {}).items() if isinstance(v, dict) and float(v.get("until") or 0) > now}
+    entry = {"until": now + ttl, "status": status, "why": why[:120]}
+    neg[(txid or "").lower()] = entry
+    st["neg"] = neg
+    _txl_save(st)
+    return entry
+
+
+def txlookup_slot(sleep=time.sleep, now_fn=time.time, max_wait: float = None) -> float:
+    """Take one slot in the shared per-minute tx-lookup window, sleeping if it is full.
+    Returns seconds waited. Never waits longer than max_wait (default POA_TXLOOKUP_MAX_WAIT)."""
+    max_wait = TXLOOKUP_MAX_WAIT if max_wait is None else max_wait
+    cap = max(1, TXLOOKUP_PER_MIN)
+    waited = 0.0
+    while True:
+        now = now_fn()
+        st = _txl_load()
+        win = [float(t) for t in st.get("window") or [] if now - float(t) < 60.0]
+        if len(win) < cap or waited >= max_wait:
+            win.append(now)
+            st["window"] = win[-cap * 2:]
+            _txl_save(st)
+            return waited
+        delay = min(max(0.5, 60.0 - (now - min(win)) + 0.1), max_wait - waited)
+        sleep(delay)
+        waited += delay
+
+
+def _neg_until_iso(entry: dict) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(entry["until"]), datetime.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Keyless explorer confirmation (public read node; lags a few minutes)
 # ---------------------------------------------------------------------------
 EXPLORER_MIN_WAIT = int(os.environ.get("POA_EXPLORER_MIN_WAIT", "180"))
@@ -576,11 +669,21 @@ EXPLORER_MAX_WAIT = int(os.environ.get("POA_EXPLORER_MAX_WAIT", "900"))
 
 
 def explorer_get(path: str, timeout: float = 40):
+    txid = path.rsplit("/", 1)[-1].split("?", 1)[0] if path.startswith("/api/explorer/tx/") else None
+    if txid:
+        neg = txlookup_negative(txid)
+        if neg:
+            return {"error": f"txid lookup skipped: cached miss until {_neg_until_iso(neg)} (edge 60 s negative cache)",
+                    "status": neg.get("status"), "cached_miss": True}
+        txlookup_slot()
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout)
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout)
         return json.loads(raw.decode("utf-8", errors="replace"))
     except Exception as e:
-        return {"error": redact(str(_classify(e, path, "")))[:200]}
+        err = _classify(e, path, "")
+        if txid and err.status in (404, 429, 503):
+            txlookup_mark_negative(txid, err.status, err.retry_after, why="explorer/tx")
+        return {"error": redact(str(err))[:200], "status": err.status, "retry_after": err.retry_after}
 
 
 def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
@@ -610,8 +713,15 @@ def write_receipt(txid: str, timeout: float = 20) -> dict:
     if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
         return {"txid": txid, "outcome": "invalid", "resend_ok": False, "note": "txid must be hex"}
     path = f"/api/explorer/tx/{txid}"
+    neg = txlookup_negative(txid)
+    if neg:
+        return {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": "cached-miss", "http_status": neg.get("status"),
+                "retry_not_before": _neg_until_iso(neg),
+                "note": "this txid was just looked up and missed; the edge caches misses for 60 s, so asking again now proves nothing. "
+                        "Unknown, NOT failed. Do not resend; re-run `receipt` after retry_not_before."}
+    txlookup_slot()
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"}, timeout=timeout,
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout,
                            follow_redirects=False)
         d = json.loads(raw.decode("utf-8", errors="replace"))
     except Exception as e:
@@ -620,11 +730,19 @@ def write_receipt(txid: str, timeout: float = 20) -> dict:
                     "note": f"explorer answered {e.code} redirect: tx NOT INDEXED (explorer gap, e.g. epochs ~5-10 pre-restart), "
                             "not absent. Unknown, NOT safe to resend; check your own logs / address history."}
         err = _classify(e, path, "")
+        if err.status in (404, 429, 503):
+            neg = txlookup_mark_negative(txid, err.status, err.retry_after, why="receipt")
         if err.status == 404:
-            return {"txid": txid, "outcome": "not-found", "resend_ok": True,
-                    "note": "explorer returned 404: the write did not land; resending is safe (re-check once if it was sent seconds ago)"}
-        return {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": err.kind,
-                "note": "read failed (" + err.kind + "): unknown, NOT failed. Do not resend; re-run `receipt` later."}
+            return {"txid": txid, "outcome": "not-found", "resend_ok": True, "recheck_after_s": TXLOOKUP_NEG_TTL,
+                    "note": "explorer returned 404: the write did not land. The edge caches misses for 60 s, so if you sent it "
+                            "in the last minute, re-check after 60 s before resending."}
+        out = {"txid": txid, "outcome": "unknown", "resend_ok": False, "error_kind": err.kind,
+               "note": "read failed (" + err.kind + "): unknown, NOT failed. Do not resend; re-run `receipt` later."}
+        if err.status in (429, 503):
+            out.update(http_status=err.status, retry_after_s=err.retry_after, retry_not_before=_neg_until_iso(neg),
+                       note=f"explorer answered {err.status} (tx-lookup cap or a cached miss: since Oct 26 an unindexed or unknown txid "
+                            "answers 503 with Retry-After 60). Unknown, NOT failed. Do not resend; re-run `receipt` after retry_not_before.")
+        return out
     t = (d.get("tx") if isinstance(d, dict) and isinstance(d.get("tx"), dict) else d) or {}
     if not isinstance(t, dict) or not (t.get("id") or t.get("txid") or t.get("type")):
         return {"txid": txid, "outcome": "unknown", "resend_ok": False, "note": "unexpected explorer body; treat as unknown"}
@@ -753,9 +871,14 @@ def receipt_next_nonce(txid: str):
     txid = (txid or "").strip()
     if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
         return None
+    if txlookup_negative(txid):
+        return None
+    txlookup_slot()
     try:
         r = api_call("GET", f"/api/receipt/{txid}", need_key=False, timeout=20, retries=1)
-    except PoaHTTPError:
+    except PoaHTTPError as e:
+        if e.status in (404, 429, 503):
+            txlookup_mark_negative(txid, e.status, e.retry_after, why="api/receipt")
         return None
     return _as_int(r.get("next_nonce")) if isinstance(r, dict) else None
 
@@ -2482,6 +2605,8 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
         "paid_closes": sum(1 for r in rows if r["paid"]), "closes_checked": len(rows),
         "answers_pending": sum(1 for a in ledger if a["status"] == "pending"),
         "answers_stuck_no_panel": sum(1 for a in ledger if "no_panel_drawn" in a["flags"]),
+        "panel_field_note": ("the pending record's panel is filled when the answer is first recorded and not updated; most answers "
+                             "that settle had an empty panel there one close earlier, so no_panel_drawn is informational, not a block"),
         "answers_total": len(ledger),
         "answers_settled": sum(1 for a in ledger if a["status"] == "settled"),
         "answers_passed": sum(1 for a in ledger if a["passed"]),
@@ -3268,6 +3393,117 @@ def cmd_reopen(args: argparse.Namespace) -> None:
         sys.exit(code)
 
 
+# ---------------------------------------------------------------------------
+# Admission proof-of-work (server release v1.3-doorpow, Oct 26 2026)
+# GET /api/join-pow -> {challenge, bits, expires_ts, single_use, required, algo}. Find a string nonce
+# (<= 64 chars) such that sha256(utf8(challenge + ":" + nonce)) has `bits` leading ZERO BITS, then send
+# {"pow": {"challenge": ..., "nonce": ...}} in the register / join request body. Proofs are single-use;
+# a rejected join answers 403 with required_bits / get_challenge, so fetch a fresh challenge and re-mine.
+# ---------------------------------------------------------------------------
+def pow_leading_zero_bits(digest: bytes) -> int:
+    z = 0
+    for b in digest:
+        if b == 0:
+            z += 8
+            continue
+        return z + (8 - b.bit_length())
+    return z
+
+
+def solve_join_pow(challenge: str, bits: int, max_iters: int = None, deadline: float = None) -> dict:
+    """Mine a nonce for an admission challenge. Returns {"nonce", "iters", "seconds"} or {"nonce": None, ...}."""
+    if not isinstance(challenge, str) or not challenge or not isinstance(bits, int) or bits < 0 or bits > 64:
+        raise ValueError("bad join-pow challenge")
+    t0 = time.time()
+    prefix = (challenge + ":").encode("utf-8")
+    n = 0
+    while True:
+        if max_iters is not None and n >= max_iters:
+            return {"nonce": None, "iters": n, "seconds": round(time.time() - t0, 3)}
+        if deadline is not None and (n & 0x3FFF) == 0 and time.time() > deadline:
+            return {"nonce": None, "iters": n, "seconds": round(time.time() - t0, 3), "expired": True}
+        nonce = str(n)
+        if pow_leading_zero_bits(hashlib.sha256(prefix + nonce.encode("ascii")).digest()) >= bits:
+            return {"nonce": nonce, "iters": n + 1, "seconds": round(time.time() - t0, 3)}
+        n += 1
+
+
+def fetch_join_pow() -> dict:
+    """Keyless GET /api/join-pow (one fresh, single-use challenge)."""
+    res = api_call("GET", "/api/join-pow", need_key=False, timeout=20, retries=2)
+    if not isinstance(res, dict) or not res.get("challenge"):
+        raise RuntimeError("GET /api/join-pow did not return a challenge")
+    return res
+
+
+def mined_join_pow(pow_info: dict = None, now_fn=time.time) -> dict:
+    """Fetch (unless given) and solve one admission challenge. Returns the body fragment {"challenge", "nonce"}."""
+    info = pow_info or fetch_join_pow()
+    bits = int(info.get("bits") or 0)
+    exp = info.get("expires_ts")
+    deadline = float(exp) - 2 if isinstance(exp, (int, float)) else None
+    sol = solve_join_pow(info["challenge"], bits, deadline=deadline)
+    if sol.get("nonce") is None:
+        raise RuntimeError("join-pow challenge expired before a nonce was found; run again for a fresh one")
+    return {"challenge": info["challenge"], "nonce": sol["nonce"], "_bits": bits, "_seconds": sol["seconds"], "_iters": sol["iters"]}
+
+
+def _register_once(q: dict, pow_frag: dict, timeout: float = 30) -> dict:
+    qs = urllib.parse.urlencode(q)
+    url = f"{BASE_URL}/api/hosted/register" + (f"?{qs}" if qs else "")
+    body = dict(q)
+    if pow_frag:
+        body["pow"] = {"challenge": pow_frag["challenge"], "nonce": pow_frag["nonce"]}
+    raw = http_request("POST", url, data=json.dumps(body).encode("utf-8"),
+                       headers={"Accept": "application/json", "Content-Type": "application/json; charset=utf-8",
+                                "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout)
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def register_with_pow(q: dict, fetch=None, solve=None, log=print) -> dict:
+    """POST /api/hosted/register with a mined admission proof. On a 403 that names required_bits or
+    get_challenge, mine a fresh proof once (proofs are single-use) and retry once. Never loops."""
+    fetch = fetch or fetch_join_pow
+    solve = solve or mined_join_pow
+    info = fetch()
+    frag = solve(info) if info.get("required", True) else None
+    if frag:
+        log(f"Admission proof mined: {frag['_bits']} bits in {frag['_seconds']}s ({frag['_iters']} hashes).", file=sys.stderr)
+    try:
+        return _register_once(q, frag)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if e.code != 403 or not any(k in body for k in ("required_bits", "get_challenge")):
+            raise PoaHTTPError("client" if e.code < 500 else "server", f"HTTP {e.code} on /api/hosted/register: {redact(body)[:400]}", e.code)
+        try:
+            need = json.loads(body).get("required_bits")
+        except Exception:
+            need = None
+        log(f"Register rejected the proof (403, required_bits={need}); mining one fresh proof and retrying once.", file=sys.stderr)
+        info2 = fetch()
+        if isinstance(need, int) and need > int(info2.get("bits") or 0):
+            info2 = dict(info2, bits=need)
+        frag2 = solve(info2)
+        return _register_once(q, frag2)
+
+
+def cmd_join_pow(args: argparse.Namespace) -> None:
+    """Keyless: show the current admission proof-of-work requirement; --solve times one local solve (never submitted)."""
+    info = fetch_join_pow()
+    bits = int(info.get("bits") or 0)
+    out = {"required": info.get("required"), "bits": bits, "single_use": info.get("single_use"),
+           "expires_ts": info.get("expires_ts"), "expected_hashes": 2 ** bits}
+    if args.solve:
+        frag = mined_join_pow(info)
+        out.update(solved=True, seconds=frag["_seconds"], hashes=frag["_iters"],
+                   note="proof solved locally and NOT submitted; it expires unused. Registering fetches its own fresh challenge.")
+    print(json.dumps(out, indent=2))
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     POA_DIR.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -3291,19 +3527,14 @@ def cmd_init(args: argparse.Namespace) -> None:
             raise RuntimeError(f"{KEY_FILE} already exists. Pass --force to overwrite.")
         q = {}
         if args.name:
-            q["name"] = args.name
+            q["label"] = args.name  # documented name (go.md)
+            q["name"] = args.name   # older alias
         ref = args.ref if args.ref is not None else local_ref()
         if ref:
-            q["ref"] = ref
-        qs = urllib.parse.urlencode(q)
-        url = f"{BASE_URL}/api/hosted/register" + (f"?{qs}" if qs else "")
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            q["invited_by"] = ref   # documented name (go.md)
+            q["ref"] = ref          # older alias
+        # Since v1.3-doorpow (Oct 26 2026) registration needs a mined admission proof.
+        data = register_with_pow(q)
         api_key = data.get("api_key") or data.get("key")
         if not api_key:
             raise RuntimeError(f"Registration response did not include a key: {redact(json.dumps(data))}")
@@ -3336,6 +3567,9 @@ def main() -> None:
     p_init.add_argument("--ref", default=None, help="Referral address (default: $POA_REF or ~/.poa/ref, else none)")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing ~/.poa/key")
 
+    p_jp = sub.add_parser("join-pow", help="Keyless: current admission proof-of-work requirement for new joins (--solve times one local solve, never submitted)")
+    p_jp.add_argument("--solve", action="store_true", help="Solve one challenge locally to time it (the proof is not used)")
+
     sub.add_parser("me", help="Fetch account balance, standing, and epoch status")
     sub.add_parser("challenge", help="Fetch current epoch challenge and required seed words")
     sub.add_parser("mine", help="Verify and countersign peer transactions (auto-mining)")
@@ -3358,7 +3592,7 @@ def main() -> None:
     p_ans.add_argument("--epoch", type=int, default=None, help="Use the cached challenge for this epoch if live reads fail")
     p_ans.add_argument("--no-confirm", action="store_true", help="Skip the >=3 min explorer confirmation wait")
     p_ans.add_argument("--read-retries", type=int, default=3, help="Live challenge read attempts before falling back to cache")
-    p_rc = sub.add_parser("receipt", help="Keyless write receipt by txid: landed-final / landed-pending / not-found (direct 404) / unknown (timeout or 3xx redirect, never 'failed')")
+    p_rc = sub.add_parser("receipt", help="Keyless write receipt by txid: landed-final / landed-pending / not-found (direct 404) / unknown (timeout, 3xx redirect, 429/503 or a cached miss; never 'failed')")
     p_rc.add_argument("txid", nargs="+")
     p_rc.add_argument("--timeout", type=float, default=20)
     p_st = sub.add_parser("answer-status", help="Keyless explorer check: did our answer for an epoch land? (never sends)")
@@ -3718,6 +3952,8 @@ def main() -> None:
             cmd_close_check(args)
         elif args.command == "standing":
             cmd_standing(args)
+        elif args.command == "join-pow":
+            cmd_join_pow(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
         elif args.command == "close-pull":

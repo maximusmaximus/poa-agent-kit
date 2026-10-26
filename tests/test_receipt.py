@@ -14,6 +14,11 @@ def http_err(code):
 
 
 class ReceiptTests(unittest.TestCase):
+    def setUp(self):
+        # fresh POA_HOME per test: the tx-lookup negative cache and window live in POA_HOME/cache
+        d = mock.patch.object(poa, "POA_DIR", pathlib.Path(tempfile.mkdtemp()))
+        d.start(); self.addCleanup(d.stop)
+
     def run_with(self, **kw):
         with mock.patch.object(poa, "http_request", **kw) as m:
             return poa.write_receipt(TX), m
