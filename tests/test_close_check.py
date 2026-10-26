@@ -136,5 +136,74 @@ class EpochWindowTests(unittest.TestCase):
         self.assertTrue(out["clock"]["anchor_exact"])
 
 
+class AllAnswersTests(unittest.TestCase):
+    """Shaped like the real E6 close (Oct 26 2026): an E1-born answer settled and passed at E6
+    while the E6-born answer stayed pending; 105 passed+eligible accounts, only 11 established."""
+
+    def e6_like(self):
+        others = [f"poa1OTHER{i:03d}" for i in range(105)]
+        settled = [{"answer": "c5cb47f9e358f1bf" + "0" * 48, "from": ME, "passed": True, "jury": [{"grader": "g", "aligned": True}] * 5}]
+        settled += [{"answer": f"{i:064x}", "from": a, "passed": True, "jury": [{}] * 4} for i, a in enumerate(others[:104])]
+        pending = {"31495b46c021" + "1" * 52: {"kind": "short", "panel": ["poa1G"], "since": 6, "grades": [{"score": 2}]},
+                   "1723548d8479" + "2" * 52: {"kind": "short", "panel": [], "since": 2, "grades": []}}
+        eps = [close(n, T0 + n * H) for n in range(6)]
+        e6 = close(6, T0 + 6 * H, rewards={ME: "511996.651201"}, settled=settled, pending=pending, eligible=[ME] + others[:104])
+        e6["basis"]["established_after"] = others[:11]
+        e6["basis"]["attestations"] = {ME: 10}
+        return eps + [e6]
+
+    def test_older_answer_settling_at_newest_close_is_seen(self):
+        eps = self.e6_like()
+        answers = {1: "c5cb47f9e358", 2: "1723548d8479", 6: "31495b46c021"}
+        r = poa.close_check(eps, answers, ME, last=4)
+        row = r["rows"][-1]
+        self.assertEqual(row["answer"], "pending")  # the E6-born answer itself
+        self.assertEqual([a["txid"] for a in row["settled_here"]], ["c5cb47f9e358"])
+        self.assertEqual(row["settled_here"][0]["born_epoch"], 1)
+        self.assertEqual(row["passed_here"], 1)
+        self.assertEqual(r["verdict"], "paid")
+        self.assertEqual((r["answers_total"], r["answers_settled"], r["answers_passed"], r["answers_pending"]), (3, 1, 1, 2))
+        led = {a["txid"]: a for a in r["answers_all"]}
+        self.assertEqual((led["c5cb47f9e358"]["status"], led["c5cb47f9e358"]["settled_at_close"]), ("settled", 6))
+        self.assertIn("no_panel_drawn", led["1723548d8479"]["flags"])
+
+    def test_pass_does_not_imply_established(self):
+        eps = self.e6_like()
+        r = poa.close_check(eps, {1: "c5cb47f9e358"}, ME, last=1)
+        self.assertIn("passed_not_established", r["rows"][-1]["flags"])
+        est = r["established_from_closes"]
+        self.assertIsNone(est["established"])
+        self.assertTrue(est["passed_but_not_established"])
+        self.assertEqual(est["closes_with_a_passed_answer"], [6])
+        b = eps[-1]["basis"]
+        passed = {x["from"] for x in b["settled"] if x["passed"]} & set(b["challenge_eligible"])
+        self.assertEqual((len(passed), len(passed & set(b["established_after"]))), (105, 11))
+        with mock.patch.object(poa, "api_call", return_value=eps):
+            self.assertIsNone(poa.edge_read_epochs_summary(ME)["established_from_epochs"])
+
+    def test_established_after_then_removed(self):
+        eps = [close(1, T0), close(2, T0 + H), close(3, T0 + 2 * H, removed=[ME])]
+        eps[0]["basis"]["established_after"] = [ME]
+        st = poa.established_from_closes(eps[:2], ME)
+        self.assertEqual((st["established"], st["last_change_close"]), (True, 1))
+        st = poa.established_from_closes(eps, ME)
+        self.assertEqual((st["established"], st["last_change_close"]), (False, 3))
+
+    def test_all_answers_keeps_two_in_one_epoch_and_settled_from_rows(self):
+        eps = self.e6_like()
+        txs = [{"type": "challenge", "id": "aaaa1111", "epoch": 3}, {"type": "challenge", "id": "bbbb2222", "epoch": 3}]
+        got = poa.own_answers_all(txs, "", None, eps, ME)
+        self.assertEqual(got["aaaa1111"], 3)
+        self.assertEqual(got["bbbb2222"], 3)
+        self.assertIn("c5cb47f9e358f1bf" + "0" * 48, got)  # found via settled.from even with no txid on file
+        out = json.dumps(poa.close_check(eps, {}, ME, all_answers=got))
+        self.assertNotIn(ME, out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            poa.print_close_check(poa.close_check(eps, {}, ME, all_answers=got))
+        self.assertNotIn(ME, buf.getvalue())
+        self.assertIn("settled here: c5cb47f9e358", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

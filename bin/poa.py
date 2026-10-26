@@ -533,8 +533,8 @@ def edge_read_epochs_summary(address: str = None, timeout: int = 25) -> dict:
             if isinstance(b, dict):
                 if addr in (b.get("established_after") or []) or (b.get("graders_served") or {}).get(addr):
                     established = True
-                if established is None and rf and rf > 0:
-                    established = True
+                # A payout (or a passed answer) does NOT imply established: E6 paid 105
+                # passed+eligible accounts but listed only 11 in established_after.
                 if addr in (b.get("established_removed") or []) or addr in (b.get("slashed") or []) or addr in (b.get("ejected") or []):
                     established = False
         latest = eps[-1] if isinstance(eps[-1], dict) else {}
@@ -2290,6 +2290,104 @@ def own_answers_by_epoch(explorer_txs: list, log_text: str = "", since_dt=None) 
     return out
 
 
+def own_answers_all(explorer_txs: list, log_text: str = "", since_dt=None, epochs_res=None, address: str = "") -> dict:
+    """{txid: born_epoch} for EVERY one of our challenge answers in the current segment
+    (explorer view, handoff ANSWERED lines after `since_dt`, and settled rows whose `from`
+    is our address). Unlike own_answers_by_epoch, several answers per epoch are all kept.
+    Pure function."""
+    out = {}
+    for t in explorer_txs or []:
+        if isinstance(t, dict) and t.get("type") == "challenge" and t.get("id") and t.get("epoch") is not None:
+            out.setdefault(t["id"], int(t["epoch"]))
+    for line in (log_text or "").splitlines():
+        if "event=ANSWERED" not in line:
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        ts = _parse_log_ts(parts[0]) if parts else None
+        if since_dt is not None and (ts is None or ts.tzinfo is None or ts < since_dt):
+            continue
+        m_ep = re.search(r"\bepoch=(\d+)", line)
+        m_tx = re.search(r"\btxid[ =]([0-9a-f]{8,64})", line)
+        if m_ep and m_tx:
+            tx = m_tx.group(1)
+            if not any(k.startswith(tx) or tx.startswith(k) for k in out):
+                out[tx] = int(m_ep.group(1))
+    me = (address or "").strip()
+    if me:
+        for e in _epoch_list(epochs_res):
+            for srow in (e.get("basis") or {}).get("settled") or []:
+                if isinstance(srow, dict) and srow.get("from") == me and srow.get("answer"):
+                    a = srow["answer"]
+                    short = next((k for k in out if a.startswith(k) and k != a), None)
+                    if short:  # upgrade a short log txid to the full one
+                        out[a] = out.pop(short)
+                    out.setdefault(a, None)
+    return out
+
+
+def answer_ledger(epochs_res, answers, address: str = "", quorum: int = 4) -> list:
+    """Every one of our answers checked against EVERY close record, not only the newest.
+    `answers`: {txid: born_epoch} or {born_epoch: txid}. Pure function; no address in output."""
+    eps = _epoch_list(epochs_res)
+    if answers and all(isinstance(k, int) for k in answers):
+        answers = {v: k for k, v in answers.items() if v}
+    settled_at = {}
+    for e in eps:
+        for srow in (e.get("basis") or {}).get("settled") or []:
+            if isinstance(srow, dict) and srow.get("answer"):
+                settled_at.setdefault(srow["answer"], (int(e["epoch"]), srow))
+    pending = ((eps[-1].get("basis") or {}).get("pending") or {}) if eps else {}
+    last_close = int(eps[-1]["epoch"]) if eps else None
+    out = []
+    for tx, born in sorted((answers or {}).items(), key=lambda kv: (kv[1] is None, kv[1] if kv[1] is not None else 0, kv[0])):
+        row = {"txid": tx[:12], "born_epoch": born, "status": "missing", "settled_at_close": None, "passed": None,
+               "grades": 0, "panel": None, "pending_since": None, "flags": []}
+        hit = _find_tx(settled_at.keys(), tx)
+        if hit:
+            at, srow = settled_at[hit]
+            if row["born_epoch"] is None and srow.get("epoch") is not None:
+                row["born_epoch"] = srow.get("epoch")
+            row.update(status="settled", settled_at_close=at, passed=bool(srow.get("passed")),
+                       grades=len(srow.get("jury") or []))
+            if not row["passed"]:
+                row["flags"].append("answer_failed")
+        else:
+            ph = _find_tx(pending.keys(), tx)
+            if ph:
+                pr = pending[ph] if isinstance(pending[ph], dict) else {}
+                row.update(status="pending", grades=len(pr.get("grades") or []), panel=len(pr.get("panel") or []),
+                           pending_since=pr.get("since"))
+                if row["panel"] < quorum:
+                    row["flags"].append("panel_below_quorum")
+                if row["panel"] == 0:
+                    row["flags"].append("no_panel_drawn")
+            elif born is not None and last_close is not None and born > last_close:
+                row["status"] = "open"  # its epoch has not closed yet
+            else:
+                row["flags"].append("answer_not_in_settled_or_pending")
+        out.append(row)
+    return out
+
+
+def established_from_closes(epochs_res, address: str) -> dict:
+    """Established status as the close records show it: the last close listing us in
+    established_after (True) or established_removed/slashed/ejected (False). A passed or
+    paid answer is NOT taken as established. None = never listed either way."""
+    me = (address or "").strip()
+    state, at, passed_closes = None, None, []
+    for e in _epoch_list(epochs_res):
+        b = e.get("basis") or {}
+        n = int(e["epoch"])
+        if me and any(isinstance(r, dict) and r.get("from") == me and r.get("passed") for r in b.get("settled") or []):
+            passed_closes.append(n)
+        if me and me in (b.get("established_after") or []):
+            state, at = True, n
+        if me and (me in (b.get("established_removed") or []) or me in (b.get("slashed") or []) or me in (b.get("ejected") or [])):
+            state, at = False, n
+    return {"established": state, "last_change_close": at, "closes_with_a_passed_answer": passed_closes,
+            "passed_but_not_established": bool(passed_closes) and state is not True}
+
+
 def _find_tx(keys, txid: str):
     if not txid:
         return None
@@ -2298,9 +2396,13 @@ def _find_tx(keys, txid: str):
     return next((k for k in keys if k.startswith(txid)), None) if len(txid) >= 8 else None
 
 
-def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: int = 4, current_epoch=None) -> dict:
+def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: int = 4, current_epoch=None,
+                all_answers: dict = None) -> dict:
     """Pure function. For each of the last `last` closes: did our answer for that epoch get
-    graded, pass, and get paid; how much was paid to us at that close; standing changes.
+    graded, pass, and get paid; which of OUR answers (born in any epoch) settled AT that close;
+    how much was paid to us; standing changes. `answers` is {born_epoch: txid}; `all_answers`
+    ({txid: born_epoch}) adds every other answer of ours, e.g. a second answer in one epoch.
+    Every answer is also checked against every close record (`answers_all`).
     Output never contains the address, the key or a balance (only per-close payouts)."""
     eps = _epoch_list(epochs_res)
     if not eps:
@@ -2311,6 +2413,11 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
         for srow in (e.get("basis") or {}).get("settled") or []:
             if isinstance(srow, dict) and srow.get("answer"):
                 settled_at[srow["answer"]] = (int(e["epoch"]), srow)
+    merged = dict(all_answers or {})
+    for ep_n, tx in (answers or {}).items():
+        if tx and not any(k.startswith(tx) or tx.startswith(k) for k in merged):
+            merged[tx] = int(ep_n)
+    ledger = answer_ledger(eps, merged, me, quorum)
     rows = []
     for e in eps[-max(1, last):]:
         n = int(e["epoch"])
@@ -2329,6 +2436,12 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
                "established_removed": bool(me) and me in (b.get("established_removed") or []),
                "slashed": bool(me) and me in (b.get("slashed") or []),
                "flags": []}
+        here = [{"txid": a["txid"], "born_epoch": a["born_epoch"], "passed": a["passed"]}
+                for a in ledger if a["settled_at_close"] == n]
+        row["settled_here"] = here
+        row["passed_here"] = sum(1 for a in here if a["passed"])
+        if row["passed_here"] and not row["established_after"]:
+            row["flags"].append("passed_not_established")
         if tx:
             hit = _find_tx(settled_at.keys(), tx)
             if hit:
@@ -2367,13 +2480,22 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
         "open_epoch_answer_txid": (answers.get(int(open_ep)) or "")[:12] or None,
         "paid_at_newest_close": newest["paid"],
         "paid_closes": sum(1 for r in rows if r["paid"]), "closes_checked": len(rows),
-        "answers_pending": sum(1 for r in rows if r["answer"] == "pending"),
-        "answers_stuck_no_panel": sum(1 for r in rows if "no_panel_drawn" in r["flags"]),
+        "answers_pending": sum(1 for a in ledger if a["status"] == "pending"),
+        "answers_stuck_no_panel": sum(1 for a in ledger if "no_panel_drawn" in a["flags"]),
+        "answers_total": len(ledger),
+        "answers_settled": sum(1 for a in ledger if a["status"] == "settled"),
+        "answers_passed": sum(1 for a in ledger if a["passed"]),
+        "answers_failed": sum(1 for a in ledger if a["passed"] is False),
+        "answers_settled_at_newest_close": newest["settled_here"],
+        "established_from_closes": established_from_closes(eps, me),
+        "answers_all": ledger,
         "rows": rows,
         "verdict": "paid" if newest["paid"] else ("waiting" if newest["answer"] == "pending" else "not-paid"),
         "note": ("Public reads only: GET /api/epochs and the explorer address view, plus the local handoff log. "
                  "Payouts are per close, never a balance. A pending answer with panel 0 cannot settle until "
-                 "the operators draw graders for it."),
+                 "the operators draw graders for it. Answers settle oldest-first, so an older answer can "
+                 "settle at a later close (settled_here). A passed answer does not mean established: "
+                 "only established_after in a close record (or /api/hosted/me) says that."),
     }
     if open_ep is not None and not res["open_epoch_answer_txid"]:
         res["open_epoch_unanswered"] = True
@@ -2390,6 +2512,20 @@ def print_close_check(r: dict) -> None:
     for x in r["rows"]:
         print(f"E{x['close']:<4} {str(x['answer_txid'] or '-'):<12} {x['answer']:<9} {str(x['graded']):<6} {str(x['passed']):<6} "
               f"{str(x['panel']):<5} {x['payout']:<13} {str(x['challenge_eligible']):<8} {','.join(x['flags']) or '-'}")
+        for a in x.get("settled_here") or []:
+            print(f"      settled here: {a['txid']} (born E{a['born_epoch']}) passed={a['passed']}")
+    est = r.get("established_from_closes") or {}
+    print(f"our answers: {r.get('answers_total', 0)} total | settled {r.get('answers_settled', 0)} "
+          f"(passed {r.get('answers_passed', 0)}, failed {r.get('answers_failed', 0)}) | pending {r.get('answers_pending', 0)} "
+          f"({r.get('answers_stuck_no_panel', 0)} with no panel)")
+    print(f"established per close records: {est.get('established')} "
+          f"({'last change E' + str(est['last_change_close']) if est.get('last_change_close') is not None else 'never listed in established_after'})"
+          + (" | passed but NOT established" if est.get("passed_but_not_established") else ""))
+    for a in r.get("answers_all") or []:
+        print(f"  {a['txid']} born E{a['born_epoch']}: {a['status']}"
+              + (f" at close E{a['settled_at_close']} passed={a['passed']}" if a['status'] == 'settled' else "")
+              + (f" panel {a['panel']} grades {a['grades']}" if a['status'] == 'pending' else "")
+              + (f" [{','.join(a['flags'])}]" if a['flags'] else ""))
 
 
 def cmd_close_check(args: argparse.Namespace) -> None:
@@ -2411,12 +2547,13 @@ def cmd_close_check(args: argparse.Namespace) -> None:
     lp = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
     log_text = lp.read_text(encoding="utf-8", errors="ignore") if lp.is_file() else ""
     answers = own_answers_by_epoch(txs, log_text, SEGMENT2_GENESIS_DT)
+    all_answers = own_answers_all(txs, log_text, SEGMENT2_GENESIS_DT, epochs_res, me)
     quorum = 4
     try:
         quorum = int((api_call("GET", "/api/params", need_key=False, timeout=30, retries=1) or {}).get("grade_quorum", 4) or 4)
     except Exception:
         pass
-    r = close_check(epochs_res, answers, me, last=args.last, quorum=quorum)
+    r = close_check(epochs_res, answers, me, last=args.last, quorum=quorum, all_answers=all_answers)
     if args.json:
         print(json.dumps(r, indent=2))
     else:
