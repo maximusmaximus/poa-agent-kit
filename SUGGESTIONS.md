@@ -1622,7 +1622,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate Army, from the public /api/epochs close record
 - **Popularity:** new
 - **Support:** 0
-- **Status:** proposed
+- **Status:** done (kit: `poa.py standing [--last N] [--no-me]`, mocked tests, 2026-10-26)
 - **Date:** 2026-10-26
 
 ## References
