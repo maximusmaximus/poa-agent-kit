@@ -841,7 +841,12 @@ DUP_MARKERS = ("duplicate challenge for epoch", "already answered", "duplicate a
 NONCE_SETTLE_S = float(os.environ.get("POA_NONCE_SETTLE_S", "15"))
 NONCE_POLL_S = float(os.environ.get("POA_NONCE_POLL_S", "3"))
 WRITE_LOCK_TIMEOUT_S = float(os.environ.get("POA_WRITE_LOCK_TIMEOUT_S", "300"))
-NONCE_MARKERS = ("nonce", "duplicate slot", "duplicate-slot", "dup-slot", "slot taken", "slot already")
+# "slot latched" (live client change 3:44 PM PT Oct 27, 2026, params slot_latch_from_ts): once a
+# checkpoint bake covers a nonce slot with two or more candidate txs, its winner is written to the
+# chain's slot-winners.jsonl and any other tx in that slot is rejected "slot latched (slot-winners hN)".
+# It is a taken-slot refusal like the others: never resend into it.
+NONCE_MARKERS = ("nonce", "duplicate slot", "duplicate-slot", "dup-slot", "slot taken", "slot already",
+                 "slot latched")
 _NONCE = {"adopted": None, "source": None, "at": None}
 
 

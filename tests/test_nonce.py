@@ -180,3 +180,9 @@ class NonceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_slot_latched_is_nonce_error():
+    e = poa.PoaHTTPError("client", 'HTTP 409 (client) on /api/hosted/grade: {"error":"slot latched (slot-winners h1234)"}', 409)
+    assert poa.is_nonce_error(e)
+    assert not poa.is_nonce_error(poa.PoaHTTPError("client", "HTTP 400 bad answer length", 400))

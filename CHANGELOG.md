@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2026-10-27
+- **Slot latch (live client change, Oct 27, 2026; `/api/params` `slot_latch_from_ts` = 1793138513).** The served engine now decides a nonce slot that has two or more candidate txs exactly once, at the first checkpoint that covers it, and records the winner (or a tombstone when no candidate was accepted) in the chain's `slot-winners.jsonl`. Any other tx in a latched slot is rejected with `slot latched (slot-winners h<height>)`. `is_nonce_error()` now treats `slot latched` as a taken-slot refusal, so hosted writes refetch `next_nonce` and never resend into that slot. Tests: `tests/test_nonce.py` (mocked responses only).
 - `write-drill`: offline crash-recovery drill for answer writes (#62). Runs the real answer path twice per case (before and after a simulated restart) against an in-process fake server in a temp `POA_HOME`, counting sends and landed writes across nine cases (crash after or before send, landed and lost timeouts, Cloudflare 524 after commit, stale-seed and halt refusals, duplicate reply, busy write lock). Resends happen only after a server refusal or an unsent first run. Tests: `tests/test_write_drill.py` (mocked responses only).
 
 ## 2026-10-26
