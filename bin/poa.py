@@ -21,10 +21,12 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -3549,6 +3551,157 @@ def cmd_init(args: argparse.Namespace) -> None:
     raise RuntimeError("Specify either `--register [--name <AgentName>]` or `--import`.")
 
 
+# ---------------------------------------------------------------------------
+# write-drill (#62): offline crash-recovery drill for answer writes. Counts SENDS, not retries.
+# Every case runs submit_answer_safely() twice (run 1, then a simulated restart) against an
+# in-process fake hosted server that replaces http_request(), inside a throwaway POA_HOME.
+# No network, no key, no real cache is touched. Grades are not covered (grading is out of scope).
+# ---------------------------------------------------------------------------
+class _DrillCrash(BaseException):
+    """Simulated process death (not an Exception, so nothing in the write path can swallow it)."""
+
+
+class _DrillServer:
+    def __init__(self, script=None, answered=False, crash_on_me=False):
+        self.script = list(script or [])
+        self.answered = answered
+        self.nonce = 10
+        self.sends = 0
+        self.landed = 0
+        self.crash_on_me = crash_on_me
+        self.offroute = []
+
+    @staticmethod
+    def _err(url, code, body):
+        return urllib.error.HTTPError(url, code, "drill", {}, io.BytesIO(body.encode("utf-8")))
+
+    def _land(self):
+        self.answered = True
+        self.landed += 1
+        self.nonce += 1
+
+    def http_request(self, method, url, data=None, headers=None, timeout=30, follow_redirects=True):
+        path = urllib.parse.urlsplit(url).path
+        if path.endswith("/api/hosted/me") and method.upper() == "GET":
+            if self.crash_on_me:
+                self.crash_on_me = False
+                raise _DrillCrash("process died before the answer left")
+            return json.dumps({"next_nonce": self.nonce, "answered": self.answered}).encode()
+        if path.endswith("/api/hosted/answer") and method.upper() == "POST":
+            self.sends += 1
+            step = self.script.pop(0) if self.script else "ok"
+            if self.answered and step == "ok":
+                step = "duplicate"
+            if step == "ok":
+                self._land()
+                return json.dumps({"ok": True, "txid": "d0" * 16, "next_nonce": self.nonce}).encode()
+            if step == "crash_after_land":
+                self._land()
+                raise _DrillCrash("process died after the answer landed, before the reply was read")
+            if step == "timeout_after_land":
+                self._land()
+                raise TimeoutError("timed out")
+            if step == "timeout_no_land":
+                raise TimeoutError("timed out")
+            if step == "cf524_after_land":
+                self._land()
+                raise self._err(url, 524, "<html>cloudflare 524: a timeout occurred</html>")
+            if step == "stale":
+                raise self._err(url, 400, '{"error":"stale_seed","seed_rotated_this_epoch":true}')
+            if step == "halted":
+                raise self._err(url, 503, '{"error":"endpoint temporarily halted - API hardening in progress"}')
+            if step == "duplicate":
+                raise self._err(url, 400, '{"error":"duplicate challenge for epoch"}')
+            raise ValueError(f"drill: unknown step {step}")
+        self.offroute.append(path)
+        raise OSError(f"drill: no route for {method} {path} (offline drill never reaches the network)")
+
+
+# name, server script, preset, expected sends, expected landed writes, expected run-2 'how', resend proof
+WRITE_DRILL_CASES = (
+    ("crash-after-send", {"script": ["crash_after_land"]}, 1, 1, "sent_before", ""),
+    ("crash-before-send", {"crash_on_me": True}, 0, 0, "sent_before", ""),
+    ("timeout-landed", {"script": ["timeout_after_land"]}, 1, 1, "sent_before", ""),
+    ("timeout-not-landed", {"script": ["timeout_no_land"]}, 1, 0, "sent_before", ""),
+    ("cf524-after-commit", {"script": ["cf524_after_land"]}, 1, 1, "sent_before", ""),
+    ("stale-seed-refused", {"script": ["stale", "ok"]}, 2, 1, "response", "server refused with 400 stale_seed, so nothing landed"),
+    ("halt-refused", {"script": ["halted", "ok"]}, 2, 1, "response", "server refused with 503 halt, so nothing landed"),
+    ("duplicate-is-receipt", {"script": ["duplicate"], "answered": True}, 1, 0, "sent_before", ""),
+    ("write-lock-busy", {"script": ["ok"], "_hold_lock": True}, 1, 1, "response", "the first run never sent (write lock held by another process)"),
+)
+
+
+def _drill_how(r) -> str:
+    if r is None:
+        return "crashed"
+    return str(r.get("how") or ("landed" if r.get("landed") else "error"))
+
+
+def write_drill_case(name, spec, exp_sends, exp_landed, exp_how2, proof, epoch: int = 9999) -> dict:
+    """Run one drill case in a temp POA_HOME with a fake server. Restores every global it touches."""
+    g = globals()
+    spec = dict(spec)
+    hold = spec.pop("_hold_lock", False)
+    srv = _DrillServer(**spec)
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="poa-drill-"))
+    saved = {k: g[k] for k in ("POA_DIR", "CACHE_DIR", "http_request", "load_key", "WRITE_LOCK_TIMEOUT_S")}
+    saved_nonce = dict(_NONCE)
+    runs = []
+    try:
+        g.update(POA_DIR=tmp, CACHE_DIR=tmp / "cache", http_request=srv.http_request,
+                 load_key=lambda: "pk_drill_fake", WRITE_LOCK_TIMEOUT_S=0.2)
+        for run in (1, 2):
+            _NONCE.update(adopted=None, source=None, at=None)  # a restart forgets everything in memory
+            holder = None
+            if hold and run == 1:
+                holder = _WriteLock(tmp / "cache" / "write.lock", timeout=1)
+                holder.__enter__()
+            try:
+                r = submit_answer_safely("drill answer text", epoch)
+            except _DrillCrash:
+                r = None
+            finally:
+                if holder:
+                    holder.__exit__(None, None, None)
+            runs.append(r)
+        record = load_epoch_cache(epoch)
+    finally:
+        g.update(saved)
+        _NONCE.clear(); _NONCE.update(saved_nonce)
+        shutil.rmtree(tmp, ignore_errors=True)
+    how1, how2 = _drill_how(runs[0]), _drill_how(runs[1])
+    ok = srv.sends == exp_sends and srv.landed == exp_landed and how2 == exp_how2 and not srv.offroute
+    if how2 == "sent_before":
+        state = "landed" if srv.answered else "unknown, held for review (no proof of absence, so no resend)"
+    else:
+        state = "landed" if runs[1] and runs[1].get("landed") else "not landed"
+    return {"case": name, "sends": srv.sends, "landed_writes": srv.landed, "run1": how1, "run2": how2,
+            "final_state": state, "record": record.get("send_outcome"), "resend_proof": proof or "-",
+            "pass": ok, "expected": {"sends": exp_sends, "landed_writes": exp_landed, "run2": exp_how2},
+            "offroute": srv.offroute}
+
+
+def write_drill() -> dict:
+    rows = [write_drill_case(*c) for c in WRITE_DRILL_CASES]
+    return {"ok": all(r["pass"] for r in rows), "cases": rows,
+            "note": "offline: fake server, temp POA_HOME, no key, no network. Answers only; grades are not drilled. "
+                    "Dedup here is a client discipline (the durable epoch record), not a server operation key."}
+
+
+def cmd_write_drill(args: argparse.Namespace) -> None:
+    r = write_drill()
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print(f"{'case':22} {'sends':>5} {'landed':>6}  {'run 1':12} {'run 2':12} {'pass':4}  final state / resend proof")
+        for c in r["cases"]:
+            tail = c["final_state"] if c["resend_proof"] == "-" else f"{c['final_state']}; resend legal because {c['resend_proof']}"
+            print(f"{c['case']:22} {c['sends']:>5} {c['landed_writes']:>6}  {c['run1']:12} {c['run2']:12} {'ok' if c['pass'] else 'FAIL':4}  {tail}")
+        print(("all cases ok: no restart turned an unknown write into a second send" if r["ok"] else "DRILL FAILED: see rows marked FAIL"))
+        print(r["note"])
+    sys.exit(0 if r["ok"] else 3)
+
+
 def main() -> None:
     for _stream in ("stdout", "stderr"):
         _s = getattr(sys, _stream, None)
@@ -3667,6 +3820,9 @@ def main() -> None:
     p_cc.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
+    p_wd = sub.add_parser("write-drill", help="Offline crash-recovery drill for answer writes: counts sends across a simulated restart (fake server, no network, no key); exit 3 if any case sends twice")
+    p_wd.add_argument("--json", action="store_true", help="JSON output")
 
     p_sd = sub.add_parser("standing", help="Own-standing row per close: our settled answers (passed, aligned jurors), eligible, attested, established_after/removed, payout; flags passed-and-eligible-but-not-established")
     p_sd.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close in /api/epochs)")
@@ -3952,6 +4108,8 @@ def main() -> None:
             cmd_close_check(args)
         elif args.command == "standing":
             cmd_standing(args)
+        elif args.command == "write-drill":
+            cmd_write_drill(args)
         elif args.command == "join-pow":
             cmd_join_pow(args)
         elif args.command == "epoch-time":

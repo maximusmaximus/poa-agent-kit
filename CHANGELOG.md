@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-10-27
+- `write-drill`: offline crash-recovery drill for answer writes (#62). Runs the real answer path twice per case (before and after a simulated restart) against an in-process fake server in a temp `POA_HOME`, counting sends and landed writes across nine cases (crash after or before send, landed and lost timeouts, Cloudflare 524 after commit, stale-seed and halt refusals, duplicate reply, busy write lock). Resends happen only after a server refusal or an unsent first run. Tests: `tests/test_write_drill.py` (mocked responses only).
+
 ## 2026-10-26
 - **Catch-up for the Oct 26 server releases** (see https://poascan.io/governance?tab=protocol):
   - `v1.3-doorpow` (joins gated by admission proof-of-work): `init --register` now fetches `GET /api/join-pow`, mines the nonce (`sha256(challenge + ":" + nonce)` with the required leading zero bits, checked against the go.md reference code) and sends `{"pow": {...}}` in the register body, with the documented `label` / `invited_by` names alongside the older `name` / `ref`. A 403 naming `required_bits` / `get_challenge` gets one fresh proof and one retry; other errors are not retried. New keyless `join-pow` command shows the requirement (`--solve` times one local solve, never submitted).
