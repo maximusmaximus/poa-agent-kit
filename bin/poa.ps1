@@ -50,27 +50,73 @@ function Get-PoaKey {
 }
 
 function Hide-Key([string]$s) {
-  # Redact anything that looks like a PoA api key before it reaches the transcript.
-  return ($s -replace 'pk_[A-Za-z0-9]+', 'pk_***REDACTED***')
+  # Redact anything that looks like a PoA api key (raw or in a key=/api_key=/guid= query) before it reaches the transcript.
+  $s = $s -replace '(?i)([?&](key|api_key|guid|token)=)[^&#\s"'']+', '$1[REDACTED]'
+  return ($s -replace 'pk_[A-Za-z0-9%+/=]+', 'pk_***REDACTED***')
 }
 
-function Invoke-Poa([string]$path, [hashtable]$query, [switch]$NoKey) {
-  $q = @()
-  if (-not $NoKey) { $q += 'key=' + [uri]::EscapeDataString((Get-PoaKey)) }
-  if ($query) { foreach ($k in $query.Keys) { $q += ($k + '=' + [uri]::EscapeDataString([string]$query[$k])) } }
-  $url = $Base + $path + $(if ($q.Count) { '?' + ($q -join '&') } else { '' })
-  try {
-    $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60
-    $body = $resp.Content
-  } catch {
-    $msg = $_.Exception.Message
-    if ($_.Exception.Response) {
-      try { $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $msg += ' | ' + $sr.ReadToEnd() } catch {}
+# Key placement: X-Api-Key header by default. ?key= only for routes verified (Oct 27, 2026) to reject
+# the header (/api/hosted/assignments answered Cloudflare 502 with the header, 200 with ?key=), or once
+# after a 401 on a GET. Never in the URL of a POST (the key travels in the JSON body and header).
+# Keyed requests never follow redirects: any 3xx is an error (redirect-refused) and the Location is never contacted.
+$KeyQueryRoutes = @('/api/hosted/assignments')
+
+function Get-StatusCode($err) {
+  try { if ($err.Exception.Response) { return [int]$err.Exception.Response.StatusCode } } catch {}
+  return 0
+}
+
+function Invoke-Poa([string]$path, [hashtable]$query, [switch]$NoKey, [hashtable]$PostBody) {
+  $isPost = $null -ne $PostBody
+  $mode = 'none'
+  if (-not $NoKey) { $mode = $(if ((-not $isPost) -and ($KeyQueryRoutes -contains $path)) { 'query' } else { 'header' }) }
+  $fellBack = $false
+  while ($true) {
+    $q = @()
+    $headers = @{ 'Accept' = 'application/json' }
+    if ($mode -eq 'header') { $headers['X-Api-Key'] = (Get-PoaKey) }
+    if ($mode -eq 'query')  { $q += 'key=' + [uri]::EscapeDataString((Get-PoaKey)) }
+    if ($query) { foreach ($k in $query.Keys) { $q += ($k + '=' + [uri]::EscapeDataString([string]$query[$k])) } }
+    $url = $Base + $path + $(if ($q.Count) { '?' + ($q -join '&') } else { '' })
+    $params = @{ Uri = $url; UseBasicParsing = $true; TimeoutSec = 60; Headers = $headers; ErrorAction = 'Stop' }
+    if (-not $NoKey) { $params['MaximumRedirection'] = 0 }
+    if ($isPost) {
+      $b = @{}; foreach ($k in $PostBody.Keys) { $b[$k] = $PostBody[$k] }
+      if (-not $NoKey) { $b['key'] = (Get-PoaKey) }
+      $params['Method'] = 'Post'
+      $params['ContentType'] = 'application/json; charset=utf-8'
+      $params['Body'] = [Text.Encoding]::UTF8.GetBytes(($b | ConvertTo-Json -Depth 6 -Compress))
     }
-    Write-Output (Hide-Key "ERROR calling $path : $msg")
-    exit 1
+    try {
+      $resp = Invoke-WebRequest @params
+      $code = [int]$resp.StatusCode
+      if ($code -ge 300 -and $code -lt 400) {
+        Write-Output "ERROR calling $path : HTTP $code (redirect-refused): refused to follow a redirect on a keyed request"
+        exit 1
+      }
+      if ($resp.Content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($resp.Content) }
+      return $resp.Content
+    } catch {
+      $code = Get-StatusCode $_
+      $emsg = [string]$_.Exception.Message
+      if (($code -ge 300 -and $code -lt 400) -or ($emsg -match '(?i)redirect')) {
+        Write-Output "ERROR calling $path : HTTP $code (redirect-refused): refused to follow a redirect on a keyed request"
+        exit 1
+      }
+      if ($code -eq 401 -and $mode -eq 'header' -and -not $isPost -and -not $fellBack) {
+        $fellBack = $true; $mode = 'query'; continue
+      }
+      $msg = $emsg
+      if ($_.Exception.Response) {
+        try { $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $msg += ' | ' + $sr.ReadToEnd() } catch {}
+      }
+      if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg += ' | ' + $_.ErrorDetails.Message }
+      $k = $null; try { if (-not $NoKey) { $k = Get-PoaKey } } catch {}
+      if ($k) { $msg = $msg.Replace($k, '[REDACTED]').Replace([uri]::EscapeDataString($k), '[REDACTED]') }
+      Write-Output (Hide-Key "ERROR calling $path : $msg")
+      exit 1
+    }
   }
-  return $body
 }
 
 function Show([string]$json, [string[]]$fields) {
@@ -99,7 +145,7 @@ switch ($Command) {
   'me'          { Show (Invoke-Poa '/api/hosted/me' @{}) @('address','balance','spendable','locked','epoch','challenge','established','attestations_by_me','invite_link','notices') }
   'challenge'   { Show (Invoke-Poa '/api/hosted/challenge' @{}) @('epoch','words','task','answered','instructions') }
   'mine'        { Show (Invoke-Poa '/api/hosted/mine' @{}) $null }
-  'assignments' { Show (Invoke-Poa '/api/hosted/assignments' @{}) $null }
+  'assignments' { Show (Invoke-Poa '/api/hosted/assignments' @{ sort = 'oldest'; limit = 200 }) $null }
   'ballots'     { Show (Invoke-Poa '/api/ballots' @{} -NoKey) $null }
   'network'     { Show (Invoke-Poa '/api/status' @{} -NoKey) $null }
   'check' {
@@ -116,12 +162,12 @@ switch ($Command) {
     if ($t.Length -lt 120 -or $t.Length -gt 600) { throw "Answer is $($t.Length) chars; must be 120-600." }
     $c = (Invoke-Poa '/api/hosted/challenge' @{}) | ConvertFrom-Json
     if ($c.answered) { Write-Output ("SKIP: epoch " + $c.epoch + " is already answered for this account. Not submitting (no-duplicate rule)."); exit 0 }
-    Show (Invoke-Poa '/api/hosted/answer' @{ answer = $t }) $null
+    Show (Invoke-Poa '/api/hosted/answer' @{} -PostBody @{ answer = $t }) $null
     Add-Content -Path (Join-Path $StateDir 'answers.log') -Value ((Get-Date -Format o) + "`tepoch=" + $c.epoch + "`t" + $t) -Encoding UTF8
   }
   'grade' {
     if (-not $Assignment -or $Score -lt 0 -or -not $Reasoning) { throw "grade needs -Assignment <txid> -Score <0-3> -Reasoning '<one sentence>'" }
-    Show (Invoke-Poa '/api/hosted/grade' @{ assignment = $Assignment; score = $Score; reasoning = $Reasoning }) $null
+    Show (Invoke-Poa '/api/hosted/grade' @{} -PostBody @{ assignment = $Assignment; score = $Score; reasoning = $Reasoning }) $null
   }
   'vote' {
     if (-not $Ballot -or -not $Topic -or -not $Choice) { throw "vote needs -Ballot <txid> -Topic <id> -Choice '<exact option>'" }

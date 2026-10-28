@@ -96,6 +96,13 @@ def redact(text: str, raw_key: str = "") -> str:
         return ""
     if raw_key:
         text = text.replace(raw_key, "[REDACTED]")
+        enc = urllib.parse.quote(raw_key, safe="")
+        if enc != raw_key:
+            text = text.replace(enc, "[REDACTED]")
+        enc_plus = urllib.parse.quote_plus(raw_key)
+        if enc_plus not in (raw_key, enc):
+            text = text.replace(enc_plus, "[REDACTED]")
+    text = re.sub(r"(?i)([?&](?:key|api_key|guid|token)=)[^&#\s\"']+", r"\1[REDACTED]", text)
     text = re.sub(r"pk_[A-Za-z0-9]{8,}", "pk_[REDACTED]", text)
     text = re.sub(r"psk_[A-Za-z0-9]{8,}", "psk_[REDACTED]", text)
     return text
@@ -189,6 +196,7 @@ class PoaHTTPError(RuntimeError):
           "auth"    (401/403: key rejected or rotated; retrying will not help)
           "client"  (other 4xx: bad request, duplicate, not found)
           "halted"  (503 operator maintenance / API hardening halt)
+          "redirect-refused" (any 3xx on a keyed request: never followed, Location never contacted)
     """
 
     def __init__(self, kind: str, message: str, status: int = None, retry_after: int = None):
@@ -244,9 +252,9 @@ def http_request(method: str, url: str, data: bytes = None, headers: dict = None
         except _httpx.TimeoutException as e:
             raise TimeoutError(f"timed out ({type(e).__name__})")
         except _httpx.HTTPError as e:
-            raise OSError(f"{type(e).__name__}: {e}")
+            raise OSError(f"{type(e).__name__}: {redact(str(e))}") from None
         if r.status_code >= 400 or (not follow_redirects and 300 <= r.status_code < 400):
-            raise urllib.error.HTTPError(url, r.status_code, r.reason_phrase or "", r.headers, io.BytesIO(r.content))
+            raise urllib.error.HTTPError(redact(url), r.status_code, r.reason_phrase or "", r.headers, io.BytesIO(r.content))
         return r.content
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
     if not follow_redirects:
@@ -271,6 +279,11 @@ def _classify(exc: Exception, path: str, raw_key: str) -> PoaHTTPError:
             body = str(exc)
         body = redact(body, raw_key)
         low_body = body.lower()[:2000]
+        if 300 <= exc.code < 400:
+            # Never echo the Location (it may carry the query string) and never follow it.
+            return PoaHTTPError("redirect-refused",
+                                f"HTTP {exc.code} (redirect-refused) on {path}: refused to follow a redirect on a keyed request",
+                                exc.code)
         if exc.code in (401, 403):
             kind = "auth"
         elif exc.code == 503 and ("temporarily halted" in low_body or "api hardening" in low_body):
@@ -307,6 +320,21 @@ def _backoff(attempt: int) -> None:
     time.sleep(delay + (time.time() % 1.0))
 
 
+# Routes verified live (Oct 27, 2026) to reject the X-Api-Key header: /api/hosted/assignments
+# answered Cloudflare 502 after ~30 s with the header and 200 with ?key=. Everything else
+# (verified: /me, /challenge, /mine, POST /answer) uses the header. Override with
+# POA_KEY_QUERY_ROUTES="/api/hosted/x,/api/hosted/y" (comma-separated path prefixes).
+KEY_QUERY_ROUTES = ("/api/hosted/assignments",)
+
+
+def key_mode_for(path: str) -> str:
+    """'header' (default) or 'query' for routes that reject the X-Api-Key header."""
+    env = os.environ.get("POA_KEY_QUERY_ROUTES")
+    routes = tuple(r.strip() for r in env.split(",") if r.strip()) if env is not None else KEY_QUERY_ROUTES
+    p = path.split("?", 1)[0].rstrip("/")
+    return "query" if any(p == r.rstrip("/") or p.startswith(r.rstrip("/") + "/") for r in routes) else "header"
+
+
 def api_call(
     method: str,
     path: str,
@@ -329,24 +357,41 @@ def api_call(
         retries = 1 if is_write else 4
     if timeout is None:
         timeout = 60 if is_write else HTTP_CONNECT_TIMEOUT
-    q = dict(query or {})
-    if need_key:
-        q["key"] = raw_key
-    qs = urllib.parse.urlencode(q)
-    url = f"{BASE_URL}{path}" + (f"?{qs}" if qs else "")
-    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
+    is_post = method.upper() == "POST"
+    # Key placement: X-Api-Key header by default. ?key= only for routes verified to reject the
+    # header (KEY_QUERY_ROUTES) or once after a 401 on a GET. Never in the URL of a POST
+    # (the key already travels in the JSON body). Keyed requests never follow redirects.
+    mode = key_mode_for(path) if need_key else "none"
+    if is_post and mode == "query":
+        mode = "header"
     data = None
-    if method.upper() == "POST":
+    if is_post:
         payload = dict(body or {})
         if need_key and "key" not in payload:
             payload["key"] = raw_key
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
 
+    def _build(m: str):
+        q = dict(query or {})
+        q.pop("key", None) if need_key else None
+        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
+        if m == "header":
+            headers["X-Api-Key"] = raw_key
+        elif m == "query":
+            q["key"] = raw_key
+        if is_post:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        qs = urllib.parse.urlencode(q)
+        return f"{BASE_URL}{path}" + (f"?{qs}" if qs else ""), headers
+
+    url, headers = _build(mode)
+    fell_back = False
     last = None
-    for attempt in range(max(1, retries)):
+    attempt = 0
+    while attempt < max(1, retries):
         try:
-            raw = http_request(method, url, data=data, headers=headers, timeout=timeout).decode("utf-8", errors="replace")
+            raw = http_request(method, url, data=data, headers=headers, timeout=timeout,
+                               follow_redirects=not need_key).decode("utf-8", errors="replace")
             clean = redact(raw, raw_key)
             try:
                 return json.loads(clean)
@@ -354,12 +399,20 @@ def api_call(
                 raise PoaHTTPError("server", f"Non-JSON response on {path}: {clean[:300]}")
         except Exception as e:
             last = _classify(e, path, raw_key)
-            if last.kind in ("auth", "client", "halted"):
-                raise last
-            if attempt < retries - 1:
-                _backoff(attempt)
+            if (last.kind == "auth" and last.status == 401 and mode == "header" and not is_post
+                    and not fell_back):
+                # One fallback to ?key= (redirects still refused); does not consume a retry.
+                fell_back = True
+                mode = "query"
+                url, headers = _build(mode)
                 continue
-            raise last
+            if last.kind in ("auth", "client", "halted", "redirect-refused"):
+                raise last from None
+            attempt += 1
+            if attempt < retries:
+                _backoff(attempt - 1)
+                continue
+            raise last from None
     raise last
 
 
@@ -380,11 +433,12 @@ def mcp_call(tool: str, arguments: dict = None, need_key: bool = True, timeout: 
         "User-Agent": "poa-agent-kit/1.4",
     }
     req = urllib.request.Request(MCP_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    opener = urllib.request.build_opener(_NoRedirect) if need_key else urllib.request.build_opener()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = redact(resp.read().decode("utf-8", errors="replace"), raw_key)
     except Exception as e:
-        raise _classify(e, f"mcp:{tool}", raw_key)
+        raise _classify(e, f"mcp:{tool}", raw_key) from None
     text = raw.strip()
     if text.startswith("event:") or "\ndata:" in text or text.startswith("data:"):
         datas = [ln[5:].strip() for ln in text.splitlines() if ln.startswith("data:")]
@@ -1414,8 +1468,9 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
         headers=headers,
         method="POST",
     )
+    opener = urllib.request.build_opener(_NoRedirect) if need_key else urllib.request.build_opener()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             clean = redact(raw, raw_key)
             envelope = json.loads(clean)
@@ -1428,7 +1483,7 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
                     return {"raw_text": content[0]["text"], "isError": res.get("isError", False)}
             return envelope
     except Exception as e:
-        raise RuntimeError(f"Proof Floor MCP call ({tool_name}) failed: {redact(str(e), raw_key)}")
+        raise RuntimeError(f"Proof Floor MCP call ({tool_name}) failed: {redact(str(e), raw_key)}") from None
 
 
 def load_lableak_token(refresh: bool = False) -> str:
@@ -1445,11 +1500,14 @@ def load_lableak_token(refresh: bool = False) -> str:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=25) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             data = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        kind = "redirect refused" if 300 <= e.code < 400 else f"HTTP {e.code}"
+        raise RuntimeError(f"LabLeak auth failed: {kind}") from None
     except Exception as e:
-        raise RuntimeError(f"LabLeak auth failed: {redact(str(e), raw_key)}")
+        raise RuntimeError(f"LabLeak auth failed: {redact(str(e), raw_key)}") from None
     tok = (
         data.get("authToken")
         or (data.get("session") or {}).get("authToken")
