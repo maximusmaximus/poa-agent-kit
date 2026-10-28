@@ -186,5 +186,101 @@ class KeyHandlingTests(unittest.TestCase):
         self.assertNotIn("key=", c["url"])
 
 
+
+class LabLeakRenewalTests(unittest.TestCase):
+    """LabLeak token renewal never puts the API key in a URL (or anywhere on the wire)."""
+
+    def setUp(self):
+        os.environ["POA_API_KEY"] = FAKE
+        os.environ.pop("POA_LABLEAK_TOKEN", None)
+        self.tokfile = poa.LABLEAK_TOKEN_FILE
+        if self.tokfile.exists():
+            self.tokfile.unlink()
+
+    def tearDown(self):
+        os.environ.pop("POA_LABLEAK_TOKEN", None)
+        if self.tokfile.exists():
+            self.tokfile.unlink()
+
+    def _assert_no_key(self, calls):
+        enc = [FAKE, urllib.parse.quote(FAKE, safe=""), urllib.parse.quote_plus(FAKE)]
+        for c in calls:
+            for v in enc:
+                self.assertNotIn(v, c["url"])
+                self.assertNotIn(v, (c["data"] or b"").decode("utf-8", "replace"))
+                self.assertNotIn(v, " ".join(map(str, c["headers"].values())))
+            self.assertNotIn("guid=", c["url"])
+            self.assertNotIn("agentconnect/join", c["url"])
+            self.assertNotIn("key=", c["url"])
+            self.assertFalse(c["follow_redirects"])
+
+    def test_401_does_not_rejoin_with_key_in_url(self):
+        self.tokfile.write_text("psk_oldtokenvalue1234\n")
+        rec = Recorder([http_err("https://minepoa.com/lableak/api/me", 401)])
+        with mock.patch.object(poa, "http_request", rec), \
+                mock.patch.object(poa.urllib.request, "urlopen", side_effect=AssertionError("urlopen used")), \
+                mock.patch.object(poa.urllib.request, "build_opener", side_effect=AssertionError("opener used")):
+            with self.assertRaises(poa.LabLeakTokenExpired) as cm:
+                poa.lableak_call("GET", "/api/me", need_auth=True)
+        self.assertEqual(len(rec.calls), 1)
+        self._assert_no_key(rec.calls)
+        self.assertEqual(rec.calls[0]["headers"].get("Authorization"), "Bearer psk_oldtokenvalue1234")
+        msg = str(cm.exception)
+        self.assertIn("expired", msg)
+        self.assertIn("header", msg)
+        self.assertNotIn(FAKE, msg)
+
+    def test_missing_token_makes_no_request(self):
+        rec = Recorder([])
+        with mock.patch.object(poa, "http_request", rec):
+            with self.assertRaises(poa.LabLeakTokenExpired):
+                poa.lableak_call("POST", "/api/posts", body={"title": "t"}, need_auth=True)
+        self.assertEqual(rec.calls, [])
+
+    def test_refresh_never_touches_network(self):
+        rec = Recorder([])
+        with mock.patch.object(poa, "http_request", rec), \
+                mock.patch.object(poa.urllib.request, "urlopen", side_effect=AssertionError("urlopen used")), \
+                mock.patch.object(poa.urllib.request, "build_opener", side_effect=AssertionError("opener used")):
+            with self.assertRaises(poa.LabLeakTokenExpired):
+                poa.load_lableak_token(refresh=True)
+        self.assertEqual(rec.calls, [])
+
+    def test_authed_post_key_never_sent_and_redirect_refused(self):
+        os.environ["POA_LABLEAK_TOKEN"] = "psk_envtokenvalue5678"
+        rec = Recorder([b'{"ok": true}', http_err("https://minepoa.com/lableak/api/posts", 302,
+                                                   headers={"Location": "https://evil.example/"})])
+        with mock.patch.object(poa, "http_request", rec):
+            self.assertTrue(poa.lableak_call("POST", "/api/posts", body={"title": "t"}, need_auth=True)["ok"])
+            with self.assertRaises(RuntimeError) as cm:
+                poa.lableak_call("GET", "/api/me", need_auth=True)
+        self.assertIn("redirect-refused", str(cm.exception))
+        self._assert_no_key(rec.calls)
+
+    def test_credential_query_params_refused(self):
+        rec = Recorder([])
+        with mock.patch.object(poa, "http_request", rec):
+            for k in ("guid", "key", "token", "api_key"):
+                with self.assertRaises(RuntimeError):
+                    poa.lableak_call("GET", "/api/posts", query={k: FAKE})
+        self.assertEqual(rec.calls, [])
+
+    def test_errors_redact_key_and_token(self):
+        os.environ["POA_LABLEAK_TOKEN"] = "psk_envtokenvalue5678"
+        body = ("echo " + FAKE + " psk_envtokenvalue5678").encode()
+        rec = Recorder([http_err("https://minepoa.com/lableak/api/posts", 500, body)])
+        with mock.patch.object(poa, "http_request", rec):
+            with self.assertRaises(RuntimeError) as cm:
+                poa.lableak_call("GET", "/api/posts", need_auth=True)
+        text = str(cm.exception)
+        self.assertNotIn(FAKE, text)
+        self.assertNotIn("psk_envtokenvalue5678", text)
+
+    def test_source_never_builds_a_guid_join_url(self):
+        src = (pathlib.Path(__file__).resolve().parents[1] / "bin" / "poa.py").read_text(encoding="utf-8")
+        self.assertNotIn('{"guid": raw_key}', src)
+        self.assertNotIn("join?{qs}", src)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1506,74 +1506,86 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
         raise RuntimeError(f"Proof Floor MCP call ({tool_name}) failed: {redact(str(e), raw_key)}") from None
 
 
+LABLEAK_JOIN_PATH = "/.well-known/agentconnect/join"
+
+
+class LabLeakTokenExpired(RuntimeError):
+    """The stored LabLeak token is missing or was rejected, and the kit will not renew it.
+
+    LabLeak's only pk_ login is GET /.well-known/agentconnect/join?guid=<api key>, which puts the
+    API key in the URL (server logs, proxies, history). Header-only rule: the key travels only in a
+    request header, so the kit never calls that URL. Checked live 2026-10-27: the join endpoint
+    ignores an X-Api-Key header and a JSON POST body {"guid": ...} (both just mint an unrelated
+    ephemeral guid), so there is no header-only renewal to fall back to."""
+
+
+LABLEAK_RENEW_HELP = (
+    "LabLeak session token {why}. The kit will not renew it: LabLeak's join endpoint only accepts "
+    "the PoA API key as a URL query parameter, and this kit sends the key only in a request header. "
+    "Header-only renewal is not supported by LabLeak yet. To continue, put a fresh LabLeak token "
+    "in {file} (or the POA_LABLEAK_TOKEN environment variable) and run the command again."
+)
+
+
 def load_lableak_token(refresh: bool = False) -> str:
-    if not refresh and LABLEAK_TOKEN_FILE.is_file():
-        tok = LABLEAK_TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
-        if tok:
-            return tok
-    raw_key = load_key()
-    qs = urllib.parse.urlencode({"guid": raw_key})
-    url = f"{LABLEAK_BASE_URL}/.well-known/agentconnect/join?{qs}"
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"},
-        method="GET",
-    )
-    try:
-        with urllib.request.build_opener(_NoRedirect).open(req, timeout=25) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        kind = "redirect refused" if 300 <= e.code < 400 else f"HTTP {e.code}"
-        raise RuntimeError(f"LabLeak auth failed: {kind}") from None
-    except Exception as e:
-        raise RuntimeError(f"LabLeak auth failed: {redact(str(e), raw_key)}") from None
-    tok = (
-        data.get("authToken")
-        or (data.get("session") or {}).get("authToken")
-        or data.get("token")
-        or ""
-    ).strip()
-    if not tok:
-        raise RuntimeError(f"LabLeak join did not return authToken: {redact(json.dumps(data), raw_key)}")
-    POA_DIR.mkdir(parents=True, exist_ok=True)
-    LABLEAK_TOKEN_FILE.write_text(tok + "\n", encoding="utf-8")
-    lock_file_permissions(LABLEAK_TOKEN_FILE)
-    return tok
+    """Return the stored LabLeak bearer token. Never renews through the URL-key join.
+
+    refresh=True means the server just rejected the current token (401): raise
+    LabLeakTokenExpired with instructions instead of sending the API key in a URL."""
+    env_tok = os.environ.get("POA_LABLEAK_TOKEN", "").strip()
+    if not refresh:
+        if env_tok:
+            return env_tok
+        if LABLEAK_TOKEN_FILE.is_file():
+            tok = LABLEAK_TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+            if tok:
+                return tok
+        raise LabLeakTokenExpired(LABLEAK_RENEW_HELP.format(why="is missing", file=LABLEAK_TOKEN_FILE))
+    raise LabLeakTokenExpired(LABLEAK_RENEW_HELP.format(why="expired (HTTP 401)", file=LABLEAK_TOKEN_FILE))
 
 
 def lableak_call(method: str, path: str, query: dict = None, body: dict = None, need_auth: bool = False):
-    raw_key = load_key() if need_auth else ""
+    """LabLeak forum request. Auth is the bearer token in a header only; 3xx is refused (never
+    followed, so the token is never replayed to a Location); key and token are redacted from errors.
+    A 401 does NOT trigger a URL-key re-join: it raises LabLeakTokenExpired."""
+    raw_key = ""
+    try:
+        raw_key = load_key()  # only used to redact; never sent to LabLeak
+    except Exception:
+        raw_key = ""
     tok = load_lableak_token(refresh=False) if need_auth else ""
     q = dict(query or {})
+    for k in list(q):
+        if k.lower() in ("key", "api_key", "guid", "token"):
+            raise RuntimeError(f"refusing to put credential parameter '{k}' in a LabLeak URL")
     qs = urllib.parse.urlencode(q)
     url = f"{LABLEAK_BASE_URL}{path}" + (f"?{qs}" if qs else "")
-    for attempt in range(2):
-        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
-        if need_auth and tok:
-            headers["Authorization"] = f"Bearer {tok}"
-        data = None
-        if method.upper() in ("POST", "PATCH"):
-            data = json.dumps(body or {}).encode("utf-8")
-            headers["Content-Type"] = "application/json; charset=utf-8"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
+    if need_auth and tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    data = None
+    if method.upper() in ("POST", "PATCH"):
+        data = json.dumps(body or {}).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    try:
+        raw = http_request(method.upper(), url, data=data, headers=headers, timeout=30,
+                           follow_redirects=False).decode("utf-8", errors="replace")
+        return json.loads(redact(redact(raw, raw_key), tok))
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            raise RuntimeError(f"LabLeak HTTP {e.code} (redirect-refused) on {path}: refused to follow a redirect") from None
+        if e.code == 401 and need_auth:
+            load_lableak_token(refresh=True)  # always raises LabLeakTokenExpired
+        err_body = ""
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                clean = redact(redact(raw, raw_key), tok)
-                return json.loads(clean)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and need_auth and attempt == 0:
-                tok = load_lableak_token(refresh=True)
-                continue
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = str(e)
-            raise RuntimeError(f"LabLeak HTTP {e.code} on {path}: {redact(redact(err_body, raw_key), tok)}")
-        except Exception as e:
-            raise RuntimeError(f"LabLeak request failed on {path}: {redact(redact(str(e), raw_key), tok)}")
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = str(e)
+        raise RuntimeError(f"LabLeak HTTP {e.code} on {path}: {redact(redact(err_body, raw_key), tok)}") from None
+    except LabLeakTokenExpired:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"LabLeak request failed on {path}: {redact(redact(str(e), raw_key), tok)}") from None
 
 
 NOTICE_SUSPICIOUS_PATTERNS = (
