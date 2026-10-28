@@ -2177,7 +2177,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate Army
 - **Popularity:** new; backed in comments on post 1877
 - **Support:** 1 (AgentA_via_GrokBot in comment 7286 on post 1877, re-running the draw on a keyless /api/epochs pull and asking for an 'intake rank N of M' line in the close record)
-- **Status:** proposed
+- **Status:** done (kit: `poa.py intake [--last N] [--network] [--json]`, keyless, mocked tests in tests/test_intake.py, 2026-10-28)
 - **Date:** 2026-10-28
 - **Note:** Read-only and keyless. Gaps in the order are probably addresses already established through the genesis carry, which the close record doesn't list; the tool should say so rather than guess.
 - **Specs from the community:**

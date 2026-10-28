@@ -3066,6 +3066,166 @@ def cmd_standing(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# intake: where an account sits in each close's establishment draw (SUGGESTIONS.md #70)
+# ---------------------------------------------------------------------------
+def intake_order(candidates, epoch: int) -> list:
+    """The reference client's staged-intake order for one close: not-yet-established
+    addresses with a pass, sorted by sha256('intake:' + address + ':' + epoch). Pure."""
+    return [a for _, a in sorted((hashlib.sha256(f"intake:{a}:{int(epoch)}".encode()).hexdigest(), a)
+                                 for a in set(candidates or []) if a)]
+
+
+def intake_report(epochs_res, address: str = "", params: dict = None, last: int = 0) -> dict:
+    """Pure function. For each close in GET /api/epochs, rebuild the establishment intake the
+    public reference client runs (poa.mjs, staged intake): candidates = basis.challenge_eligible
+    minus the established set the close records show before that close, ordered by
+    sha256('intake:' + address + ':' + epoch); the first max(5, ceil(10% of established)) are
+    admitted (basis.established_after). The records don't list accounts established through the
+    genesis carry, so the cap is read from established_after rather than computed, and a rank
+    above the last admitted rank that was skipped is reported as a gap (probably an account that
+    was already established), never as a broken draw. Our row says whether we were a candidate,
+    our rank N of M, and whether we were admitted. It also projects when standing lapses:
+    an established account is removed at the first close more than estab_ttl closes after its
+    last challenge_eligible close. Output never contains any address."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    params = params if isinstance(params, dict) else {}
+    try:
+        ttl = int(params.get("estab_ttl", 6))
+    except (TypeError, ValueError):
+        ttl = 6
+    me = (address or "").strip()
+    est = set()
+    last_eligible = {}
+    me_est, me_admitted_at, me_removed_at = False, None, None
+    rows = []
+    for e in eps:
+        n = int(e["epoch"])
+        b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+        eligible = [a for a in (b.get("challenge_eligible") or []) if isinstance(a, str)]
+        admitted = [a for a in (b.get("established_after") or []) if isinstance(a, str)]
+        removed = [a for a in (b.get("established_removed") or []) if isinstance(a, str)]
+        order = intake_order([a for a in eligible if a not in est], n)
+        pos = {a: i + 1 for i, a in enumerate(order)}
+        ranks = sorted(pos[a] for a in admitted if a in pos)
+        off_order = sum(1 for a in admitted if a not in pos)
+        top = ranks[-1] if ranks else 0
+        gaps = [r for r in range(1, top + 1) if r not in set(ranks)]
+        row = {"close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None,
+               "candidates": len(order), "admitted": len(admitted), "admitted_ranks": ranks,
+               "gaps": gaps, "admitted_not_in_order": off_order,
+               "cap_from_records": max(5, -(-len(est) // 10)), "established_in_records": len(est),
+               "matches_order": bool(admitted) and off_order == 0 and ranks == [r for r in range(1, top + 1) if r not in gaps]
+                                and len(gaps) <= 2,
+               "removed": len(removed)}
+        if me:
+            row["me"] = {"eligible": me in eligible, "already_established": me in est and me not in admitted,
+                         "candidate": me in pos, "rank": pos.get(me), "of": len(order),
+                         "admitted": me in admitted, "removed": me in removed}
+            if me in pos and me not in admitted:
+                row["me"]["missed_by"] = (pos[me] - top) if top else None
+        rows.append(row)
+        for a in eligible:
+            last_eligible[a] = n
+        est |= set(admitted)
+        est -= set(removed)
+        if me and me in admitted:
+            me_est, me_admitted_at = True, n
+        if me and me in removed:
+            me_est, me_removed_at = False, n
+    newest = int(eps[-1]["epoch"])
+    sel = rows[-last:] if last and last > 0 else rows
+    res = {"ok": True, "read_only": True, "newest_close": newest, "estab_ttl": ttl, "rows": sel,
+           "closes_matching_order": sum(1 for r in rows if r["admitted"] and r["matches_order"]),
+           "closes_with_admissions": sum(1 for r in rows if r["admitted"]), "flags": []}
+    if me:
+        cand = [r for r in rows if r["me"]["candidate"]]
+        le = last_eligible.get(me)
+        you = {"established_per_records": me_est, "admitted_at_close": me_admitted_at,
+               "removed_at_close": me_removed_at, "closes_as_candidate": len(cand),
+               "best_rank": min((f"{r['me']['rank']} of {r['me']['of']} (E{r['close']})" for r in cand),
+                                key=lambda s: int(s.split()[0]), default=None),
+               "last_eligible_close": le}
+        if me_est and le is not None:
+            you["established_through_close"] = le + ttl
+            you["lapses_at_close"] = le + ttl + 1
+            you["closes_left_before_lapse"] = max(0, le + ttl - newest)
+        res["you"] = you
+        if cand and not me_est:
+            res["flags"].append("candidate_but_not_drawn")
+        if me_est and le is not None and le + ttl - newest <= 1:
+            res["flags"].append("standing_lapses_soon")
+    res["note"] = ("Keyless: GET /api/epochs (and /api/params for estab_ttl) only. Each passing close is a fresh, "
+                   "independent sha256 draw keyed by address and epoch; queue age, forum activity and answer "
+                   "quality past the pass don't change your rank. The close records don't list accounts established "
+                   "through the genesis carry, so a gap is probably one of them. No address is ever printed.")
+    return res
+
+
+def print_intake(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"intake: {r.get('error')}")
+        return
+    print(f"intake: {r['closes_matching_order']} of {r['closes_with_admissions']} closes with admissions match the "
+          f"sha256 intake order | estab_ttl {r['estab_ttl']} closes")
+    print("close cand  admitted ranks                       gaps     you")
+    for x in r["rows"]:
+        rk = ",".join(str(v) for v in x["admitted_ranks"]) or "-"
+        if len(rk) > 28:
+            rk = rk[:25] + "..."
+        gp = ",".join(str(v) for v in x["gaps"]) or "-"
+        you = "-"
+        m = x.get("me")
+        if m:
+            if m["admitted"]:
+                you = f"ADMITTED rank {m['rank']} of {m['of']}"
+            elif m["candidate"]:
+                you = f"rank {m['rank']} of {m['of']}, not drawn" + (f" (missed by {m['missed_by']})" if m.get("missed_by") else "")
+            elif m["already_established"] and m["eligible"]:
+                you = "already established (eligible)"
+            elif m["already_established"]:
+                you = "already established"
+            if m["removed"]:
+                you += " REMOVED"
+        print(f"E{x['close']:<4} {x['candidates']:<5} {x['admitted']:<8} {rk:<28} {gp:<8} {you}")
+        if x["admitted_not_in_order"]:
+            print(f"      {x['admitted_not_in_order']} admitted address(es) were not in the rebuilt candidate list")
+    y = r.get("you")
+    if y:
+        line = (f"you: established per records {y['established_per_records']}; candidate at {y['closes_as_candidate']} "
+                f"close(s), best rank {y['best_rank'] or '-'}")
+        if y.get("lapses_at_close") is not None:
+            line += (f"; last eligible E{y['last_eligible_close']}, established through E{y['established_through_close']}, "
+                     f"lapses at the E{y['lapses_at_close']} close unless another answer passes")
+        print(line)
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
+def cmd_intake(args: argparse.Namespace) -> None:
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"intake: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    params = {}
+    try:
+        params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+    except Exception:
+        params = {}
+    me = "" if args.network else (args.address or local_address()).strip()
+    r = intake_report(epochs_res, me, params=params if isinstance(params, dict) else {}, last=args.last)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_intake(r)
+    if not r.get("ok"):
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
 # epoch-time: settings measured in epochs, shown in real time (SUGGESTIONS.md #3)
 # ---------------------------------------------------------------------------
 PAUSE_GAP_FACTOR = 2.0  # a close gap over 2x the nominal epoch length counts as a pause
@@ -4576,6 +4736,13 @@ def main() -> None:
     p_sd.add_argument("--json", action="store_true", help="JSON output")
     p_sd.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_in = sub.add_parser("intake", help="Keyless: rebuild each close's establishment draw (sha256 intake order) from /api/epochs; your rank N of M, admitted or not, and when standing lapses")
+    p_in.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close)")
+    p_in.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_in.add_argument("--network", action="store_true", help="Network rows only, no address")
+    p_in.add_argument("--json", action="store_true", help="JSON output")
+    p_in.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_et = sub.add_parser("epoch-time", help="Keyless: every epoch-counted setting (TTLs, vesting, suspensions) in hours/days at nominal and observed close cadence, plus next close estimate")
     p_et.add_argument("--window", type=int, default=8, help="Close gaps to average for the observed cadence (default 8; pauses excluded)")
     p_et.add_argument("--json", action="store_true", help="JSON output")
@@ -4879,6 +5046,8 @@ def main() -> None:
             cmd_write_drill(args)
         elif args.command == "join-pow":
             cmd_join_pow(args)
+        elif args.command == "intake":
+            cmd_intake(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
         elif args.command == "close-pull":
