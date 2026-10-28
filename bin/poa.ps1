@@ -55,11 +55,9 @@ function Hide-Key([string]$s) {
   return ($s -replace 'pk_[A-Za-z0-9%+/=]+', 'pk_***REDACTED***')
 }
 
-# Key placement: X-Api-Key header by default. ?key= only for routes verified (Oct 27, 2026) to reject
-# the header (/api/hosted/assignments answered Cloudflare 502 with the header, 200 with ?key=), or once
-# after a 401 on a GET. Never in the URL of a POST (the key travels in the JSON body and header).
-# Keyed requests never follow redirects: any 3xx is an error (redirect-refused) and the Location is never contacted.
-$KeyQueryRoutes = @('/api/hosted/assignments')
+# Key placement: X-Api-Key header only (a POST also carries it in the JSON body). Never in a URL, and
+# no fallback after a 401 or a 5xx. Keyed requests never follow redirects: any 3xx is an error
+# (redirect-refused) and the Location is never contacted. A failed seat listing means seats UNKNOWN.
 
 function Get-StatusCode($err) {
   try { if ($err.Exception.Response) { return [int]$err.Exception.Response.StatusCode } } catch {}
@@ -69,14 +67,12 @@ function Get-StatusCode($err) {
 function Invoke-Poa([string]$path, [hashtable]$query, [switch]$NoKey, [hashtable]$PostBody) {
   $isPost = $null -ne $PostBody
   $mode = 'none'
-  if (-not $NoKey) { $mode = $(if ((-not $isPost) -and ($KeyQueryRoutes -contains $path)) { 'query' } else { 'header' }) }
-  $fellBack = $false
+  if (-not $NoKey) { $mode = 'header' }
   while ($true) {
     $q = @()
     $headers = @{ 'Accept' = 'application/json' }
     if ($mode -eq 'header') { $headers['X-Api-Key'] = (Get-PoaKey) }
-    if ($mode -eq 'query')  { $q += 'key=' + [uri]::EscapeDataString((Get-PoaKey)) }
-    if ($query) { foreach ($k in $query.Keys) { $q += ($k + '=' + [uri]::EscapeDataString([string]$query[$k])) } }
+    if ($query) { foreach ($k in $query.Keys) { if ($k -notmatch '(?i)^(key|api_key|apikey|token|guid)$') { $q += ($k + '=' + [uri]::EscapeDataString([string]$query[$k])) } } }
     $url = $Base + $path + $(if ($q.Count) { '?' + ($q -join '&') } else { '' })
     $params = @{ Uri = $url; UseBasicParsing = $true; TimeoutSec = 60; Headers = $headers; ErrorAction = 'Stop' }
     if (-not $NoKey) { $params['MaximumRedirection'] = 0 }
@@ -103,9 +99,6 @@ function Invoke-Poa([string]$path, [hashtable]$query, [switch]$NoKey, [hashtable
         Write-Output "ERROR calling $path : HTTP $code (redirect-refused): refused to follow a redirect on a keyed request"
         exit 1
       }
-      if ($code -eq 401 -and $mode -eq 'header' -and -not $isPost -and -not $fellBack) {
-        $fellBack = $true; $mode = 'query'; continue
-      }
       $msg = $emsg
       if ($_.Exception.Response) {
         try { $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $msg += ' | ' + $sr.ReadToEnd() } catch {}
@@ -113,6 +106,7 @@ function Invoke-Poa([string]$path, [hashtable]$query, [switch]$NoKey, [hashtable
       if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg += ' | ' + $_.ErrorDetails.Message }
       $k = $null; try { if (-not $NoKey) { $k = Get-PoaKey } } catch {}
       if ($k) { $msg = $msg.Replace($k, '[REDACTED]').Replace([uri]::EscapeDataString($k), '[REDACTED]') }
+      if ($path -like '/api/hosted/assignments*') { $msg = "grading seats unknown (header-only read; no URL-key fallback): " + $msg }
       Write-Output (Hide-Key "ERROR calling $path : $msg")
       exit 1
     }
@@ -145,7 +139,7 @@ switch ($Command) {
   'me'          { Show (Invoke-Poa '/api/hosted/me' @{}) @('address','balance','spendable','locked','epoch','challenge','established','attestations_by_me','invite_link','notices') }
   'challenge'   { Show (Invoke-Poa '/api/hosted/challenge' @{}) @('epoch','words','task','answered','instructions') }
   'mine'        { Show (Invoke-Poa '/api/hosted/mine' @{}) $null }
-  'assignments' { Show (Invoke-Poa '/api/hosted/assignments' @{ sort = 'oldest'; limit = 200 }) $null }
+  'assignments' { Show (Invoke-Poa '/api/hosted/assignments/' @{ sort = 'oldest'; limit = 200 }) $null }
   'ballots'     { Show (Invoke-Poa '/api/ballots' @{} -NoKey) $null }
   'network'     { Show (Invoke-Poa '/api/status' @{} -NoKey) $null }
   'check' {

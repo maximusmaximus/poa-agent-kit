@@ -1,5 +1,6 @@
-"""Key handling: X-Api-Key header by default, ?key= only for header-rejecting routes or once
-after a 401, never in the URL of a POST, never follow a 3xx, never leak the key (mocked, no network)."""
+"""Key handling: the key goes only in the X-Api-Key header (and a POST's JSON body), never in any URL,
+with no ?key= route list and no fallback after a 401 or 5xx; never follow a 3xx; never leak the key
+(mocked, no network)."""
 import importlib.util, io, os, pathlib, tempfile, unittest, urllib.error, urllib.parse
 from unittest import mock
 
@@ -66,39 +67,116 @@ class KeyHandlingTests(unittest.TestCase):
         self.assertEqual(c["headers"].get("X-Api-Key"), FAKE)
         self.assertFalse(c["follow_redirects"])
 
-    def test_assignments_route_uses_query_fallback(self):
+    def _assert_no_key_in_urls(self, rec):
+        for c in rec.calls:
+            for v in self._enc_variants():
+                self.assertNotIn(v, c["url"])
+            self.assertNotIn("key=", c["url"])
+            self.assertFalse(c["follow_redirects"])
+
+    def test_assignments_header_only_trailing_slash(self):
         rec = Recorder([b'{"assignments": []}'])
         with mock.patch.object(poa, "http_request", rec):
-            poa.api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+            poa.hosted_assignments()
         c = rec.calls[0]
-        self.assertIn("key=", c["url"])
+        self.assertEqual(c["headers"].get("X-Api-Key"), FAKE)
+        self.assertIn("/api/hosted/assignments/?", c["url"])
         self.assertIn("sort=oldest", c["url"])
-        self.assertNotIn("X-Api-Key", c["headers"])
-        self.assertFalse(c["follow_redirects"])
+        self._assert_no_key_in_urls(rec)
 
-    def test_query_routes_env_override(self):
-        os.environ["POA_KEY_QUERY_ROUTES"] = ""
-        self.assertEqual(poa.key_mode_for("/api/hosted/assignments"), "header")
-        os.environ["POA_KEY_QUERY_ROUTES"] = "/api/hosted/vote"
-        self.assertEqual(poa.key_mode_for("/api/hosted/vote"), "query")
-        self.assertEqual(poa.key_mode_for("/api/hosted/me"), "header")
+    def test_no_query_key_mode_any_route(self):
+        os.environ["POA_KEY_QUERY_ROUTES"] = "/api/hosted/assignments,/api/hosted/vote"  # old override is ignored
+        for path in ("/api/hosted/assignments", "/api/hosted/assignments/", "/api/hosted/vote", "/api/hosted/me"):
+            self.assertEqual(poa.key_mode_for(path), "header")
+            rec = Recorder([b"{}"])
+            with mock.patch.object(poa, "http_request", rec):
+                poa.api_call("GET", path, query={"a": 1})
+            self._assert_no_key_in_urls(rec)
+            self.assertEqual(rec.calls[0]["headers"].get("X-Api-Key"), FAKE)
 
-    def test_401_falls_back_to_query_once(self):
-        rec = Recorder([http_err("u", 401, b'{"error":"missing key"}'), b'{"epoch": 4}'])
+    def test_caller_supplied_key_query_is_dropped(self):
+        rec = Recorder([b"{}"])
         with mock.patch.object(poa, "http_request", rec):
-            self.assertEqual(poa.api_call("GET", "/api/hosted/challenge", retries=1)["epoch"], 4)
-        self.assertEqual(len(rec.calls), 2)
-        self.assertNotIn("key=", rec.calls[0]["url"])
-        self.assertIn("key=", rec.calls[1]["url"])
-        self.assertFalse(rec.calls[1]["follow_redirects"])
+            poa.api_call("GET", "/api/hosted/me", query={"key": FAKE, "api_key": FAKE, "token": FAKE, "x": 1})
+        self._assert_no_key_in_urls(rec)
+        self.assertIn("x=1", rec.calls[0]["url"])
 
-    def test_401_twice_raises_auth_after_one_fallback(self):
-        rec = Recorder([http_err("u", 401), http_err("u", 401)])
+    def test_key_in_path_is_refused_before_sending(self):
+        rec = Recorder([b"{}"])
+        with mock.patch.object(poa, "http_request", rec):
+            with self.assertRaises(poa.PoaHTTPError):
+                poa.api_call("GET", "/api/hosted/x/" + urllib.parse.quote(FAKE, safe=""))
+        self.assertEqual(rec.calls, [])
+
+    def test_401_never_falls_back_to_url(self):
+        rec = Recorder([http_err("u", 401, b'{"error":"auth required"}'), b'{"epoch": 4}'])
         with mock.patch.object(poa, "http_request", rec):
             with self.assertRaises(poa.PoaHTTPError) as cm:
-                poa.api_call("GET", "/api/hosted/me")
+                poa.api_call("GET", "/api/hosted/challenge", retries=3)
         self.assertEqual(cm.exception.kind, "auth")
-        self.assertEqual(len(rec.calls), 2)
+        self.assertEqual(len(rec.calls), 1)
+        self._assert_no_key_in_urls(rec)
+
+    def test_assignments_502_is_unknown_and_never_url_retried(self):
+        errs = [http_err("u", 502, b"cloudflare bad gateway")] * 4 + [TimeoutError("timed out")] * 4
+        for exc in (errs[0], errs[4]):
+            rec = Recorder([exc] * 4)
+            with mock.patch.object(poa, "http_request", rec):
+                with self.assertRaises(poa.PoaHTTPError) as cm:
+                    poa.hosted_assignments(retries=4)
+            self.assertIn("unknown", str(cm.exception))
+            self.assertTrue(getattr(cm.exception, "seats_unknown", False))
+            self.assertEqual(len(rec.calls), 4)
+            self._assert_no_key_in_urls(rec)
+            for c in rec.calls:
+                self.assertEqual(c["headers"].get("X-Api-Key"), FAKE)
+
+    def test_assignments_401_or_3xx_is_unknown_single_call(self):
+        for code in (401, 307):
+            rec = Recorder([http_err("u", code, b"{}", {"Location": "https://x/?key=" + FAKE})])
+            with mock.patch.object(poa, "http_request", rec):
+                with self.assertRaises(poa.PoaHTTPError) as cm:
+                    poa.hosted_assignments(retries=4)
+            self.assertTrue(cm.exception.seats_unknown)
+            self.assertEqual(len(rec.calls), 1)
+            self._assert_no_key_in_urls(rec)
+            for v in self._enc_variants():
+                self.assertNotIn(v, str(cm.exception))
+
+    def test_assignments_warming_waits_then_reads(self):
+        warm = http_err("u", 503, b'{"error":"assignments index is building","warming":true,"retry_after_seconds":20}')
+        rec = Recorder([warm, b'{"assignments": [{"answer_txid": "ab"}]}'])
+        slept = []
+        with mock.patch.object(poa, "http_request", rec):
+            res = poa.hosted_assignments(retries=1, sleep=slept.append)
+        self.assertEqual(res["assignments"][0]["answer_txid"], "ab")
+        self.assertEqual(slept, [20])
+        self._assert_no_key_in_urls(rec)
+
+    def test_read_open_seats_unknown_not_zero(self):
+        rec = Recorder([http_err("u", 502, b"bad gateway")] * 4)
+        with mock.patch.object(poa, "http_request", rec), mock.patch.object(poa, "mcp_fallback_enabled", return_value=False):
+            r = poa.grade_shown_on_assignments("ab")
+        self.assertIsNone(r["confirmed"])
+        self._assert_no_key_in_urls(rec)
+
+    def test_source_has_no_query_key_builder(self):
+        src = (pathlib.Path(__file__).resolve().parents[1] / "bin" / "poa.py").read_text(encoding="utf-8")
+        self.assertNotIn('q["key"] = raw_key', src)
+        self.assertNotIn("KEY_QUERY_ROUTES", src)
+        self.assertNotIn("fell_back", src)
+
+    def test_every_command_path_url_is_keyless(self):
+        """Exercise every keyed GET/POST helper with a recorder; no URL may ever carry the key."""
+        rec = Recorder([b'{"assignments": [], "next_nonce": 1, "epoch": 1}'] * 40)
+        with mock.patch.object(poa, "http_request", rec), mock.patch.object(poa, "mcp_fallback_enabled", return_value=False):
+            for path in ("/api/hosted/me", "/api/hosted/challenge", "/api/hosted/mine", "/api/hosted/vote"):
+                poa.api_call("GET", path, query={"ballot": "b"})
+            poa.api_call("POST", "/api/hosted/answer", body={"answer": "x"})
+            poa.hosted_assignments()
+            poa.read_open_seats()
+        self.assertGreaterEqual(len(rec.calls), 7)
+        self._assert_no_key_in_urls(rec)
 
     def test_post_401_does_not_fall_back_to_url(self):
         rec = Recorder([http_err("u", 401)])

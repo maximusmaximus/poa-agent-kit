@@ -25,7 +25,7 @@ class GradeCapTests(unittest.TestCase):
             self.calls.append(path)
             if path == "/api/hosted/me":
                 return {"next_nonce": 3}
-            if path == "/api/hosted/assignments":
+            if path == "/api/hosted/assignments/":
                 return {"assignments": [{"answer_txid": ("%02x" % i) * 32} for i in range(3)]}
             r = writes.pop(0)
             if isinstance(r, Exception):
@@ -37,7 +37,7 @@ class GradeCapTests(unittest.TestCase):
         with mock.patch.object(poa, "api_call", self.fake([cap_err(30)])):
             r = poa.submit_grade_safely(TX, 2, "reason")
         self.assertEqual((r["landed"], r["kind"], r["retry_after"]), (False, "rate-limited", 30))
-        self.assertEqual(self.calls.count("/api/hosted/assignments"), 0)
+        self.assertEqual(self.calls.count("/api/hosted/assignments/"), 0)
 
     def test_body_marker_without_429_is_detected(self):
         e = poa.PoaHTTPError("server", "HTTP 503 on /api/hosted/grade: grade_rpm_global exceeded", 503)

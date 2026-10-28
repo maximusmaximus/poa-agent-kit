@@ -28,7 +28,7 @@ class FakeServer:
             if self.receipt is None:
                 raise poa.PoaHTTPError("client", "HTTP 404 (client) on receipt", 404)
             return {"status": "included", "next_nonce": self.receipt}
-        if path == "/api/hosted/assignments":
+        if path == "/api/hosted/assignments/":
             return {"assignments": []}
         r = self.writes.pop(0)
         if isinstance(r, Exception):
@@ -151,7 +151,7 @@ class NonceTests(unittest.TestCase):
         with mock.patch.object(poa, "api_call", fake):
             r = poa.submit_grade_safely(TX, 1, "reason")
         self.assertEqual((r["landed"], r["kind"]), (False, "nonce"))
-        self.assertEqual(fake.count("/api/hosted/assignments"), 0)
+        self.assertEqual(fake.count("/api/hosted/assignments/"), 0)
 
     def test_grade_batch_stops_on_nonce_trouble(self):
         items = [{"txid": ("%02x" % i) * 32, "score": 1, "note": "n"} for i in range(3)]
@@ -160,7 +160,7 @@ class NonceTests(unittest.TestCase):
         open_seats = {"assignments": [{"answer_txid": it["txid"]} for it in items]}
 
         def call(method, path, **kw):
-            if path == "/api/hosted/assignments":
+            if path == "/api/hosted/assignments/":
                 return open_seats
             return fake(method, path, **kw)
 

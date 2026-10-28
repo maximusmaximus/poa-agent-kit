@@ -8,7 +8,7 @@ description: Weekly Proof of Agent performance review using poa-agent-kit. Summa
 1. **Status & History**:
    Run `python3 bin/poa.py me` and `python3 bin/poa.py network`. Count epochs answered over the past 7 days in `~/.poa/answers.log` (and `LOG.md` if using a handoff repo).
 2. **Yield & Standing Analysis**:
-   Compare current `balance`, `spendable`, `locked`, `established`, and `attestations_by_me` against the prior week. Identify any missed epoch windows and recommend schedule adjustments.
+   Compare current `balance`, `spendable`, `locked` and `established` against the prior week. Don't compare `attestations_by_me` week to week: it counts only since the latest checkpoint and resets at each roll-up. Identify any missed epoch windows and recommend schedule adjustments.
 3. **Referral Blurbs (Draft Only — Never Auto-Post)**:
    Draft 2–3 concise, honest outreach blurbs explaining Proof of Agent, `poa-agent-kit`, and your referral invite link for your human operator to review and post in agent communities.
 4. **Security Check**:

@@ -40,6 +40,8 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
+KIT_VERSION = "1.7.0"
+USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
 FLOOR_BASE_URL = os.environ.get("POA_FLOOR_URL", "https://poa.grok.me").rstrip("/")
@@ -320,19 +322,17 @@ def _backoff(attempt: int) -> None:
     time.sleep(delay + (time.time() % 1.0))
 
 
-# Routes verified live (Oct 27, 2026) to reject the X-Api-Key header: /api/hosted/assignments
-# answered Cloudflare 502 after ~30 s with the header and 200 with ?key=. Everything else
-# (verified: /me, /challenge, /mine, POST /answer) uses the header. Override with
-# POA_KEY_QUERY_ROUTES="/api/hosted/x,/api/hosted/y" (comma-separated path prefixes).
-KEY_QUERY_ROUTES = ("/api/hosted/assignments",)
+# The key travels ONLY in the X-Api-Key header (and, for POSTs, the JSON body). There is no ?key=
+# route list and no URL fallback of any kind: a route that refuses the header form (502, timeout,
+# 401, 3xx) is reported as an error / unknown, never retried with the key in the URL.
+# The seat listing uses the trailing-slash path, which accepts the header (Oct 28, 2026 live check:
+# the slash form answered with the header while the bare path hung).
+HOSTED_ASSIGNMENTS_PATH = "/api/hosted/assignments/"
 
 
 def key_mode_for(path: str) -> str:
-    """'header' (default) or 'query' for routes that reject the X-Api-Key header."""
-    env = os.environ.get("POA_KEY_QUERY_ROUTES")
-    routes = tuple(r.strip() for r in env.split(",") if r.strip()) if env is not None else KEY_QUERY_ROUTES
-    p = path.split("?", 1)[0].rstrip("/")
-    return "query" if any(p == r.rstrip("/") or p.startswith(r.rstrip("/") + "/") for r in routes) else "header"
+    """Always 'header'. Kept for callers/tests; the key never goes in a URL."""
+    return "header"
 
 
 def api_call(
@@ -358,12 +358,9 @@ def api_call(
     if timeout is None:
         timeout = 60 if is_write else HTTP_CONNECT_TIMEOUT
     is_post = method.upper() == "POST"
-    # Key placement: X-Api-Key header by default. ?key= only for routes verified to reject the
-    # header (KEY_QUERY_ROUTES) or once after a 401 on a GET. Never in the URL of a POST
-    # (the key already travels in the JSON body). Keyed requests never follow redirects.
-    mode = key_mode_for(path) if need_key else "none"
-    if is_post and mode == "query":
-        mode = "header"
+    # Key placement: X-Api-Key header only (POSTs also carry it in the JSON body). Never in a URL,
+    # no fallback after a 401 or a 5xx. Keyed requests never follow redirects.
+    mode = "header" if need_key else "none"
     data = None
     if is_post:
         payload = dict(body or {})
@@ -373,19 +370,21 @@ def api_call(
 
     def _build(m: str):
         q = dict(query or {})
-        q.pop("key", None) if need_key else None
-        headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
+        if need_key:
+            for k in [k for k in q if str(k).lower() in ("key", "api_key", "apikey", "token", "guid")]:
+                q.pop(k, None)
+        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
         if m == "header":
             headers["X-Api-Key"] = raw_key
-        elif m == "query":
-            q["key"] = raw_key
         if is_post:
             headers["Content-Type"] = "application/json; charset=utf-8"
         qs = urllib.parse.urlencode(q)
         return f"{BASE_URL}{path}" + (f"?{qs}" if qs else ""), headers
 
     url, headers = _build(mode)
-    fell_back = False
+    if need_key and raw_key and (raw_key in url or urllib.parse.quote(raw_key, safe="") in url
+                                 or urllib.parse.quote_plus(raw_key) in url):
+        raise PoaHTTPError("client", f"refused to send: the API key would appear in the URL of {path}")
     last = None
     attempt = 0
     while attempt < max(1, retries):
@@ -399,13 +398,6 @@ def api_call(
                 raise PoaHTTPError("server", f"Non-JSON response on {path}: {clean[:300]}")
         except Exception as e:
             last = _classify(e, path, raw_key)
-            if (last.kind == "auth" and last.status == 401 and mode == "header" and not is_post
-                    and not fell_back):
-                # One fallback to ?key= (redirects still refused); does not consume a retry.
-                fell_back = True
-                mode = "query"
-                url, headers = _build(mode)
-                continue
             if last.kind in ("auth", "client", "halted", "redirect-refused"):
                 raise last from None
             attempt += 1
@@ -414,6 +406,29 @@ def api_call(
                 continue
             raise last from None
     raise last
+
+
+def hosted_assignments(timeout: int = None, retries: int = None, max_warming_waits: int = 2, sleep=time.sleep) -> dict:
+    """Keyed seat listing, header-only (HOSTED_ASSIGNMENTS_PATH). Never falls back to ?key=.
+
+    503 `warming` (index building) waits retry_after_seconds (capped at 30 s) up to max_warming_waits
+    times. Anything else that fails (502, timeout, 401, 3xx) raises PoaHTTPError whose message says the
+    seats are UNKNOWN: callers must treat that as unknown, never as zero seats."""
+    waits = 0
+    while True:
+        try:
+            return api_call("GET", HOSTED_ASSIGNMENTS_PATH, query={"sort": "oldest", "limit": 200},
+                            timeout=timeout, retries=retries)
+        except PoaHTTPError as e:
+            warming = e.status == 503 and "warming" in str(e).lower()
+            if warming and waits < max_warming_waits:
+                waits += 1
+                sleep(min(30, max(1, int(e.retry_after or 20))))
+                continue
+            err = PoaHTTPError(e.kind, f"grading seats unknown (header-only read of {HOSTED_ASSIGNMENTS_PATH}; "
+                                       f"no URL-key fallback): {e}", e.status, retry_after=e.retry_after)
+            err.seats_unknown = True
+            raise err from None
 
 
 def mcp_call(tool: str, arguments: dict = None, need_key: bool = True, timeout: int = 30) -> dict:
@@ -430,7 +445,7 @@ def mcp_call(tool: str, arguments: dict = None, need_key: bool = True, timeout: 
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "application/json, text/event-stream",
-        "User-Agent": "poa-agent-kit/1.4",
+        "User-Agent": USER_AGENT,
     }
     req = urllib.request.Request(MCP_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     opener = urllib.request.build_opener(_NoRedirect) if need_key else urllib.request.build_opener()
@@ -733,13 +748,38 @@ def explorer_get(path: str, timeout: float = 40):
                     "status": neg.get("status"), "cached_miss": True}
         txlookup_slot()
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout)
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": USER_AGENT}, timeout=timeout)
         return json.loads(raw.decode("utf-8", errors="replace"))
     except Exception as e:
         err = _classify(e, path, "")
         if txid and err.status in (404, 429, 503):
             txlookup_mark_negative(txid, err.status, err.retry_after, why="explorer/tx")
         return {"error": redact(str(err))[:200], "status": err.status, "retry_after": err.retry_after}
+
+
+# Server release v0.21-pusher (Oct 28, 2026): state rolls up into checkpoints (anchored on Solana and
+# Base) and new writes are checked against the latest checkpoint, not the whole history. Several
+# counters now cover only the window since that checkpoint, so they DROP at each roll-up. A drop is
+# not data loss; never compare them across checkpoints. Mine/answer checks use next_nonce instead.
+SINCE_CHECKPOINT_SCOPE = "since latest checkpoint (resets at each checkpoint roll-up; a drop is not data loss)"
+STATUS_SINCE_CHECKPOINT_FIELDS = ("txs", "final", "invalid")
+
+
+def label_status_counts(st):
+    """Annotate /api/status: txs/final/invalid are since-latest-checkpoint counts, plus checkpoint height."""
+    if not isinstance(st, dict):
+        return st
+    out = dict(st)
+    out["counts_scope"] = {k: SINCE_CHECKPOINT_SCOPE for k in STATUS_SINCE_CHECKPOINT_FIELDS if k in st}
+    return out
+
+
+def label_me_counts(me):
+    """Annotate /api/hosted/me: attestations_by_me is a since-latest-checkpoint count."""
+    if isinstance(me, dict) and "attestations_by_me" in me:
+        me = dict(me)
+        me["attestations_by_me_scope"] = SINCE_CHECKPOINT_SCOPE
+    return me
 
 
 def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
@@ -757,7 +797,12 @@ def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
         if t.get("type") == "challenge" and str(t.get("epoch")) == str(epoch):
             return {"found": True, "via": "explorer/address", "txid": t.get("id"), "tx": {k: t.get(k) for k in ("id", "type", "epoch", "ts", "atts", "final")},
                     "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height")}
-    return {"found": False, "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height"), "txs_listed": len(d.get("txs") or [])}
+    # Not listed is UNKNOWN, never "absent": since v0.21-pusher the per-address view can cover only the
+    # window since the latest checkpoint, and it lags. It must never trigger a resend; the challenge
+    # `answered` flag (and answered_txid / local log) stays the deciding signal.
+    return {"found": None, "status": "unknown", "explorer_as_of": d.get("as_of"), "checkpoint_height": d.get("checkpoint_height"),
+            "txs_listed": len(d.get("txs") or []),
+            "note": "not listed on the explorer address view: unknown, not absent. Do not resend; /challenge `answered` decides."}
 
 
 def write_receipt(txid: str, timeout: float = 20) -> dict:
@@ -777,7 +822,7 @@ def write_receipt(txid: str, timeout: float = 20) -> dict:
                         "Unknown, NOT failed. Do not resend; re-run `receipt` after retry_not_before."}
     txlookup_slot()
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout,
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": USER_AGENT}, timeout=timeout,
                            follow_redirects=False)
         d = json.loads(raw.decode("utf-8", errors="replace"))
     except Exception as e:
@@ -848,7 +893,7 @@ def confirm_answer_landed(epoch, txid: str = None, min_wait: int = None, max_wai
 def read_open_seats():
     """Set of open assignment txids, or None if unknown."""
     try:
-        res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+        res = hosted_assignments()
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
             res = mcp_call("poa_assignments", {})
@@ -1451,7 +1496,7 @@ def _origin_auth_gated(timeout: float = 5.0) -> bool:
 def _mcp_list(timeout) -> dict:
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
     req = urllib.request.Request(MCP_URL, data=json.dumps(payload).encode(), method="POST", headers={
-        "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "poa-agent-kit/1.4"})
+        "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -1480,7 +1525,7 @@ def floor_mcp_call(tool_name: str, arguments: dict = None, need_key: bool = Fals
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "application/json",
-        "User-Agent": "poa-agent-kit/1.4",
+        "User-Agent": USER_AGENT,
     }
     req = urllib.request.Request(
         FLOOR_MCP_URL,
@@ -1560,7 +1605,7 @@ def lableak_call(method: str, path: str, query: dict = None, body: dict = None, 
             raise RuntimeError(f"refusing to put credential parameter '{k}' in a LabLeak URL")
     qs = urllib.parse.urlencode(q)
     url = f"{LABLEAK_BASE_URL}{path}" + (f"?{qs}" if qs else "")
-    headers = {"Accept": "application/json", "User-Agent": "poa-agent-kit/1.4"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if need_auth and tok:
         headers["Authorization"] = f"Bearer {tok}"
     data = None
@@ -1889,7 +1934,7 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
     # Check currently open assignments so we skip any already-sealed seats on re-runs
     open_txids = set()
     try:
-        asgn_res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+        asgn_res = hosted_assignments()
         for s in (asgn_res.get("assignments") or []):
             if s.get("answer_txid"):
                 open_txids.add(s["answer_txid"])
@@ -1963,7 +2008,7 @@ REF_FILE = POA_DIR / "ref"
 
 
 def _ledger_get(url: str, timeout: int = 30):
-    headers = {"User-Agent": "poa-agent-kit/1.4", "Accept": "application/vnd.github+json"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
     gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
     if gh_token and url.startswith("https://api.github.com/"):
         headers["Authorization"] = f"Bearer {gh_token}"
@@ -2027,7 +2072,88 @@ def local_address() -> str:
     return ""
 
 
-def ledger_status(branch: str) -> dict:
+POASCAN_ANCHORS_URL = os.environ.get("POA_POASCAN_ANCHORS_URL", "https://poascan.io/api/v1/anchors")
+
+
+def _poascan_anchors(timeout: float = 20):
+    """Keyless POAScan anchor list (newest first): [{height, chain, tx, state_root, anchored_at, ...}]."""
+    raw = http_request("GET", POASCAN_ANCHORS_URL, headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                       timeout=timeout, follow_redirects=False)
+    d = json.loads(raw.decode("utf-8", errors="replace"))
+    return d if isinstance(d, list) else (d.get("anchors") if isinstance(d, dict) else None) or []
+
+
+def _iso_age_s(iso, now):
+    try:
+        return int(now - datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def ledger_status(branch: str, mirror: bool = False, fetch_status=None, fetch_anchors=None, clock=time.time) -> dict:
+    """Live checkpoint status (server release v0.21-pusher). Checkpoint height comes from keyless
+    /api/status (checkpoint_height, plus stale / stale_age_s when the server serves a cached view)
+    and POAScan anchors; the GitHub ledger branch is NOT used for lag (it trails the live roll-ups,
+    which land about every 15 minutes, and reported hours of false lag). `mirror=True` adds the
+    GitHub mirror's newest checkpoint as information only."""
+    fetch_status = fetch_status or (lambda: api_call("GET", "/api/status", need_key=False, timeout=20, retries=2))
+    fetch_anchors = fetch_anchors or _poascan_anchors
+    now = clock()
+    out = {"source": "live: /api/status + POAScan anchors", "branch": branch}
+    st, errs = None, {}
+    try:
+        st = fetch_status()
+    except Exception as e:
+        errs["status"] = redact(str(e))[:200]
+    anchors = []
+    try:
+        anchors = [a for a in (fetch_anchors() or []) if isinstance(a, dict)]
+    except Exception as e:
+        errs["anchors"] = redact(str(e))[:200]
+    if isinstance(st, dict) and st.get("checkpoint_height") is not None:
+        stale = bool(st.get("stale"))
+        out["latest_checkpoint"] = {"height": st.get("checkpoint_height"), "state_root": st.get("state_root"),
+                                    "as_of": st.get("as_of"), "via": "/api/status"}
+        out["stale"] = stale
+        out["stale_age_s"] = st.get("stale_age_s") if stale else 0
+        out["checkpoint_lag_seconds"] = int(st.get("stale_age_s") or 0) if stale else 0
+        out["epochs_closed"] = st.get("epochs_closed")
+    latest = {}
+    for a in anchors:
+        ch = a.get("chain") or "?"
+        try:
+            h = int(a.get("height"))
+        except Exception:
+            continue
+        if ch not in latest or h > int(latest[ch]["height"]):
+            latest[ch] = {"height": h, "anchored_at": a.get("anchored_at"), "tx": a.get("tx"),
+                          "state_root": a.get("state_root"), "age_s": _iso_age_s(a.get("anchored_at"), now)}
+    out["latest_anchors"] = latest
+    if "latest_checkpoint" not in out and latest:
+        top = max(latest.values(), key=lambda x: x["height"])
+        out["latest_checkpoint"] = {"height": top["height"], "state_root": top["state_root"],
+                                    "as_of": top["anchored_at"], "via": "POAScan anchors"}
+        out["checkpoint_lag_seconds"] = None
+        out["note_lag"] = "/api/status unreadable: lag unknown (anchors trail the live checkpoint by design)"
+    if "latest_checkpoint" not in out:
+        out["checkpoint_lag_seconds"] = None
+        out["status"] = "unknown"
+    else:
+        out["status"] = "stale" if out.get("stale") else ("ok" if out.get("checkpoint_lag_seconds") == 0 else "unknown")
+    out["checkpoint_lag_hours"] = (round(out["checkpoint_lag_seconds"] / 3600, 2)
+                                   if isinstance(out.get("checkpoint_lag_seconds"), int) else None)
+    if errs:
+        out["errors"] = errs
+    if mirror:
+        try:
+            out["github_mirror"] = ledger_mirror_status(branch)
+            out["github_mirror"]["note"] = "information only; the mirror trails live checkpoints and is not used for lag"
+        except Exception as e:
+            out["github_mirror"] = {"error": redact(str(e))[:200]}
+    return out
+
+
+def ledger_mirror_status(branch: str) -> dict:
     cps = [x["name"][:-5] for x in ledger_ls(branch, "checkpoints") if x.get("type") == "file" and x["name"].endswith(".json")]
     heights = sorted(int(h) for h in cps if h.isdigit())
     out = {"repo": LEDGER_REPO, "branch": branch}
@@ -2041,8 +2167,7 @@ def ledger_status(branch: str) -> dict:
             "state_root": cp.get("state_root"),
             "signatures": len(cp.get("sigs") or []),
         }
-        out["checkpoint_lag_seconds"] = int(now - int(cp.get("ts") or now))
-        out["checkpoint_lag_hours"] = round(out["checkpoint_lag_seconds"] / 3600, 2)
+        out["mirror_age_seconds"] = int(now - int(cp.get("ts") or now))
     names = [x["name"] for x in ledger_ls(branch, "anchors") if x.get("type") == "file"]
     latest = {}
     for n in names:
@@ -2135,7 +2260,7 @@ def cmd_ledger(args: argparse.Namespace) -> None:
     b = args.branch
     act = args.action
     if act == "status":
-        res = ledger_status(b)
+        res = ledger_status(b, mirror=getattr(args, "mirror", False))
     elif act == "params":
         res = ledger_params_diff(b, args.diff) if args.diff else ledger_raw(b, "params.json")
     elif act == "pardons":
@@ -2155,13 +2280,16 @@ def cmd_ledger(args: argparse.Namespace) -> None:
 def print_ledger_human(act: str, res: dict) -> None:
     if act == "status":
         cp = res.get("latest_checkpoint") or {}
-        print(f"Ledger {res['repo']}@{res['branch']}")
-        print(f"  checkpoint  h{cp.get('height')} at {cp.get('time_utc')} (epochs covered {cp.get('covered_epochs')}, sigs {cp.get('signatures')})")
-        print(f"  lag         {res.get('checkpoint_lag_hours')} h since last checkpoint")
+        print(f"Checkpoint status ({res.get('source')})")
+        print(f"  checkpoint  h{cp.get('height')} as of {cp.get('as_of')} via {cp.get('via')}")
+        lag = res.get("checkpoint_lag_seconds")
+        print(f"  status      {res.get('status')}" + (f" (server view stale {lag} s)" if res.get("stale") else "")
+              + ("" if lag is not None else " (lag unknown)"))
         for chain, a in (res.get("latest_anchors") or {}).items():
             print(f"  anchor      {chain}: h{a.get('height')} at {a.get('anchored_at')} tx {a.get('tx')}")
-        ep = res.get("latest_epoch") or {}
-        print(f"  epoch       {ep.get('epoch')} files {', '.join(ep.get('files') or [])}")
+        gm = res.get("github_mirror")
+        if isinstance(gm, dict) and gm.get("latest_checkpoint"):
+            print(f"  mirror      h{gm['latest_checkpoint'].get('height')} (GitHub, information only)")
     elif act == "pardons":
         for e, c in res.get("epochs", {}).items():
             print(f"  epoch {e}: {c} pardoned")
@@ -2319,7 +2447,7 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     seats = None
     if not args.no_key:
         try:
-            a = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200}, timeout=45, retries=1)
+            a = hosted_assignments(timeout=45, retries=1)
             seats = a.get("assignments") or []
         except Exception as e:
             seats = {"error": redact(str(e))}
@@ -3134,7 +3262,7 @@ def _keyless_assignments(address: str, timeout: float = 30):
     """(http_code, parsed_json_or_None). Keyless public route; never sends a key."""
     path = f"/api/assignments/{urllib.parse.quote(address)}/"
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"},
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": USER_AGENT},
                            timeout=timeout)
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -3567,7 +3695,7 @@ def _register_once(q: dict, pow_frag: dict, timeout: float = 30) -> dict:
         body["pow"] = {"challenge": pow_frag["challenge"], "nonce": pow_frag["nonce"]}
     raw = http_request("POST", url, data=json.dumps(body).encode("utf-8"),
                        headers={"Accept": "application/json", "Content-Type": "application/json; charset=utf-8",
-                                "User-Agent": "poa-agent-kit/1.6"}, timeout=timeout)
+                                "User-Agent": USER_AGENT}, timeout=timeout)
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
@@ -3997,7 +4125,7 @@ def top_accounts_from_epochs(eps: list, top: int = 10, closes: int = 5, exclude:
 
 def _public_json(path: str, timeout: float = 40):
     try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"},
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": USER_AGENT},
                            timeout=timeout)
         return json.loads(raw.decode("utf-8", errors="replace"))
     except Exception:
@@ -4208,7 +4336,7 @@ def cmd_grade_plan(args: argparse.Namespace) -> None:
         seats = data.get("assignments", []) if isinstance(data, dict) else data
         source = "file"
     else:
-        res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+        res = hosted_assignments()
         seats = res.get("assignments") or []
         source = "live-read"
     queue = plan_grades(seats)
@@ -4298,6 +4426,7 @@ def main() -> None:
             except Exception:
                 pass
     parser = argparse.ArgumentParser(description="poa-agent-kit CLI (cross-platform zero-leak PoA client & auditor)")
+    parser.add_argument("--version", action="version", version=f"poa-agent-kit {KIT_VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Register a new PoA identity or import an existing key into ~/.poa/key")
@@ -4344,7 +4473,7 @@ def main() -> None:
     p_og.add_argument("--require-top", action="store_true", help="Exit 4 when no top-answer corpus could be checked")
 
     p_gp = sub.add_parser("grade-plan", help="Propose consensus-calibrated scores for dealt seats and write a grade-batch queue (never sends)")
-    p_gp.add_argument("--seats", default="", help="JSON seats file (offline); default: one keyed read of /api/hosted/assignments")
+    p_gp.add_argument("--seats", default="", help="JSON seats file (offline); default: one header-keyed read of /api/hosted/assignments/")
     p_gp.add_argument("--out", default="", help="Write the queue [{txid, score, note, epoch}] here")
 
     p_gc = sub.add_parser("grade-calibrate", help="Offline: agreement of grade-plan's scores with settled jury outcomes in a fixtures file")
@@ -4463,7 +4592,7 @@ def main() -> None:
     p_cp.add_argument("--no-log", action="store_true", help="Don't append to the log")
     p_cp.add_argument("--json", action="store_true", help="JSON output")
 
-    p_led = sub.add_parser("ledger", help="Read the public ledger mirror on GitHub (no key): status, params, pardons, epoch")
+    p_led = sub.add_parser("ledger", help="No key. status: live checkpoint height (/api/status + POAScan anchors); params, pardons, epoch: GitHub ledger mirror")
     p_led.add_argument("action", choices=["status", "params", "pardons", "epoch"], help="Ledger action")
     p_led.add_argument("n", nargs="?", type=int, default=None, help="Epoch number for `ledger epoch N`")
     p_led.add_argument("--branch", default=LEDGER_DEFAULT_BRANCH, help="Ledger branch (default poa-mainnet-1)")
@@ -4471,6 +4600,7 @@ def main() -> None:
     p_led.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
     p_led.add_argument("--full", action="store_true", help="For epoch: print the raw emission.json")
     p_led.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    p_led.add_argument("--mirror", action="store_true", help="For status: also show the GitHub mirror's newest checkpoint (information only)")
 
     p_health = sub.add_parser("health", help="Read-only probe: REST status/challenge + MCP; tells outage (server) from key trouble (auth)")
     p_health.add_argument("--timeout", type=float, default=15, help="Per-probe timeout seconds (default 15)")
@@ -4508,7 +4638,7 @@ def main() -> None:
             cmd_init(args)
         elif args.command == "me":
             try:
-                res = api_call("GET", "/api/hosted/me")
+                res = label_me_counts(api_call("GET", "/api/hosted/me"))
                 res["answered_in_local_log"] = has_answered_epoch_locally(res.get("epoch"))
                 print(json.dumps(res, indent=2))
                 print_notice(res)
@@ -4718,7 +4848,7 @@ def main() -> None:
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "assignments":
-            res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+            res = hosted_assignments()
             if args.audit:
                 seats = res.get("assignments", []) or []
                 audited = audit_assignments_batch(seats)
@@ -4773,7 +4903,7 @@ def main() -> None:
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "network":
-            res = api_call("GET", "/api/status", need_key=False)
+            res = label_status_counts(api_call("GET", "/api/status", need_key=False))
             print(json.dumps(res, indent=2))
         elif args.command == "floor":
             act = args.action
@@ -4804,7 +4934,7 @@ def main() -> None:
             elif act == "guide":
                 req = urllib.request.Request(
                     FLOOR_MCP_URL,
-                    headers={"Accept": "text/markdown, text/plain", "User-Agent": "poa-agent-kit/1.4"},
+                    headers={"Accept": "text/markdown, text/plain", "User-Agent": USER_AGENT},
                     method="GET",
                 )
                 with urllib.request.urlopen(req, timeout=20) as resp:
@@ -4905,7 +5035,7 @@ def main() -> None:
                 hosted_err = hosted_err or str(e)[:200]
                 ch_res = getattr(e, "edge_challenge", None) or {}
             try:
-                asgn_res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200}) if hosted_status != "halted" else {"assignments": []}
+                asgn_res = hosted_assignments() if hosted_status != "halted" else {"assignments": []}
             except PoaHTTPError as e:
                 if e.kind == "auth" and not me_res.get("address") and not ch_res.get("words"):
                     raise
@@ -4951,6 +5081,7 @@ def main() -> None:
                 "locked": me_res.get("locked"),
                 "established": me_res.get("established") if "established" in me_res else edge_me.get("established_from_epochs"),
                 "attestations_by_me": me_res.get("attestations_by_me"),
+                "attestations_by_me_scope": SINCE_CHECKPOINT_SCOPE,
                 "mined_this_pulse": mine_res.get("attested") if isinstance(mine_res, dict) else 0,
                 "open_grading_seats_count": len(seats),
                 "open_grading_seats": seats,
