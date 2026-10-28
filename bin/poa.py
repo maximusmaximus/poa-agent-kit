@@ -1123,6 +1123,20 @@ def grade_shown_on_assignments(txid: str) -> dict:
     return {"confirmed": txid not in seats, "open_seats": len(seats)}
 
 
+# Server release v1.12-gradecap (Oct 27, 2026, 8:51 PM PT): a global grade ceiling
+# (grade_rpm_global, about 90 grades per minute across all graders and IPs) is checked before
+# replay. A grade refused with 429 (or a body naming the ceiling) did not land.
+GRADE_RATE_LIMIT_MARKERS = ("grade_rpm_global", "grade ceiling", "grade rate", "grades per minute")
+GRADE_RATE_LIMIT_DEFAULT_WAIT_S = 60
+
+
+def is_grade_rate_limited(e) -> bool:
+    if getattr(e, "status", None) == 429:
+        return True
+    low = str(e).lower()
+    return any(m in low for m in GRADE_RATE_LIMIT_MARKERS)
+
+
 def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
     """Send a grade ONCE, then count it done only when /assignments no longer deals the seat.
     landed: True (assignments confirms) / None (sent or ambiguous, not yet confirmed) / False (rejected)."""
@@ -1135,6 +1149,12 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
         if e.kind in ("nonce", "nonce-lag", "busy"):
             return {"landed": False, "how": e.kind, "error": str(e)[:300], "kind": e.kind,
                     "note": "not landed (nonce slot); safe to grade this seat again on the next run"}
+        if is_grade_rate_limited(e):
+            # v1.12-gradecap (Oct 27, 2026): global grade ceiling grade_rpm_global, checked before
+            # replay, so a refused grade did not land. Stop and wait out Retry-After.
+            return {"landed": False, "how": "rate-limited", "kind": "rate-limited", "error": str(e)[:300],
+                    "retry_after": e.retry_after if e.retry_after is not None else GRADE_RATE_LIMIT_DEFAULT_WAIT_S,
+                    "note": "not landed (global grade ceiling); safe to grade this seat again after retry_after seconds"}
         if "duplicate sealed grade" in low or "already graded" in low:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
@@ -1885,8 +1905,11 @@ def cmd_grade_batch(args: argparse.Namespace) -> None:
         elif r.get("landed") is None:
             unknown.append({"txid": txid, "score": score, "error": r.get("error")})
         else:
-            failed.append({"txid": txid, "score": score, "error": r.get("error"), "kind": r.get("kind")})
-            if r.get("kind") in ("auth", "nonce", "nonce-lag", "busy"):
+            row = {"txid": txid, "score": score, "error": r.get("error"), "kind": r.get("kind")}
+            if r.get("retry_after") is not None:
+                row["retry_after"] = r.get("retry_after")
+            failed.append(row)
+            if r.get("kind") in ("auth", "nonce", "nonce-lag", "busy", "rate-limited"):
                 # nonce trouble: stop instead of burning rate limit; the rest stay dealt for the next run
                 break
     retried_ok = [x["txid"] for x in sealed if x.get("how") == "read-back"]
