@@ -1,3 +1,5 @@
 
 __pycache__/
 *.pyc
+overlap-cache*.json
+seat-check.json

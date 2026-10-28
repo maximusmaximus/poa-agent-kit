@@ -1259,6 +1259,7 @@ def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True, current_e
 
 
 def cmd_takeover_check(args: argparse.Namespace) -> None:
+    after_min = float(getattr(args, "after_min", None) or os.environ.get("POA_TAKEOVER_AFTER_MIN", "45"))
     log_path = pathlib.Path(args.log).expanduser() if args.log else HANDOFF_LOG
     sil = pc_silence(log_path, args.node, args.hours)
     out = {"pc": sil, "clock": None, "epoch": None, "answered": None, "pc_claim_or_answer": False}
@@ -1307,10 +1308,11 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
         decision, why = "wait", "PC has a fresh CLAIM or ANSWERED line for this epoch"
     elif sil["silent"]:
         decision, why = "takeover", f"PC heartbeat older than {args.hours}h and epoch unanswered"
-    elif win["window_age_hours"] > 1.0:
-        decision, why = "takeover", "epoch window >1h old, unanswered, no PC claim"
+    elif win["window_age_hours"] * 60 > after_min:
+        decision, why = "takeover", f"epoch window >{after_min:g} min old, unanswered, no PC claim"
     else:
-        decision, why = "wait", "PC is fresh and epoch is <1h old; give it time"
+        decision, why = "wait", f"PC is fresh and epoch is <{after_min:g} min old; give it time"
+    out["takeover_after_min"] = after_min
     out["decision"] = decision
     out["reason"] = why
     print(json.dumps(out, indent=2))
@@ -1670,6 +1672,7 @@ def check_answer_quality(text: str, required_words: list) -> dict:
         warnings.append(f"3-word shingle Jaccard overlap is {max_overlap:.1%} against {colliding_epoch} (keep <25% to avoid template rejection).")
 
     rubric = score_grade3_rubric(text, required_words, max_overlap, inflected)
+    style = plain_style_score(text)
     return {
         "passed": passed,
         "length": length,
@@ -1680,6 +1683,12 @@ def check_answer_quality(text: str, required_words: list) -> dict:
         "max_shingle_overlap": round(max_overlap, 4),
         "rubric_score": rubric["rubric_score"],
         "rubric_breakdown": rubric["rubric_breakdown"],
+        "style_score": style["style_score"],
+        "style_breakdown": style["style_breakdown"],
+        "jargon_per_100_words": style["jargon_per_100_words"],
+        "drift": style["drift"],
+        "style_flags": style["style_flags"],
+        "combined_score": round(0.4 * rubric["rubric_score"] + 0.6 * style["style_score"]),
         "warnings": warnings,
     }
 
@@ -3361,6 +3370,8 @@ def run_reopen(args: argparse.Namespace) -> tuple:
                     handoff_append(log_path, args.node, epoch, "ANSWERED", "reopen: read back ok", words)
                     with ANSWERS_LOG.open("a", encoding="utf-8") as fp:
                         fp.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}\tchain={MAINNET_CHAIN_ID}\tepoch={epoch}\twords={','.join(words)}\t{text}\n")
+                elif res.get("how") == "halted":
+                    handoff_append(log_path, args.node, epoch, "FAILED", "reopen: HTTP 503 temporarily halted (API hardening) on /api/hosted/answer; staged answer not landed, will send when halt lifts", words)
                 if args.git_sync:
                     handoff_git(log_path, "push", f"{args.node}: E{epoch} answer result (reopen)")
                 if res.get("landed") is False:
@@ -3707,6 +3718,484 @@ def cmd_write_drill(args: argparse.Namespace) -> None:
     sys.exit(0 if r["ok"] else 3)
 
 
+# ---------------------------------------------------------------------------
+# Plain-style scoring, drift check, overlap guard and grading prep (Oct 27, 2026)
+#
+# Answers that settle well tend to read the same way: name the mechanism, show what N fake
+# identities cost with real numbers, say what one honest agent pays, and name one way the
+# mechanism fails. `plain_style_score` rewards that shape, penalises jargon density and flags
+# drift away from the challenge's question (the cost of faking identities). The overlap guard
+# refuses a draft that shares more than 25% of its 3-word shingles with any single prior answer
+# (recent public answers from the top-earning accounts, plus our own past answers). The guard is
+# for learning patterns, never for copying text. Its cache lives in $POA_HOME, never in a repo.
+# ---------------------------------------------------------------------------
+
+STYLE_JARGON = (
+    "schnorr", "bls", "timelock", "time-lock", "oblivious", "shamir", "zk-snark", "zksnark", "snark", "stark",
+    "zero-knowledge", "vdf", "merkle", "pedersen", "homomorphic", "bisection", "opcode", "eigenvalue",
+    "eigenvector", "conductance", "submodular", "nullifier", "ciphertext", "cosignature", "cosignatures",
+    "witness set", "state root", "finality", "finalization", "mempool", "succinct", "fraud proof",
+    "commit-reveal", "vrf", "threshold signature", "trace", "canonical", "deterministic execution",
+)
+STYLE_JARGON_RE = [re.compile(r"\b\d+-of-\d+\b"), re.compile(r"\bO\([^)]{1,12}\)"), re.compile(r"\b\d*k\s*[-+]\s*n\b|2k-n")]
+STYLE_OFFTOPIC = (
+    "mempool", "front-run", "frontrun", "front run", "mev", "finality", "finalization", "block ", "rollup",
+    "sequencer", "bridge", "relay", "partition", "double-spend", "double spend", "opcode", "state root",
+    "gas fee", "latency", "ordering", "l1 ", "l2 ",
+)
+STYLE_TOPIC = ("sybil", "fake", "identit", "clone", "throwaway", "sock", "farm", "duplicate account", "account",
+               "bot", "newcomer", "collu", "persona")
+STYLE_FAKE_COUNT_RE = re.compile(
+    r"\b\d[\d,\.]*\s*(?:k\b|thousand\b|million\b)?\s*(?:extra\s+|more\s+|new\s+)?"
+    r"(?:fake|sybil|clone|throwaway|sock|identit|account|bot|node|agent|copies|cop(?:y|ies))", re.I)
+STYLE_COST_NUM_RE = re.compile(
+    r"(?:[$€£]\s?\d[\d,\.]*|\b\d[\d,\.]*\s*(?:k\b|thousand\b|million\b)?\s*(?:-\s*)?"
+    r"(?:credits?|poa\b|tokens?|usd|dollars?|cents?|hours?|days?|weeks?|months?|years?|epochs?|devices?|"
+    r"machines?|gpus?|phones?|sims?|bonds?|stake|%|percent|units?|points?|minutes?))", re.I)
+STYLE_HONEST_RE = re.compile(
+    r"\bhonest\b[^.;]{0,140}?\b(?:once|only|single|one|\d[\d,\.]*|nothing|little|free|cheap|back|refund\w*|fast|small|tiny)\b", re.I)
+STYLE_FAILURE_RE = re.compile(
+    r"failure mode|fails?\s+(?:if|when|against)|breaks?\s+(?:if|when|down)|weak(?:ness|\s+point|\s+spot)|"
+    r"could fail|can fail|risk is|main risk|the risk|limitation|the catch|downside|blind spot|caveat|"
+    r"does not stop|doesn't stop|won't stop|cannot stop|can't stop|still (?:beat|bypass|evade|game)|"
+    r"(?:attacker|farmer|ring)s? (?:could|can) still|\blimits?:|\bcan still\b|only raises? the floor", re.I)
+STYLE_MECH_VERBS_RE = re.compile(
+    r"\b(?:require|requires|bind|binds|lock|locks|stake|stakes|bond|bonds|vouch|vouches|attest|attests|"
+    r"cap|caps|charge|charges|limit|limits|tie|ties|gate|gates|weight|weights|escrow|vest|vests|audit|audits)\b", re.I)
+
+
+def _first_sentence(text: str) -> str:
+    m = re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)
+    return m[0] if m else text
+
+
+def plain_style_score(text: str, topic_terms=None) -> dict:
+    """Score a draft 0-100 on the plain top-answer pattern. Pure: no network, no key.
+
+    mechanism_20: the first sentence names what the mechanism does (a mechanism or cost verb/keyword).
+    attacker_cost_30: a count of fake identities AND a numeric cost (e.g. "1,000 fakes lock 200,000 credits").
+    honest_cost_20: a line saying what one honest agent pays ("honest agents pay once", "one honest agent locks 200").
+    failure_mode_15: names one way it fails ("the failure mode is...", "fails if...").
+    plain_language_15: jargon density (hits per 100 words) <= 1 gets 15, <= 2.5 gets 8, else 0.
+    drift: the answer is about something other than making fake identities costly (no topic terms,
+    or off-topic terms such as mempool / front-running / finality outnumber them). Drift costs 30 points.
+    """
+    lower = text.lower()
+    words = re.findall(r"[a-z0-9]+", lower)
+    n_words = max(1, len(words))
+    first = _first_sentence(text).lower()
+    mech = bool(STYLE_MECH_VERBS_RE.search(first)) or any(k in first for k in MECH_KEYWORDS) or any(k in first for k in COST_KEYWORDS)
+    mech_pts = 20 if mech else 0
+
+    fake_count = bool(STYLE_FAKE_COUNT_RE.search(text))
+    cost_num = bool(STYLE_COST_NUM_RE.search(text))
+    if fake_count and not cost_num:
+        # "10,000 clones cost 10,000 sequential waits": a second number in the fake-count sentence is the cost
+        for sent in re.split(r"(?<=[.!?;])\s+", text):
+            if STYLE_FAKE_COUNT_RE.search(sent) and len(re.findall(r"\d[\d,\.]*", sent)) >= 2:
+                cost_num = True
+                break
+    attacker_pts = 30 if (fake_count and cost_num) else (12 if (fake_count or cost_num) else 0)
+
+    honest = bool(STYLE_HONEST_RE.search(text))
+    honest_pts = 20 if honest else (6 if "honest" in lower else 0)
+
+    failure = bool(STYLE_FAILURE_RE.search(text))
+    failure_pts = 15 if failure else 0
+
+    jargon_hits = [t for t in STYLE_JARGON if re.search(rf"(?<![a-z]){re.escape(t)}(?![a-z])", lower)]
+    for rx in STYLE_JARGON_RE:
+        jargon_hits += rx.findall(text)
+    density = round(len(jargon_hits) * 100.0 / n_words, 2)
+    plain_pts = 15 if density <= 1.0 else (8 if density <= 2.5 else 0)
+
+    topics = [t.lower() for t in (topic_terms or STYLE_TOPIC)]
+    topic_hits = sum(len(re.findall(rf"\b{re.escape(t)}", lower)) for t in topics)
+    off_hits = [t.strip() for t in STYLE_OFFTOPIC if t in lower]
+    drift = topic_hits == 0 or (len(off_hits) >= 2 and len(off_hits) > topic_hits)
+
+    total = mech_pts + attacker_pts + honest_pts + failure_pts + plain_pts - (30 if drift else 0)
+    total = max(0, min(100, total))
+    flags = []
+    if not mech:
+        flags.append("STYLE_NO_MECHANISM_UP_FRONT: open by saying what the mechanism does")
+    if not (fake_count and cost_num):
+        flags.append("STYLE_NO_ATTACKER_COST_MATH: show what N fakes cost with numbers (e.g. 1,000 fakes lock 200,000 credits)")
+    if not honest:
+        flags.append("STYLE_NO_HONEST_COST_LINE: say what one honest agent pays (e.g. honest agents pay 200 once)")
+    if not failure:
+        flags.append("STYLE_NO_FAILURE_MODE: name one way the mechanism fails")
+    if density > 2.5:
+        flags.append(f"STYLE_JARGON_DENSE: {len(jargon_hits)} jargon terms ({density} per 100 words); say it plainly")
+    if drift:
+        flags.append("STYLE_DRIFT: answer the challenge's question (what faking identities costs), not "
+                     + (", ".join(off_hits[:4]) if off_hits else "an unrelated topic"))
+    return {
+        "style_score": int(total),
+        "style_breakdown": {"mechanism_20": mech_pts, "attacker_cost_30": attacker_pts, "honest_cost_20": honest_pts,
+                            "failure_mode_15": failure_pts, "plain_language_15": plain_pts},
+        "jargon_terms": sorted(set(str(j).lower() for j in jargon_hits)),
+        "jargon_per_100_words": density,
+        "drift": drift,
+        "offtopic_terms": off_hits,
+        "style_flags": flags,
+    }
+
+
+OVERLAP_CACHE = POA_DIR / "overlap-cache.json"
+OVERLAP_THRESHOLD = 0.25
+OVERLAP_K = 3
+OVERLAP_MAX_AGE_H = 6.0
+
+
+def shingle_containment(draft: str, prior: str, k: int = OVERLAP_K) -> float:
+    """Share of the draft's k-word shingles that also appear in `prior` (0..1). Containment, not
+    Jaccard, so a short draft lifted from a long answer still scores high."""
+    d = word_shingles(draft, k)
+    if not d or len(re.findall(r"[a-z0-9]+", draft.lower())) < k:
+        return 0.0
+    p = word_shingles(prior, k)
+    return len(d & p) / len(d) if p else 0.0
+
+
+def own_answers_from_log(path: pathlib.Path = None) -> list:
+    """Our own past answers from ~/.poa/answers.log as [{src, epoch, text}] (text is the last tab field)."""
+    path = path or ANSWERS_LOG
+    out = []
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        parts = line.split("\t")
+        if not parts or not parts[-1].strip():
+            continue
+        ep = next((p.split("=", 1)[1] for p in parts if p.startswith("epoch=")), None)
+        out.append({"src": "self-log", "epoch": ep, "text": parts[-1].strip()})
+    return out
+
+
+def load_overlap_cache(path: pathlib.Path = None) -> dict:
+    path = path or OVERLAP_CACHE
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def overlap_cache_age_h(cache: dict, now: float = None):
+    ts = cache.get("fetched_at")
+    if not isinstance(ts, (int, float)):
+        return None
+    return round(((now if now is not None else time.time()) - ts) / 3600.0, 2)
+
+
+def top_accounts_from_epochs(eps: list, top: int = 10, closes: int = 5, exclude: str = "") -> list:
+    """Top-earning addresses over the last `closes` closes, by summed rewards. Pure."""
+    eps = [e for e in (eps or []) if isinstance(e, dict)]
+    eps.sort(key=lambda e: int(e.get("epoch", 0)))
+    tally = {}
+    for e in eps[-closes:] if closes > 0 else eps:
+        for addr, amt in (e.get("rewards") or {}).items():
+            if addr == exclude:
+                continue
+            tally[addr] = tally.get(addr, 0.0) + _f(amt)
+    return [a for a, _ in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[:top]]
+
+
+def _public_json(path: str, timeout: float = 40):
+    try:
+        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": "poa-agent-kit/1.5"},
+                           timeout=timeout)
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def recent_public_answers(address: str, per_account: int = 6, fetch=None, sleep=time.sleep) -> list:
+    """Newest challenge answers of one address from the keyless explorer: [{epoch, txid12, text}]."""
+    fetch = fetch or _public_json
+    v = fetch(f"/api/explorer/address/{urllib.parse.quote(address)}?sort=new") or {}
+    txs = [t for t in (v.get("txs") or []) if isinstance(t, dict) and t.get("type") == "challenge" and t.get("id")]
+    txs.sort(key=lambda t: -(t.get("ts") or 0))
+    out = []
+    for t in txs[:per_account]:
+        body = (fetch(f"/api/explorer/tx/{urllib.parse.quote(str(t['id']))}") or {}).get("body") or {}
+        txt = body.get("answer")
+        if isinstance(txt, str) and txt.strip():
+            out.append({"epoch": body.get("epoch") or t.get("epoch"), "txid12": str(t["id"])[:12], "text": txt.strip()})
+        sleep(0.7)
+    return out
+
+
+def refresh_overlap_cache(top: int = 10, closes: int = 5, per_account: int = 6, path: pathlib.Path = None,
+                          fetch_epochs=None, fetch_answers=None, address: str = None, clock=time.time) -> dict:
+    """Keyless refresh: top accounts from /api/epochs, their newest answers, plus our own public answers.
+    Written to $POA_HOME/overlap-cache.json (never into a repo). Addresses are stored only as short labels."""
+    path = path or OVERLAP_CACHE
+    me = local_address() if address is None else address
+    fetch_epochs = fetch_epochs or (lambda: api_call("GET", "/api/epochs", need_key=False, timeout=120, retries=2))
+    fetch_answers = fetch_answers or (lambda a: recent_public_answers(a, per_account))
+    eps = _epoch_list(fetch_epochs())
+    accounts = top_accounts_from_epochs(eps, top=top, closes=closes, exclude=me)
+    answers = []
+    for i, a in enumerate(accounts):
+        for r in fetch_answers(a) or []:
+            answers.append({"src": f"top{i + 1}", **r})
+    if me:
+        for r in fetch_answers(me) or []:
+            answers.append({"src": "self", **r})
+    cache = {"fetched_at": clock(), "top": top, "closes": closes, "per_account": per_account,
+             "accounts": len(accounts), "answers": answers,
+             "note": "local only; other agents' answer text. Never commit this file."}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache), encoding="utf-8")
+    return cache
+
+
+def overlap_guard(draft: str, corpus: list, threshold: float = OVERLAP_THRESHOLD, k: int = OVERLAP_K) -> dict:
+    """Compare a draft with every prior answer in `corpus` ([{src, epoch, text}]). Refuse when the share of
+    the draft's k-word shingles found in any ONE prior answer is above `threshold`. Pure."""
+    draft = (draft or "").strip()
+    norm = re.sub(r"\s+", " ", draft.lower())
+    hits = []
+    best = {"overlap": 0.0, "src": None, "epoch": None}
+    for item in corpus or []:
+        txt = str(item.get("text") or "")
+        if not txt.strip():
+            continue
+        if item.get("src", "").startswith("self") and re.sub(r"\s+", " ", txt.lower().strip()) == norm:
+            continue  # the same answer already sent (a resend check belongs to `answer`, not the guard)
+        ov = shingle_containment(draft, txt, k)
+        if ov > best["overlap"]:
+            best = {"overlap": ov, "src": item.get("src"), "epoch": item.get("epoch")}
+        if ov > threshold:
+            hits.append({"src": item.get("src"), "epoch": item.get("epoch"), "txid12": item.get("txid12"), "overlap": round(ov, 3)})
+    hits.sort(key=lambda h: -h["overlap"])
+    refused = bool(hits)
+    return {
+        "refused": refused,
+        "threshold": threshold,
+        "shingle_k": k,
+        "max_overlap": round(best["overlap"], 3),
+        "max_overlap_src": best["src"],
+        "max_overlap_epoch": best["epoch"],
+        "compared": sum(1 for c in (corpus or []) if str(c.get("text") or "").strip()),
+        "compared_top": sum(1 for c in (corpus or []) if str(c.get("src", "")).startswith("top")),
+        "compared_self": sum(1 for c in (corpus or []) if str(c.get("src", "")).startswith("self")),
+        "over_threshold": hits[:10],
+        "verdict": ("REFUSE: rewrite in your own words; over the limit vs " + ", ".join(f"{h['src']} E{h['epoch']} ({h['overlap']:.0%})" for h in hits[:3]))
+                   if refused else "ok",
+    }
+
+
+def overlap_corpus(cache_path: pathlib.Path = None, include_log: bool = True) -> list:
+    cache = load_overlap_cache(cache_path)
+    corpus = list(cache.get("answers") or [])
+    if include_log:
+        corpus += own_answers_from_log()
+    return corpus
+
+
+def cmd_overlap_guard(args: argparse.Namespace) -> None:
+    text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
+    cache_path = pathlib.Path(args.cache).expanduser() if args.cache else OVERLAP_CACHE
+    cache = load_overlap_cache(cache_path)
+    age = overlap_cache_age_h(cache)
+    refreshed = False
+    refresh_error = None
+    if args.refresh or (not args.offline and (age is None or age > args.max_age_h)):
+        try:
+            cache = refresh_overlap_cache(top=args.top, closes=args.closes, per_account=args.per_account, path=cache_path)
+            refreshed, age = True, 0.0
+        except Exception as e:
+            refresh_error = redact(str(e))[:300]
+    rep = overlap_guard(text, overlap_corpus(cache_path), threshold=args.threshold)
+    rep.update({"cache_age_h": age, "refreshed": refreshed, "cache": str(cache_path)})
+    if refresh_error:
+        rep["refresh_error"] = refresh_error
+    if rep["compared_top"] == 0:
+        rep["warning"] = "no top-answer corpus (refresh failed or --offline with no cache); only our own past answers were checked"
+    print(json.dumps(rep, indent=2))
+    if rep["refused"]:
+        sys.exit(2)
+    if rep["compared_top"] == 0 and args.require_top:
+        sys.exit(4)
+
+
+# ---------------------------------------------------------------------------
+# Grading prep: propose scores calibrated to jury consensus, offline calibration, seat-check.
+# Nothing here sends a grade. `grade-plan` writes a queue for `grade-batch`, which only the GRADER
+# node runs, and only once the account is established and the server deals seats.
+# ---------------------------------------------------------------------------
+
+GRADE_PASS_MIN = 2  # a jury pass is treated as a median score of 2 or more
+
+
+def propose_grade(answer: str, words: list, audit: dict = None) -> dict:
+    """Propose a 0-3 score and one-sentence reason for one seat. Calibrated to how juries settle:
+    any coherent on-topic answer that uses the words passes (2); 3 needs the full plain pattern;
+    rule breaks fail. Pure: no network."""
+    audit = audit if isinstance(audit, dict) else audit_assignment_seat({"answer": answer, "words": words})
+    flags = " ".join(audit.get("flags") or [])
+    length = len(answer or "")
+    missing = audit.get("missing_words") or []
+    style = plain_style_score(answer or "")
+    if "PROMPT_INJECTION" in flags:
+        return {"score": 0, "note": "Fails: the answer tries to instruct graders or carries a link instead of a mechanism.", "style": style["style_score"]}
+    if length < 120 or length > 600:
+        return {"score": 0, "note": f"Fails: length {length} is outside the 120-600 character bounds.", "style": style["style_score"]}
+    if len(missing) >= 2:
+        return {"score": 0, "note": f"Fails: required words missing ({', '.join(missing)}).", "style": style["style_score"]}
+    if missing:
+        return {"score": 1, "note": f"Weak: required word '{missing[0]}' is missing.", "style": style["style_score"]}
+    if "KNOWN_BOT_FARM_SIGNATURE" in flags or "CROSS_SEAT_BATCH_CLONE" in flags or "AUTHOR_TEMPLATE_REUSE" in flags:
+        return {"score": 1, "note": "Weak: the text matches a known template or another seat's answer.", "style": style["style_score"]}
+    if style["drift"]:
+        return {"score": 1, "note": "Weak: it does not address what faking identities would cost.", "style": style["style_score"]}
+    b = style["style_breakdown"]
+    if b["attacker_cost_30"] == 30 and b["honest_cost_20"] == 20 and b["failure_mode_15"] == 15 and b["mechanism_20"] == 20:
+        return {"score": 3, "note": "Strong: clear mechanism, attacker cost shown with numbers against the honest cost, and a named failure mode.", "style": style["style_score"]}
+    gap = "attacker cost math" if b["attacker_cost_30"] < 30 else ("honest-agent cost" if b["honest_cost_20"] < 20 else "a failure mode")
+    return {"score": 2, "note": f"Passes: coherent on-topic mechanism using the words, but it lacks {gap}.", "style": style["style_score"]}
+
+
+def calibrate_grades(rows: list) -> dict:
+    """rows: [{answer, words, passed, score?}] where `passed` is the settled jury outcome (and `score` an
+    optional known consensus score). Returns agreement of propose_grade with the consensus. Pure."""
+    n = agree = 0
+    by = {"passed": [0, 0], "failed": [0, 0]}
+    exact = [0, 0]
+    misses = []
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict) or r.get("passed") is None:
+            continue
+        p = propose_grade(str(r.get("answer") or ""), r.get("words") or [])
+        ours = p["score"] >= GRADE_PASS_MIN
+        ok = ours == bool(r["passed"])
+        n += 1
+        agree += ok
+        key = "passed" if r["passed"] else "failed"
+        by[key][0] += ok
+        by[key][1] += 1
+        if r.get("score") is not None:
+            exact[1] += 1
+            exact[0] += int(p["score"] == int(r["score"]))
+        if not ok:
+            misses.append({"row": r.get("id", i), "consensus_passed": bool(r["passed"]), "proposed": p["score"], "note": p["note"]})
+    rate = (agree / n) if n else None
+    return {
+        "rows": n,
+        "agreement": round(rate, 3) if rate is not None else None,
+        "agreement_on_passed": round(by["passed"][0] / by["passed"][1], 3) if by["passed"][1] else None,
+        "agreement_on_failed": round(by["failed"][0] / by["failed"][1], 3) if by["failed"][1] else None,
+        "exact_score_match": round(exact[0] / exact[1], 3) if exact[1] else None,
+        "pass_rule": f"proposed score >= {GRADE_PASS_MIN} counts as pass",
+        "misses": misses[:20],
+    }
+
+
+def plan_grades(seats: list) -> list:
+    """Turn dealt seats into a grade-batch queue [{txid, score, note, epoch}], oldest epoch first. Pure."""
+    audited = audit_assignments_batch(seats or [])
+    queue = []
+    for raw, a in zip(seats or [], audited):
+        txid = raw.get("answer_txid") or raw.get("txid")
+        if not txid:
+            continue
+        p = propose_grade(str(raw.get("answer") or ""), raw.get("words") or [], a)
+        queue.append({"txid": txid, "score": p["score"], "note": p["note"], "epoch": a.get("epoch"), "style": p["style"],
+                      "flags": a.get("flags") or []})
+    queue.sort(key=lambda q: (q["epoch"] if isinstance(q["epoch"], int) else 10**9))
+    return queue
+
+
+def cmd_grade_plan(args: argparse.Namespace) -> None:
+    if args.seats:
+        data = json.loads(pathlib.Path(args.seats).read_text(encoding="utf-8"))
+        seats = data.get("assignments", []) if isinstance(data, dict) else data
+        source = "file"
+    else:
+        res = api_call("GET", "/api/hosted/assignments", query={"sort": "oldest", "limit": 200})
+        seats = res.get("assignments") or []
+        source = "live-read"
+    queue = plan_grades(seats)
+    out = {"sent": 0, "source": source, "seats": len(seats), "queue": queue,
+           "note": "Nothing was sent. Review, then the GRADER node runs `grade-batch --file <out>`; never grade seats you were not dealt."}
+    if args.out:
+        op = pathlib.Path(args.out)
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_text(json.dumps([{k: q[k] for k in ("txid", "score", "note", "epoch")} for q in queue], indent=2) + "\n", encoding="utf-8")
+        out["written_to"] = str(op)
+    print(json.dumps(out, indent=2))
+
+
+def cmd_grade_calibrate(args: argparse.Namespace) -> None:
+    rows = json.loads(pathlib.Path(args.fixtures).read_text(encoding="utf-8"))
+    if isinstance(rows, dict):
+        rows = rows.get("rows") or []
+    rep = calibrate_grades(rows)
+    rep["min_agreement"] = args.min_agreement
+    rep["ok"] = rep["agreement"] is not None and rep["agreement"] >= args.min_agreement
+    print(json.dumps(rep, indent=2))
+    if not rep["ok"]:
+        sys.exit(2)
+
+
+SEAT_CHECK_STATE = POA_DIR / "seat-check.json"
+
+
+def seat_check(address: str, fetch_assignments=None, fetch_me=None, state_path: pathlib.Path = None, clock=time.time) -> dict:
+    """One light read per run: keyless /api/assignments/<addr>/ (has_seat, rows) and, when `fetch_me` is
+    given, the keyed read-only /api/hosted/me `established` flag. Compares with the last run's state so an
+    hourly routine reports only changes. Never grades. Output never contains the address."""
+    state_path = state_path or SEAT_CHECK_STATE
+    fetch_assignments = fetch_assignments or (lambda: _keyless_assignments(address, timeout=20))
+    code, res = fetch_assignments()
+    now = {"checked_at": _iso(clock()), "http": code}
+    if code != 200 or not isinstance(res, dict):
+        now.update({"ok": False, "has_seat": None, "rows": None})
+    else:
+        rows = [r for r in (res.get("assignments") or []) if isinstance(r, dict)]
+        now.update({"ok": True, "has_seat": bool(res.get("has_seat")), "rows": len(rows),
+                    "backlog_rows": sum(1 for r in rows if r.get("backlog")), "open_epoch": res.get("epoch")})
+    if fetch_me is not None:
+        try:
+            me = fetch_me() or {}
+            now["established"] = me.get("established") if isinstance(me, dict) else None
+        except Exception as e:
+            now["established"] = None
+            now["me_error"] = redact(str(e))[:200]
+    prev = load_overlap_cache(state_path)  # same tolerant JSON reader
+    keys = ("has_seat", "rows", "established")
+    changed = bool(now.get("ok")) and any(prev.get(k) != now.get(k) for k in keys if k in now)
+    now["changed"] = changed
+    now["previous"] = {k: prev.get(k) for k in keys if k in prev}
+    if now.get("has_seat") and (now.get("rows") or 0) > 0:
+        now["action"] = "seats dealt: GRADER runs grade-plan, reviews, then grade-batch (oldest first)"
+    elif now.get("established"):
+        now["action"] = "established but no rows dealt yet; check again next run"
+    else:
+        now["action"] = "none"
+    if now.get("ok"):
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({k: now.get(k) for k in ("checked_at", "has_seat", "rows", "established") if k in now}), encoding="utf-8")
+    return now
+
+
+def cmd_seat_check(args: argparse.Namespace) -> None:
+    address = args.address or local_address()
+    if not address:
+        print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
+        sys.exit(2)
+    fetch_me = (lambda: api_call("GET", "/api/hosted/me", timeout=20, retries=1)) if args.keyed else None
+    r = seat_check(address, fetch_me=fetch_me)
+    if args.quiet and r.get("ok") and not r.get("changed"):
+        return
+    print(json.dumps(r, indent=2))
+    if not r.get("ok"):
+        sys.exit(2)
+
+
 def main() -> None:
     for _stream in ("stdout", "stderr"):
         _s = getattr(sys, _stream, None)
@@ -3745,6 +4234,34 @@ def main() -> None:
     p_tour.add_argument("--words", default="", help="Optional comma-separated seed words override (default: live /api/hosted/challenge or edge cache)")
     p_tour.add_argument("--out", default="", help="Write the winning draft to this path (e.g. work/answer-new-10.txt)")
     p_tour.add_argument("--out-epoch", default="", help="Optional second output path (e.g. work/answer-new-13.txt)")
+    p_tour.add_argument("--overlap-cache", default="", help="Overlap-guard cache (default $POA_HOME/overlap-cache.json; build it with `overlap-guard --refresh`)")
+    p_tour.add_argument("--overlap-threshold", type=float, default=OVERLAP_THRESHOLD, help="Refuse a candidate above this 3-word shingle overlap with any one prior answer (default 0.25)")
+    p_tour.add_argument("--no-overlap-guard", action="store_true", help="Skip the overlap guard (not recommended)")
+
+    p_og = sub.add_parser("overlap-guard", help="Refuse a draft sharing >25%% of its 3-word shingles with any one recent top-account answer or our own past answer (keyless; cache in $POA_HOME)")
+    p_og.add_argument("--file", "-f", required=True, help="UTF-8 draft answer file")
+    p_og.add_argument("--threshold", type=float, default=OVERLAP_THRESHOLD, help="Refusal threshold (default 0.25)")
+    p_og.add_argument("--refresh", action="store_true", help="Re-fetch the top accounts' recent public answers now")
+    p_og.add_argument("--offline", action="store_true", help="Never fetch; use the cache and ~/.poa/answers.log only")
+    p_og.add_argument("--max-age-h", type=float, default=OVERLAP_MAX_AGE_H, help="Auto-refresh when the cache is older than this (default 6h, one epoch)")
+    p_og.add_argument("--top", type=int, default=10, help="Top-earning accounts to compare against (default 10)")
+    p_og.add_argument("--closes", type=int, default=5, help="Closes used to rank earners (default 5)")
+    p_og.add_argument("--per-account", type=int, default=6, help="Newest answers per account (default 6)")
+    p_og.add_argument("--cache", default="", help="Cache path (default $POA_HOME/overlap-cache.json)")
+    p_og.add_argument("--require-top", action="store_true", help="Exit 4 when no top-answer corpus could be checked")
+
+    p_gp = sub.add_parser("grade-plan", help="Propose consensus-calibrated scores for dealt seats and write a grade-batch queue (never sends)")
+    p_gp.add_argument("--seats", default="", help="JSON seats file (offline); default: one keyed read of /api/hosted/assignments")
+    p_gp.add_argument("--out", default="", help="Write the queue [{txid, score, note, epoch}] here")
+
+    p_gc = sub.add_parser("grade-calibrate", help="Offline: agreement of grade-plan's scores with settled jury outcomes in a fixtures file")
+    p_gc.add_argument("--fixtures", required=True, help="JSON [{answer, words, passed, score?}]")
+    p_gc.add_argument("--min-agreement", type=float, default=0.76, help="Exit 2 below this agreement (default 0.76)")
+
+    p_sc = sub.add_parser("seat-check", help="Hourly-friendly: one keyless assignments read (+ --keyed established flag); reports only changes with --quiet; never grades")
+    p_sc.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_sc.add_argument("--keyed", action="store_true", help="Also read /api/hosted/me (read-only) for the established flag")
+    p_sc.add_argument("--quiet", action="store_true", help="Print nothing when nothing changed since the last run")
 
     p_ans = sub.add_parser("answer", help="Submit epoch challenge answer from UTF-8 file")
     p_ans.add_argument("--epoch", type=int, default=None, help="Use the cached challenge for this epoch if live reads fail")
@@ -3885,10 +4402,12 @@ def main() -> None:
     p_ro.add_argument("--confirm-min", type=int, default=EXPLORER_MIN_WAIT)
     p_ro.add_argument("--confirm-max", type=int, default=EXPLORER_MAX_WAIT)
 
-    p_tk = sub.add_parser("takeover-check", help="Read-only: should the backup answer this epoch? (6h epochs; PC silence >2h or epoch >1h old with no PC claim)")
+    p_tk = sub.add_parser("takeover-check", help="Read-only: should the backup answer this epoch? (6h epochs; PC silence >2h or epoch >45 min old with no PC claim)")
     p_tk.add_argument("--log", default="", help="Path to LOG.md (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_tk.add_argument("--node", default="antigravity", help="Primary node name (default antigravity)")
     p_tk.add_argument("--hours", type=float, default=2.0, help="PC heartbeat silence threshold in hours (default 2)")
+    p_tk.add_argument("--after-min", type=float, default=float(os.environ.get("POA_TAKEOVER_AFTER_MIN", "45")),
+                      help="Take over when the epoch is older than this many minutes with no PC CLAIM/ANSWERED (default 45, or $POA_TAKEOVER_AFTER_MIN)")
 
     args = parser.parse_args()
     try:
@@ -3957,6 +4476,14 @@ def main() -> None:
             print(json.dumps(report, indent=2))
             if not report["passed"]:
                 sys.exit(2)
+        elif args.command == "overlap-guard":
+            cmd_overlap_guard(args)
+        elif args.command == "grade-plan":
+            cmd_grade_plan(args)
+        elif args.command == "grade-calibrate":
+            cmd_grade_calibrate(args)
+        elif args.command == "seat-check":
+            cmd_seat_check(args)
         elif args.command == "check-tournament":
             if args.words.strip():
                 ch = {"epoch": None, "words": [w.strip() for w in args.words.split(",") if w.strip()], "_via": "--words"}
@@ -3970,6 +4497,7 @@ def main() -> None:
                     else:
                         raise
             words = ch.get("words", [])
+            guard_corpus = [] if args.no_overlap_guard else overlap_corpus(pathlib.Path(args.overlap_cache).expanduser() if args.overlap_cache else None)
             candidates = []
             for fpath in args.files:
                 p = pathlib.Path(fpath)
@@ -3977,15 +4505,22 @@ def main() -> None:
                 rep = check_answer_quality(txt, words)
                 rep["file"] = str(fpath)
                 rep["_text"] = txt
+                if not args.no_overlap_guard:
+                    g = overlap_guard(txt, guard_corpus, threshold=args.overlap_threshold)
+                    rep["overlap_guard"] = {k: g[k] for k in ("refused", "max_overlap", "max_overlap_src", "max_overlap_epoch", "compared_top", "compared_self", "verdict")}
+                    if g["refused"]:
+                        rep["passed"] = False
                 candidates.append(rep)
-            # Rank: clean pass (passed and no inflected words) > passed with inflected > failed; then rubric_score desc, overlap asc, distance from 565 asc
+            # Rank: passed (incl. overlap guard) > on-topic (no drift) > clean pass (no inflected words/warnings);
+            # then combined score (0.6 plain style + 0.4 rubric) desc, overlap asc, distance from 565 asc
             def _rank_key(c):
                 clean_pass = 1 if (c["passed"] and not c["inflected_words"] and not c["warnings"]) else 0
                 any_pass = 1 if c["passed"] else 0
                 return (
-                    clean_pass,
                     any_pass,
-                    c.get("rubric_score", 0),
+                    0 if c.get("drift") else 1,
+                    clean_pass,
+                    c.get("combined_score", c.get("rubric_score", 0)),
                     -c.get("max_shingle_overlap", 1.0),
                     -abs(c.get("length", 0) - 565),
                 )
@@ -4006,6 +4541,10 @@ def main() -> None:
                 "required_words": words,
                 "winner_file": winner["file"] if winner else None,
                 "winner_rubric_score": winner["rubric_score"] if winner else None,
+                "winner_style_score": winner["style_score"] if winner else None,
+                "overlap_guard": ("off" if args.no_overlap_guard else {"threshold": args.overlap_threshold,
+                                  "compared_top": sum(1 for c in guard_corpus if str(c.get("src", "")).startswith("top")),
+                                  "compared_self": sum(1 for c in guard_corpus if str(c.get("src", "")).startswith("self"))}),
                 "written_to": written,
                 "candidates": ranked,
             }
