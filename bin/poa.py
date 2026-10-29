@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.7.0"
+KIT_VERSION = "1.8.0"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1111,6 +1111,110 @@ def hosted_write(send, sleep=time.sleep) -> dict:
         return res
 
 
+# Busy-node receipts (G0 notice 2026-10-29-busy-node-receipts, release v0.60-acceptqueue-buildtx,
+# Oct 29, 2026): when the node is busy, answer and grade may return HTTP 202 with
+# {"job_id", "poll_url": "api/job/<id>", "retry_after_seconds"} instead of the result. 202 means
+# ACCEPTED, not failed. Never resubmit while queued (that returns 409 duplicate_in_flight): wait
+# retry_after_seconds, then GET BASE/ + poll_url until it returns the same body the inline reply
+# would have had. Results stay fetchable about an hour. kind "queued" = sent and accepted, result
+# not known yet: do not resend; read state back on the next run.
+BUSY_PENDING_STATES = ("queued", "pending", "running", "accepted", "in_progress", "processing")
+BUSY_RESULT_KEYS = ("txid", "next_nonce", "error", "result")
+BUSY_POLL_PATH_RE = re.compile(r"^/?api/job/[A-Za-z0-9_.:\-]{1,128}$")
+BUSY_MAX_WAIT_S = float(os.environ.get("POA_BUSY_MAX_WAIT_S", "300"))
+BUSY_STEP_CAP_S = 60
+
+
+def is_busy_receipt(res) -> bool:
+    """True for a 202 busy-node receipt (or a still-pending poll reply), False for a real result."""
+    if not isinstance(res, dict):
+        return False
+    if any(k in res for k in BUSY_RESULT_KEYS):
+        return False
+    status = str(res.get("status") or res.get("state") or "").lower()
+    return bool(res.get("poll_url")) or (bool(res.get("job_id")) and (not status or status in BUSY_PENDING_STATES))
+
+
+def busy_poll_path(res: dict, fallback: str = None) -> str:
+    """Relative /api/job/<id> path from a receipt. Anything else (absolute URL, other host or path)
+    is refused so a receipt can never point the keyed client somewhere new."""
+    pu = str(res.get("poll_url") or "").strip()
+    if not pu and res.get("job_id"):
+        pu = f"api/job/{res['job_id']}"
+    if not pu and fallback:
+        pu = fallback
+    if not BUSY_POLL_PATH_RE.match(pu):
+        raise PoaHTTPError("client", "refused busy-node poll_url (only a relative api/job/<id> path is accepted)")
+    return "/" + pu.lstrip("/")
+
+
+def _busy_wait_s(res: dict) -> float:
+    ra = res.get("retry_after_seconds", res.get("retry_after")) if isinstance(res, dict) else None
+    try:
+        ra = float(ra)
+    except (TypeError, ValueError):
+        ra = 5.0
+    return max(1.0, min(float(BUSY_STEP_CAP_S), ra))
+
+
+def resolve_busy_receipt(res, path: str = "", sleep=None, max_wait: float = None):
+    """Turn a busy-node 202 receipt into the real result by polling its job, never resubmitting.
+    A non-receipt is returned unchanged. Raises PoaHTTPError(kind="queued") if the job is still
+    pending after max_wait seconds or its result is no longer fetchable; callers must not resend."""
+    if not is_busy_receipt(res):
+        return res
+    max_wait = BUSY_MAX_WAIT_S if max_wait is None else max_wait
+    sleep = sleep or time.sleep
+    poll_path = busy_poll_path(res)
+    job_id = res.get("job_id") or poll_path.rsplit("/", 1)[-1]
+    waited = 0.0
+    cur = res
+    while True:
+        step = _busy_wait_s(cur)
+        if waited + step > max_wait:
+            err = PoaHTTPError("queued", f"accepted by a busy node (job {job_id}) on {path}; still pending after "
+                                         f"{waited:.0f}s. Not resubmitting; read back on the next run.", 202)
+            err.job_id, err.poll_path = job_id, poll_path
+            raise err
+        sleep(step)
+        waited += step
+        try:
+            cur = api_call("GET", poll_path, timeout=30, retries=2)
+        except PoaHTTPError as e:
+            if e.status in (404, 410):
+                err = PoaHTTPError("queued", f"busy-node job {job_id} result no longer fetchable ({e.status}); it was "
+                                             f"accepted, so do not resubmit; confirm on the ledger.", e.status)
+                err.job_id, err.poll_path = job_id, poll_path
+                raise err from None
+            raise
+        if not is_busy_receipt(cur):
+            if isinstance(cur, dict):
+                cur = dict(cur)
+                cur["_busy_job"] = {"job_id": job_id, "waited_s": round(waited, 1)}
+            return cur
+        poll_path = busy_poll_path(cur, fallback=poll_path.lstrip("/"))
+
+
+def is_in_flight(e) -> bool:
+    """409 duplicate_in_flight: an earlier send of this write is still queued (sent, not failed)."""
+    return getattr(e, "status", None) == 409 and "duplicate_in_flight" in str(e).lower()
+
+
+def busy_aware(send, path: str = "", sleep=None):
+    """Wrap one hosted write so a 202 receipt is polled to its result and 409 duplicate_in_flight
+    becomes kind "queued" (accepted earlier, do not resend)."""
+    def run():
+        try:
+            res = send()
+        except PoaHTTPError as e:
+            if is_in_flight(e):
+                raise PoaHTTPError("queued", f"an earlier send is still queued on a busy node ({path}); "
+                                             f"not resubmitting: {str(e)[:200]}", 409) from None
+            raise
+        return resolve_busy_receipt(res, path=path, sleep=sleep)
+    return run
+
+
 def submit_answer_safely(text: str, epoch) -> dict:
     """Send the answer ONCE for this epoch and record it in ~/.poa/cache/epoch-<n>.json.
 
@@ -1127,7 +1231,7 @@ def submit_answer_safely(text: str, epoch) -> dict:
     save_epoch_cache(epoch, sent_at=now, send_outcome="sending", answer_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
     try:
         try:
-            res = hosted_write(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1))
+            res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1), "/api/hosted/answer"))
         except PoaHTTPError as e:
             if e.kind == "network" and mcp_fallback_enabled():
                 res = hosted_write(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60))
@@ -1138,6 +1242,11 @@ def submit_answer_safely(text: str, epoch) -> dict:
         return {"landed": True, "how": "response", "result": res, "txid": txid}
     except PoaHTTPError as e:
         low = str(e).lower()
+        if e.kind == "queued":
+            save_epoch_cache(epoch, send_outcome="queued", landed=None, error=str(e)[:300],
+                             busy_job=getattr(e, "job_id", None))
+            return {"landed": None, "how": "queued", "kind": "queued", "error": str(e)[:300],
+                    "note": "accepted by a busy node; not resending. Confirm on the next run."}
         if e.kind in ("nonce", "nonce-lag", "busy"):
             save_epoch_cache(epoch, send_outcome="rejected", landed=False, error=str(e)[:300])
             return {"landed": False, "how": e.kind, "error": str(e)[:300], "kind": e.kind,
@@ -1187,7 +1296,7 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
     landed: True (assignments confirms) / None (sent or ambiguous, not yet confirmed) / False (rejected)."""
     sent = None
     try:
-        res = hosted_write(lambda: api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1))
+        res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1), "/api/hosted/grade"))
         sent = {"how": "response", "result": res}
     except PoaHTTPError as e:
         low = str(e).lower()
@@ -1200,7 +1309,10 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
             return {"landed": False, "how": "rate-limited", "kind": "rate-limited", "error": str(e)[:300],
                     "retry_after": e.retry_after if e.retry_after is not None else GRADE_RATE_LIMIT_DEFAULT_WAIT_S,
                     "note": "not landed (global grade ceiling); safe to grade this seat again after retry_after seconds"}
-        if "duplicate sealed grade" in low or "already graded" in low:
+        if e.kind == "queued":
+            # Accepted by a busy node; the assignments read-back below decides, never a resend.
+            sent = {"how": "queued", "error": str(e)[:300], "kind": "queued"}
+        elif "duplicate sealed grade" in low or "already graded" in low:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
             try:

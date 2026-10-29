@@ -172,8 +172,8 @@ class NonceTests(unittest.TestCase):
     def test_mine_and_vote_paths_use_the_gate(self):
         src = (pathlib.Path(__file__).resolve().parents[1] / "bin" / "poa.py").read_text()
         for needle in ('hosted_write(lambda: api_call("GET", "/api/hosted/mine"',
-                       'hosted_write(lambda: api_call("POST", "/api/hosted/grade"',
-                       'hosted_write(lambda: api_call("POST", "/api/hosted/answer"',
+                       'hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/grade"',
+                       'hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer"',
                        'res = hosted_write(lambda: api_call(\n                "GET",\n                "/api/hosted/vote"'):
             self.assertIn(needle, src)
 
