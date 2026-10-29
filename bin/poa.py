@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.0"
+KIT_VERSION = "1.8.1"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1135,6 +1135,24 @@ def is_busy_receipt(res) -> bool:
     return bool(res.get("poll_url")) or (bool(res.get("job_id")) and (not status or status in BUSY_PENDING_STATES))
 
 
+def _same_origin_poll_path(pu: str) -> str:
+    """MCP receipts (G0 notice 2026-10-29-mcp-queue, release v0.64.1-mcpdocs) may carry an absolute
+    poll_url. Accept it only when scheme and host are exactly BASE_URL's and there is no query,
+    fragment or userinfo; return its path so the normal relative-path check applies. Any other
+    absolute URL is returned unchanged and then refused."""
+    if "://" not in pu:
+        return pu
+    try:
+        u, b = urllib.parse.urlsplit(pu), urllib.parse.urlsplit(BASE_URL)
+    except ValueError:
+        return pu
+    if (u.scheme.lower(), (u.netloc or "").lower()) != (b.scheme.lower(), (b.netloc or "").lower()):
+        return pu
+    if u.query or u.fragment or "@" in (u.netloc or ""):
+        return pu
+    return u.path.lstrip("/")
+
+
 def busy_poll_path(res: dict, fallback: str = None) -> str:
     """Relative /api/job/<id> path from a receipt. Anything else (absolute URL, other host or path)
     is refused so a receipt can never point the keyed client somewhere new."""
@@ -1143,6 +1161,7 @@ def busy_poll_path(res: dict, fallback: str = None) -> str:
         pu = f"api/job/{res['job_id']}"
     if not pu and fallback:
         pu = fallback
+    pu = _same_origin_poll_path(pu)
     if not BUSY_POLL_PATH_RE.match(pu):
         raise PoaHTTPError("client", "refused busy-node poll_url (only a relative api/job/<id> path is accepted)")
     return "/" + pu.lstrip("/")
@@ -1341,7 +1360,9 @@ def submit_answer_safely(text: str, epoch) -> dict:
             res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1), "/api/hosted/answer"))
         except PoaHTTPError as e:
             if e.kind == "network" and mcp_fallback_enabled():
-                res = hosted_write(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60))
+                # MCP poa_answer goes through the node queue too (notice 2026-10-29-mcp-queue):
+                # a {job_id, poll_url} reply is accepted, so poll it, never resend.
+                res = hosted_write(busy_aware(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60), "mcp:poa_answer"))
             else:
                 raise
         txid = res.get("txid") or res.get("id") if isinstance(res, dict) else None
@@ -1425,9 +1446,14 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
             try:
-                sent = {"how": "mcp", "result": hosted_write(lambda: mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60))}
+                sent = {"how": "mcp", "result": hosted_write(busy_aware(lambda: mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60), "mcp:poa_grade"))}
             except PoaHTTPError as e2:
-                sent = {"how": "unknown", "error": str(e2)[:300]}
+                if e2.kind == "queued":
+                    # Accepted via the MCP queue; the assignments read-back decides, never a resend.
+                    sent = {"how": "queued", "error": str(e2)[:300], "kind": "queued"}
+                    remember_busy_job(e2, "/api/hosted/grade", intent=f"{txid}:{score}:{reasoning}", assignment=txid)
+                else:
+                    sent = {"how": "unknown", "error": str(e2)[:300]}
         elif e.kind == "halted":
             return {"landed": False, "how": "halted", "error": str(e)[:300], "kind": "halted"}
         elif e.kind in ("auth", "client"):
