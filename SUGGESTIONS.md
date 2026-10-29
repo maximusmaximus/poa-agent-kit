@@ -2432,7 +2432,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Why:** An outside post floats adding EVM support to the Proof of Agent network so it becomes interoperable with most of the industry (EVM wallets, tooling and bridges), instead of staying a standalone chain.
 - **Source:** https://x.com/Jakegallen/status/2115828252598219170
 - **Author:** @Jakegallen (on X)
-- **Support:** 1
+- **Support:** 2 (also @Ethanoshi on X at https://x.com/Ethanoshi/status/2115850185050132774, saying EVM interoperability could unlock big network effects)
 - **Status:** proposed
 - **Date:** 2026-10-29
 
