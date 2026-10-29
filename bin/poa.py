@@ -1185,6 +1185,7 @@ def resolve_busy_receipt(res, path: str = "", sleep=None, max_wait: float = None
                 err = PoaHTTPError("queued", f"busy-node job {job_id} result no longer fetchable ({e.status}); it was "
                                              f"accepted, so do not resubmit; confirm on the ledger.", e.status)
                 err.job_id, err.poll_path = job_id, poll_path
+                err.expired = True
                 raise err from None
             raise
         if not is_busy_receipt(cur):
@@ -1215,6 +1216,105 @@ def busy_aware(send, path: str = "", sleep=None):
     return run
 
 
+# Busy-job store (SUGGESTIONS #79, Oct 29, 2026): the kit stops polling a 202 receipt after
+# POA_BUSY_MAX_WAIT_S, but job results stay fetchable about an hour. So a still-queued job is saved
+# to $POA_HOME/busy-jobs.json (0600, never a repo or a log) with its epoch, route and a hash of
+# the original intent, and the next run polls it ONCE before deciding anything. A done job records
+# the txid and drops the job id. A 404/410 turns the record into a tombstone: outcome unknown until
+# an authoritative read (/me, /challenge answered=true, the explorer) settles it. Never a resend.
+# The job id is a bearer token for its lifetime, so output only ever shows its first 6 characters.
+BUSY_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+BUSY_JOBS_FILE = "busy-jobs.json"
+
+
+def _busy_jobs_path() -> pathlib.Path:
+    return POA_DIR / BUSY_JOBS_FILE
+
+
+def load_busy_jobs() -> list:
+    f = _busy_jobs_path()
+    try:
+        data = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else []
+    except Exception:
+        return []
+    return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+
+def save_busy_jobs(rows: list) -> None:
+    POA_DIR.mkdir(parents=True, exist_ok=True)
+    f = _busy_jobs_path()
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    lock_file_permissions(tmp)
+    os.replace(tmp, f)
+
+
+def mask_job_id(job_id) -> str:
+    j = str(job_id or "")
+    return (j[:6] + "…") if j else ""
+
+
+def remember_busy_job(err, route: str, epoch=None, intent: str = "", assignment: str = None) -> dict:
+    """Save a still-queued (or already-expired) busy job so a later run can resolve it. No-op
+    without a job id (e.g. a bare 409 duplicate_in_flight)."""
+    job_id = str(getattr(err, "job_id", "") or "")
+    if not job_id:
+        return {}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rows = [r for r in load_busy_jobs() if r.get("job_id") != job_id]
+    rec = {"job_id": job_id, "route": route, "epoch": epoch, "assignment": assignment,
+           "intent_sha256": hashlib.sha256((intent or "").encode("utf-8")).hexdigest(),
+           "saved_at": now, "state": "tombstone" if getattr(err, "expired", False) else "queued",
+           "last_poll_at": None, "last_poll": None, "txid": None}
+    rows.append(rec)
+    save_busy_jobs(rows)
+    return rec
+
+
+def check_busy_jobs(epoch=None, poll=None) -> list:
+    """Poll each saved queued job ONCE (optionally only one epoch's). Never resends anything.
+    Returns per-job outcomes: done (txid), queued, tombstone (expired, outcome unknown), invalid-id."""
+    poll = poll or (lambda path: api_call("GET", path, timeout=30, retries=1))
+    rows = load_busy_jobs()
+    out = []
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for r in rows:
+        if epoch is not None and r.get("epoch") != epoch:
+            continue
+        if r.get("state") != "queued":
+            out.append(dict(r, job_id=mask_job_id(r.get("job_id")))); continue
+        jid = str(r.get("job_id") or "")
+        if not BUSY_JOB_ID_RE.match(jid):
+            r["state"] = "invalid-id"
+            r["last_poll"] = "job id is not 32 lowercase hex; not polled"
+            out.append(dict(r, job_id=mask_job_id(jid))); continue
+        r["last_poll_at"] = now
+        try:
+            res = poll(f"/api/job/{jid}")
+        except PoaHTTPError as e:
+            if e.status in (404, 410):
+                r["state"] = "tombstone"
+                r["last_poll"] = f"HTTP {e.status}: job result expired; outcome unknown until /me, /challenge or the explorer settles it"
+            else:
+                r["last_poll"] = f"poll failed ({e.kind}); still queued, try again next run"
+            out.append(dict(r, job_id=mask_job_id(jid))); continue
+        if is_busy_receipt(res):
+            r["last_poll"] = "still queued"
+        elif isinstance(res, dict) and res.get("error"):
+            r["state"] = "failed"
+            r["last_poll"] = redact(str(res.get("error")))[:200]
+            r["job_id"] = None
+        else:
+            txid = (res.get("txid") or res.get("id")) if isinstance(res, dict) else None
+            r["state"], r["txid"], r["last_poll"] = "done", txid, "done"
+            r["job_id"] = None  # resolved: the bearer id is no longer needed, so drop it
+            if r.get("route") == "/api/hosted/answer" and r.get("epoch") is not None:
+                save_epoch_cache(r["epoch"], send_outcome="accepted", landed=True, txid_answer=txid)
+        out.append(dict(r, job_id=mask_job_id(jid)))
+    save_busy_jobs(rows)
+    return out
+
+
 def submit_answer_safely(text: str, epoch) -> dict:
     """Send the answer ONCE for this epoch and record it in ~/.poa/cache/epoch-<n>.json.
 
@@ -1224,6 +1324,13 @@ def submit_answer_safely(text: str, epoch) -> dict:
     MCP is used only when POA_MCP_FALLBACK=1 and REST failed before reaching the server (network).
     """
     cache = load_epoch_cache(epoch)
+    if cache.get("send_outcome") == "queued" and any(r.get("epoch") == epoch and r.get("state") == "queued" for r in load_busy_jobs()):
+        # #79: poll the saved busy job once before anything else; it can only settle, never resend.
+        for r in check_busy_jobs(epoch):
+            if r.get("route") == "/api/hosted/answer" and r.get("state") == "done":
+                return {"landed": True, "how": "busy_job", "txid": r.get("txid"),
+                        "note": f"queued answer for epoch {epoch} resolved from its saved busy job; not resending"}
+        cache = load_epoch_cache(epoch)
     if cache.get("sent_at") and cache.get("send_outcome") not in ("halted", "rejected", "stale"):
         return {"landed": cache.get("landed"), "how": "sent_before", "note": f"already sent for epoch {epoch} at {cache['sent_at']} ({cache.get('send_outcome')}); not resending",
                 "txid": cache.get("txid_answer")}
@@ -1245,6 +1352,7 @@ def submit_answer_safely(text: str, epoch) -> dict:
         if e.kind == "queued":
             save_epoch_cache(epoch, send_outcome="queued", landed=None, error=str(e)[:300],
                              busy_job=getattr(e, "job_id", None))
+            remember_busy_job(e, "/api/hosted/answer", epoch=epoch, intent=text)
             return {"landed": None, "how": "queued", "kind": "queued", "error": str(e)[:300],
                     "note": "accepted by a busy node; not resending. Confirm on the next run."}
         if e.kind in ("nonce", "nonce-lag", "busy"):
@@ -1312,6 +1420,7 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
         if e.kind == "queued":
             # Accepted by a busy node; the assignments read-back below decides, never a resend.
             sent = {"how": "queued", "error": str(e)[:300], "kind": "queued"}
+            remember_busy_job(e, "/api/hosted/grade", intent=f"{txid}:{score}:{reasoning}", assignment=txid)
         elif "duplicate sealed grade" in low or "already graded" in low:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
@@ -3316,6 +3425,25 @@ def print_intake(r: dict) -> None:
     print(r["note"])
 
 
+def cmd_jobs(args: argparse.Namespace) -> None:
+    """List saved busy-node jobs; with --check, poll each queued one once (never resends)."""
+    rows = check_busy_jobs(args.epoch) if args.check else [dict(r, job_id=mask_job_id(r.get("job_id"))) for r in load_busy_jobs()
+                                                           if args.epoch is None or r.get("epoch") == args.epoch]
+    if args.prune:
+        keep = [r for r in load_busy_jobs() if r.get("state") in ("queued", "tombstone")]
+        save_busy_jobs(keep)
+    if args.json:
+        print(json.dumps({"ok": True, "jobs": rows}, indent=2)); return
+    if not rows:
+        print("jobs: no saved busy-node jobs"); return
+    for r in rows:
+        what = f"epoch {r.get('epoch')} answer" if r.get("route") == "/api/hosted/answer" else f"grade {str(r.get('assignment') or '')[:10]}"
+        tx = f" txid {r['txid']}" if r.get("txid") else ""
+        print(f"{r.get('state'):10} {what:22} job {r.get('job_id') or '-':8} saved {str(r.get('saved_at'))[:19]}{tx}  {r.get('last_poll') or ''}")
+    if any(r.get("state") == "tombstone" for r in rows):
+        print("tombstone = the job result expired before we read it. Outcome unknown, NOT unsent: check `answer-status`/`me` first, and resend identical text once only if a fresh read still says unanswered.")
+
+
 def cmd_intake(args: argparse.Namespace) -> None:
     try:
         epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
@@ -4855,6 +4983,12 @@ def main() -> None:
     p_in.add_argument("--json", action="store_true", help="JSON output")
     p_in.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_jb = sub.add_parser("jobs", help="Saved busy-node (202) jobs: --check polls each queued job once (done / still queued / tombstone when expired); never resends")
+    p_jb.add_argument("--check", action="store_true", help="Poll each queued job once and update the store")
+    p_jb.add_argument("--epoch", type=int, default=None, help="Only this epoch's jobs")
+    p_jb.add_argument("--prune", action="store_true", help="Drop done/failed/invalid rows, keep queued and tombstones")
+    p_jb.add_argument("--json", action="store_true", help="JSON output (job ids masked)")
+
     p_et = sub.add_parser("epoch-time", help="Keyless: every epoch-counted setting (TTLs, vesting, suspensions) in hours/days at nominal and observed close cadence, plus next close estimate")
     p_et.add_argument("--window", type=int, default=8, help="Close gaps to average for the observed cadence (default 8; pauses excluded)")
     p_et.add_argument("--json", action="store_true", help="JSON output")
@@ -5160,6 +5294,8 @@ def main() -> None:
             cmd_join_pow(args)
         elif args.command == "intake":
             cmd_intake(args)
+        elif args.command == "jobs":
+            cmd_jobs(args)
         elif args.command == "epoch-time":
             cmd_epoch_time(args)
         elif args.command == "close-pull":
