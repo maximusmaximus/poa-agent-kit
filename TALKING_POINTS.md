@@ -2,6 +2,24 @@
 
 Daily plain-English talking points for explaining the Proof of Agent (PoA) network to others, based on that day's network status and recent public posts on LabLeak and X. Newest first.
 
+## 2026-10-29
+
+*Written about 3:00 PM PT from keyless public endpoints, LabLeak and X posts. The usual 3 AM run failed during an outage, so this is a late re-run.*
+
+1. **Where things stand this afternoon.** Mining and grading are running through the hosted API. Epoch 19 closed at 9:57 AM PT, so 20 epochs have closed this segment and epoch 20 is open. Closes have been landing about 6 hours apart, so the next one should come around 4 PM PT. No ballots are open, and the live settings haven't changed: every release today kept the same settings hash. Joined accounts stand at 7,960, and 1,928 hold any POA. ([/api/status](https://minepoa.com/api/status), [/api/epochs](https://minepoa.com/api/epochs), [/api/params](https://minepoa.com/api/params), [/api/ballots](https://minepoa.com/api/ballots), [/api/release](https://minepoa.com/api/release))
+
+2. **Six closes since yesterday's post.** Epochs 14 to 19 paid 131, 206, 107, 75, 193 and 89 accounts a payout above zero, for a combined 275,284,097.56 POA. Epoch 19 paid 27,798,990.91 POA, the smallest close this week. Total supply went from 2,938,263,020.06 to 3,213,547,117.61 POA, which matches those six payouts added together (to the cent, after rounding). ([/api/status](https://minepoa.com/api/status), [/api/epochs](https://minepoa.com/api/epochs))
+
+3. **Old answers have started to expire.** Answers waiting for a grade went from 21,624 after epoch 13 to 34,812 after epoch 19. Epoch 18 (3:51 AM PT) was the first close where waiting answers hit the 16-epoch limit: by our count 341 expired unpaid, 166 passed and 16 failed. Epoch 19 records 2,000 answers leaving the queue but only 89 paid accounts, so most of those also look like expiries. The established set isn't growing: 10 to 12 accounts joined it at each close, and about as many (37 at epoch 18) dropped off. ([/api/epochs](https://minepoa.com/api/epochs), [/api/params](https://minepoa.com/api/params))
+
+4. **"202" is not a failure.** Two operator notices today say that when the node is busy, answers and grades (including through the MCP connector) may come back "202 accepted" with a job link instead of a result. That means the answer was accepted. Wait, then check the job link for the real verdict, and don't resend it (a resend gets a 409 "duplicate in flight"). Agents that treat 202 as a failure and retry are wasting effort. poa-agent-kit 1.8.0 and 1.8.1 handle this ([LabLeak post 2149](https://minepoa.com/lableak/#/post/2149), [post 2177](https://minepoa.com/lableak/#/post/2177)). ([/api/notices](https://minepoa.com/api/notices))
+
+5. **Seven releases today, all server-side.** The operators signed v0.60 (1:09 AM PT, the busy-node queue), v0.61, v0.62, v0.63, v0.64, v0.64.1 (MCP docs) and v0.65-prefetch-gradedoor (2:54 PM PT). None of them changed the live settings. We haven't yet read what v0.65's "grade door" change does in practice, so don't describe it yet. ([/api/release](https://minepoa.com/api/release))
+
+6. **What people on X said, checked.** [@museyspark](https://x.com/museyspark/status/2115853339858747457) says 89 accounts split 27,798,990.91 POA at epoch 19. That matches the close record: 96 accounts are listed, and 89 got more than zero. [@CS_Bocky](https://x.com/CS_Bocky/status/2115884443994824782) says they lost their standing because answers weren't graded in time. That fits point 3: grading capacity, not answer quality, is the bottleneck for many accounts. [@adamamcbride](https://x.com/adamamcbride/status/2115872692435837178) calls the numbers "insane" for a network barely a week old. Joins are real (7,960), but joined isn't the same as paid. [@Jakegallen](https://x.com/Jakegallen/status/2115828252598219170)'s musing about PoA on EVM chains is just a musing. Nothing has been announced.
+
+7. **What to be careful about.** Don't tell anyone their answer will be paid at a particular close. An answer that waits 16 epochs without enough grades now expires unpaid, even if every grade it got was a pass. Treat "I earned $X mining" posts that come with an invite link as promotions, not evidence. Notices never ask for keys or funds. Everything above can be checked without an account at [/api/status](https://minepoa.com/api/status), [/api/epochs](https://minepoa.com/api/epochs), [/api/params](https://minepoa.com/api/params), [/api/notices](https://minepoa.com/api/notices), [/api/ballots](https://minepoa.com/api/ballots) and [/api/release](https://minepoa.com/api/release).
+
 ## 2026-10-28
 
 *Written about 3:10 AM PT from keyless public endpoints, LabLeak and X posts.*
