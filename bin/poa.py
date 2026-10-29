@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.1"
+KIT_VERSION = "1.8.2"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -805,7 +805,77 @@ def explorer_find_answer(address: str, epoch, txid: str = None) -> dict:
             "note": "not listed on the explorer address view: unknown, not absent. Do not resend; /challenge `answered` decides."}
 
 
+# Rejected-receipt codes (go.md "READING A REJECTED RECEIPT", server release v0.66-ipfix-receipts, Oct 29, 2026).
+# A rejected tx is final for that txid: never resend the same tx. The action says what to do instead.
+REJECTED_RECEIPT_ACTIONS = {
+    "nonce_slot_used": "rebuild the tx with next_nonce and a fresh ts, then submit the NEW tx",
+    "bad_nonce": "rebuild the tx with next_nonce and a fresh ts, then submit the NEW tx",
+    "off_panel": "re-fetch your assignments (panels redraw every epoch close) and grade only those",
+    "duplicate_grade": "you already graded it; move on",
+    "bad_stamp": "mine the answer stamp after choosing the nonce, then sign",
+}
+
+
+def node_receipt(txid: str, timeout: float = 20):
+    """Keyless GET /api/receipt/<txid>. Returns the receipt dict, {"status": "unknown-txid"} on a direct 404,
+    or None when unreadable. Never resends anything; the key is never sent."""
+    txid = (txid or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8,128}", txid):
+        return None
+    txlookup_slot()
+    try:
+        r = api_call("GET", f"/api/receipt/{txid}", need_key=False, timeout=timeout, retries=1)
+    except PoaHTTPError as e:
+        if e.status == 404:
+            return {"status": "unknown-txid"}
+        if e.status in (429, 503):
+            txlookup_mark_negative(txid, e.status, e.retry_after, why="api/receipt")
+        return None
+    except Exception:
+        return None
+    return r if isinstance(r, dict) else None
+
+
+def rejected_receipt_result(txid: str, rc: dict) -> dict:
+    """Shape a node receipt with status 'rejected' into a write_receipt result (outcome: rejected, never resend)."""
+    code = rc.get("code")
+    out = {"txid": txid, "outcome": "rejected", "resend_ok": False, "code": code, "error": rc.get("error"),
+           "hint": rc.get("hint"), "action": REJECTED_RECEIPT_ACTIONS.get(code) or "follow the hint",
+           "note": "the node rejected this tx. Do NOT resubmit the same tx; follow the hint/action."}
+    for k in ("nonce", "next_nonce"):
+        if rc.get(k) is not None:
+            out[k] = rc.get(k)
+    return out
+
+
 def write_receipt(txid: str, timeout: float = 20) -> dict:
+    """Explorer receipt, then (if the explorer doesn't show it landed) the node's /api/receipt for a rejection."""
+    res = _explorer_write_receipt(txid, timeout=timeout)
+    # Only a direct explorer 404 asks the node: redirects, 429/503, timeouts and cached misses stay `unknown`
+    # without another lookup (the tx-lookup caps and 60 s miss cache still apply).
+    if res.get("outcome") != "not-found":
+        return res
+    rc = node_receipt(res.get("txid") or txid, timeout=timeout)
+    if not isinstance(rc, dict):
+        return res
+    st = rc.get("status")
+    if st == "rejected":
+        return rejected_receipt_result(res.get("txid") or txid, rc)
+    if st == "included":
+        out = {"txid": res.get("txid") or txid, "outcome": "landed-final" if rc.get("checkpoint_covered") else "landed-pending",
+               "resend_ok": False, "type": rc.get("type"), "source": "api/receipt",
+               "note": "the node has this tx (explorer had not shown it yet); do not resend"}
+        if rc.get("next_nonce") is not None:
+            out["next_nonce"] = rc.get("next_nonce")
+        return out
+    if st == "unknown-txid" and res.get("outcome") == "not-found":
+        res["node_receipt"] = "404 unknown txid"
+        res["note"] = ("explorer and node both say unknown txid: the node never received it. Re-submit it ONCE "
+                       "(after the 60 s miss cache), don't poll forever.")
+    return res
+
+
+def _explorer_write_receipt(txid: str, timeout: float = 20) -> dict:
     """Keyless write receipt for one txid. outcome: landed-final | landed-pending | not-found | unknown.
     A timeout, outage, network error or ANY 3xx redirect is ALWAYS `unknown` (never failed); only a direct 404 is `not-found`.
     Redirects are not followed: the explorer tx index misses ~epoch 5 to pre-restart epoch 10 and answers 307 for those
@@ -5272,7 +5342,7 @@ def main() -> None:
         elif args.command == "receipt":
             res = [write_receipt(t, timeout=args.timeout) for t in args.txid]
             print(json.dumps(res[0] if len(res) == 1 else res, indent=2, default=str))
-            codes = {"landed-final": 0, "landed-pending": 0, "not-found": 4, "unknown": 3, "invalid": 2}
+            codes = {"landed-final": 0, "landed-pending": 0, "not-found": 4, "unknown": 3, "invalid": 2, "rejected": 5}
             sys.exit(max(codes[r["outcome"]] for r in res))
         elif args.command == "answer-status":
             cached = load_epoch_cache(args.epoch)

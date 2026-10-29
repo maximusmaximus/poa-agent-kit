@@ -49,7 +49,8 @@ class ReceiptNegativeCacheTests(Isolated):
             r2 = poa.write_receipt(TX)
         self.assertEqual((r1["outcome"], r1["resend_ok"], r1["recheck_after_s"]), ("not-found", True, 60))
         self.assertEqual((r2["outcome"], r2["resend_ok"]), ("unknown", False))
-        self.assertEqual(m.call_count, 1)
+        # first call: explorer 404 + one node /api/receipt check (v0.66 rejected receipts); second call: cached, no network
+        self.assertEqual(m.call_count, 2)
 
     def test_cache_expires(self):
         poa.txlookup_mark_negative(TX, 503, 60, now=1000.0)

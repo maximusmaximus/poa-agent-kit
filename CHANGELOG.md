@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 (kit 1.8.2)
+- **Rejected receipts (server release `v0.66-ipfix-receipts`, signed 3:54 PM PT Oct 29, 2026; go.md section "READING A REJECTED RECEIPT").** `GET /api/receipt/<txid>` now returns `{"status":"rejected","error","code","hint","from","nonce","next_nonce"}` for a tx the node refused. `write_receipt` (the `receipt` command) asks the node once, keylessly, when the explorer answers 404, and reports a rejection as outcome `rejected` (exit 5, `resend_ok: false`) with `code`, `hint`, `nonce`, `next_nonce` and an `action` for the known codes (`nonce_slot_used`, `bad_nonce`, `off_panel`, `duplicate_grade`, `bad_stamp`). A node `included` receipt is reported as landed. If both say unknown txid, the note says to re-submit once. Redirects, 429/503, timeouts and cached misses still return `unknown` without a second lookup; the shared tx-lookup window and 60 s miss cache apply. The receipt's sender address is not echoed.
+- `KIT_VERSION = "1.8.2"`. Tests: `tests/test_rejected_receipts.py` (mocked responses only).
+
 ## 2026-10-29 (kit 1.8.1)
 - **MCP queued results (operator notice `2026-10-29-mcp-queue`, release `v0.64.1-mcpdocs`, signed 1:31 PM PT Oct 29, 2026).** MCP `poa_answer` and `poa_grade` now go through the node queue and may return `{job_id, poll_url}` instead of the result. The kit's MCP fallback (off unless `POA_MCP_FALLBACK=1`) used to take that reply as a landed write; it now runs through `busy_aware`, so the job is polled (key in the header only, redirects refused) and a still-queued, expired or `409 duplicate_in_flight` job is reported as `kind: queued` and never resent. Queued MCP grades are saved to the busy-job store like REST ones.
 - `busy_poll_path` accepts an absolute `poll_url` only when its scheme and host equal `POA_BASE_URL` exactly and it has no query, fragment or userinfo; it is reduced to the relative `/api/job/<id>` path. Any other absolute URL is still refused without contact.
