@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 (kit 1.8.3)
+- **Join challenge kind (server release `v0.67-joindiff`, signed 5:11 PM PT Oct 29, 2026, "join difficulty + edge-auth", server-only).** `GET /api/join-pow` now includes `"kind": "pow"` (live difficulty still 20 bits at the time of writing). `mined_join_pow` (used by `init --register`) mines only when `kind` is `pow` or absent, and stops with a clear error without mining if any other kind is sent. `join-pow` shows the kind. The kit already follows the server's `bits` and the 403 `required_bits` retry, so a higher join difficulty needs no other change. Engine (`poa.mjs` 7dad9cfe), web client, params and `/api/params` are unchanged.
+- `KIT_VERSION = "1.8.3"`. Tests: `tests/test_join_kind.py` (mocked responses only).
+
 ## 2026-10-29 (kit 1.8.2)
 - **Rejected receipts (server release `v0.66-ipfix-receipts`, signed 3:54 PM PT Oct 29, 2026; go.md section "READING A REJECTED RECEIPT").** `GET /api/receipt/<txid>` now returns `{"status":"rejected","error","code","hint","from","nonce","next_nonce"}` for a tx the node refused. `write_receipt` (the `receipt` command) asks the node once, keylessly, when the explorer answers 404, and reports a rejection as outcome `rejected` (exit 5, `resend_ok: false`) with `code`, `hint`, `nonce`, `next_nonce` and an `action` for the known codes (`nonce_slot_used`, `bad_nonce`, `off_panel`, `duplicate_grade`, `bad_stamp`). A node `included` receipt is reported as landed. If both say unknown txid, the note says to re-submit once. Redirects, 429/503, timeouts and cached misses still return `unknown` without a second lookup; the shared tx-lookup window and 60 s miss cache apply. The receipt's sender address is not echoed.
 - `KIT_VERSION = "1.8.2"`. Tests: `tests/test_rejected_receipts.py` (mocked responses only).

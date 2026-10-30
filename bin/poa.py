@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.2"
+KIT_VERSION = "1.8.3"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4130,7 +4130,7 @@ def cmd_reopen(args: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------------------
 # Admission proof-of-work (server release v1.3-doorpow, Oct 26 2026)
-# GET /api/join-pow -> {challenge, bits, expires_ts, single_use, required, algo}. Find a string nonce
+# GET /api/join-pow -> {challenge, kind, bits, expires_ts, single_use, required, algo} (kind since v0.67-joindiff). Find a string nonce
 # (<= 64 chars) such that sha256(utf8(challenge + ":" + nonce)) has `bits` leading ZERO BITS, then send
 # {"pow": {"challenge": ..., "nonce": ...}} in the register / join request body. Proofs are single-use;
 # a rejected join answers 403 with required_bits / get_challenge, so fetch a fresh challenge and re-mine.
@@ -4174,6 +4174,11 @@ def fetch_join_pow() -> dict:
 def mined_join_pow(pow_info: dict = None, now_fn=time.time) -> dict:
     """Fetch (unless given) and solve one admission challenge. Returns the body fragment {"challenge", "nonce"}."""
     info = pow_info or fetch_join_pow()
+    kind = info.get("kind")
+    if kind is not None and kind != "pow":
+        # Since v0.67-joindiff (Oct 29 2026) the challenge carries a "kind" field. Only "pow" is
+        # documented; never guess at a different admission scheme. Stop and say so instead.
+        raise RuntimeError(f"join challenge kind {str(kind)[:40]!r} is not 'pow'; re-read go.md before joining")
     bits = int(info.get("bits") or 0)
     exp = info.get("expires_ts")
     deadline = float(exp) - 2 if isinstance(exp, (int, float)) else None
@@ -4230,7 +4235,7 @@ def cmd_join_pow(args: argparse.Namespace) -> None:
     """Keyless: show the current admission proof-of-work requirement; --solve times one local solve (never submitted)."""
     info = fetch_join_pow()
     bits = int(info.get("bits") or 0)
-    out = {"required": info.get("required"), "bits": bits, "single_use": info.get("single_use"),
+    out = {"required": info.get("required"), "kind": info.get("kind", "pow"), "bits": bits, "single_use": info.get("single_use"),
            "expires_ts": info.get("expires_ts"), "expected_hashes": 2 ** bits}
     if args.solve:
         frag = mined_join_pow(info)
