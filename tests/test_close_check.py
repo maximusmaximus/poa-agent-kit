@@ -55,7 +55,7 @@ class CloseCheckTests(unittest.TestCase):
 
     def test_failed_missing_and_removed(self):
         st = [{"answer": "ffff2222aaaa", "passed": False, "jury": []}]
-        eps = [close(1, T0, settled=st), close(2, T0 + H, removed=[ME])]
+        eps = [close(1, T0, settled=st), close(2, T0 + H, rewards={"poa1other": "1.0"}, removed=[ME])]
         r = poa.close_check(eps, {1: "ffff2222aaaa", 2: "99998888"}, ME, last=2)
         self.assertIn("answer_failed", r["rows"][0]["flags"])
         self.assertIn("answer_not_in_settled_or_pending", r["rows"][1]["flags"])

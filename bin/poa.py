@@ -2873,6 +2873,26 @@ def _epoch_list(epochs_res) -> list:
     return out
 
 
+def close_network_labels(eps: list, idx: int) -> dict:
+    """SUGGESTIONS.md #88. Network-wide labels for close eps[idx] (sorted list from _epoch_list).
+    empty_rewards: nobody was paid (rewards, weights and challenges all empty or zero), so a
+    'not paid' row is network-wide, not a personal miss. missing_basis_keys: basis keys that the
+    previous close had and this one lacks (a schema change). Pure function: no network."""
+    e = eps[idx]
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+    paid = sum(1 for v in rewards.values() if _f(v) > 0)
+    weights = e.get("weights") or {}
+    challenges = e.get("challenges") or {}
+    empty = paid == 0 and not weights and not challenges
+    missing = []
+    if idx > 0 and int(eps[idx - 1].get("epoch", 0)) > 0:
+        pb = eps[idx - 1].get("basis") if isinstance(eps[idx - 1].get("basis"), dict) else {}
+        missing = sorted(k for k in pb if k not in b)
+    return {"empty_rewards": empty, "addresses_paid": paid, "missing_basis_keys": missing,
+            "network_wide": bool(empty or missing)}
+
+
 def close_health(epochs_res, k: int = 5, epoch: int = None, address: str = "") -> dict:
     """Summarize one close record from GET /api/epochs. Pure function: no network."""
     eps = _epoch_list(epochs_res)
@@ -2906,7 +2926,17 @@ def close_health(epochs_res, k: int = 5, epoch: int = None, address: str = "") -
         flags.append("eligible_thin")
     if pool and burned / pool > 0.75:
         flags.append("mostly_burned")
-    verdict = "halted-like" if "attesters_below_k" in flags else ("thin" if flags else "healthy")
+    net = close_network_labels(eps, idx)
+    if net["empty_rewards"]:
+        flags.append("empty_rewards")
+    if net["missing_basis_keys"]:
+        flags.append("basis_keys_missing")
+    if "attesters_below_k" in flags:
+        verdict = "halted-like"
+    elif net["empty_rewards"]:
+        verdict = "network-empty"
+    else:
+        verdict = "thin" if flags else "healthy"
 
     res = {
         "ok": True,
@@ -2931,7 +2961,11 @@ def close_health(epochs_res, k: int = 5, epoch: int = None, address: str = "") -
         "pool": f"{pool:.6f}",
         "burned": f"{burned:.6f}",
         "burned_share": round(burned / pool, 4) if pool else None,
+        "missing_basis_keys": net["missing_basis_keys"],
+        "network_wide": net["network_wide"],
         "note": ("Public read of GET /api/epochs only. halted-like = fewer distinct attesters than K; "
+                 "network-empty = nobody was paid (rewards, weights and challenges empty), so not being paid is network-wide, not your miss; "
+                 "basis_keys_missing = basis keys the previous close had are gone (schema change); "
                  "thin = challenge-eligible under half the median of earlier closes, or over 75% of the pool burned. "
                  "These are signals for humans, not anything the network itself uses."),
     }
@@ -2959,6 +2993,10 @@ def print_close_health(r: dict) -> None:
           f" | settled {r['settled']} | pending {r['pending']}")
     print(f"  established +{r['established_after']} / removed {r['established_removed']} | slashed {r['slashed']} | ejected {r['ejected']}")
     print(f"  paid {r['addresses_paid']} addresses {r['rewards_total']} POA | burned {r['burned']} of {r['pool']} ({r['burned_share']})")
+    if "empty_rewards" in (r.get("flags") or []):
+        print("  NETWORK-WIDE: nobody was paid at this close; an unpaid answer here is not a personal miss, don't retune or retry for it")
+    if r.get("missing_basis_keys"):
+        print(f"  basis keys missing vs previous close: {', '.join(r['missing_basis_keys'])}")
     y = r.get("you")
     if y:
         print(f"  you: eligible {y['challenge_eligible']} | attested {y['attested']} | reward {y['reward']} | "
@@ -3144,9 +3182,11 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
             merged[tx] = int(ep_n)
     ledger = answer_ledger(eps, merged, me, quorum)
     rows = []
-    for e in eps[-max(1, last):]:
+    start = max(0, len(eps) - max(1, last))
+    for ci, e in enumerate(eps[start:], start):
         n = int(e["epoch"])
         b = e.get("basis") or {}
+        net = close_network_labels(eps, ci)
         rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
         reward = _f(rewards.get(me)) if me else 0.0
         tx = answers.get(n)
@@ -3193,6 +3233,11 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
             row["flags"].append("answer_failed")
         if not row["paid"]:
             row["flags"].append("not_paid")
+        if net["empty_rewards"]:
+            row["flags"].append("network_empty_close")
+        if net["missing_basis_keys"]:
+            row["flags"].append("basis_keys_missing")
+            row["missing_basis_keys"] = net["missing_basis_keys"]
         if row["established_removed"]:
             row["flags"].append("established_removed")
         if row["slashed"]:
@@ -3217,7 +3262,8 @@ def close_check(epochs_res, answers: dict, address: str, last: int = 4, quorum: 
         "established_from_closes": established_from_closes(eps, me),
         "answers_all": ledger,
         "rows": rows,
-        "verdict": "paid" if newest["paid"] else ("waiting" if newest["answer"] == "pending" else "not-paid"),
+        "verdict": "paid" if newest["paid"] else ("network-empty" if "network_empty_close" in newest["flags"]
+                                                  else ("waiting" if newest["answer"] == "pending" else "not-paid")),
         "note": ("Public reads only: GET /api/epochs and the explorer address view, plus the local handoff log. "
                  "Payouts are per close, never a balance. A pending answer with panel 0 cannot settle until "
                  "the operators draw graders for it. Answers settle oldest-first, so an older answer can "

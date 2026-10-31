@@ -13,7 +13,7 @@ ME = "poa1TESTADDRESSxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 def close(n, ts, attesters, eligible, burned="100.000000", rewards=None, removed=(), after=(), settled=0, pending=0):
     return {
         "epoch": n, "ts": ts, "pool": "1000.000000",
-        "rewards": rewards or {},
+        "rewards": rewards if rewards is not None else {"poa1payee": "1.000000"},
         "basis": {
             "attestations": {f"poa1att{i}": 3 for i in range(attesters)},
             "challenge_eligible": list(eligible),
