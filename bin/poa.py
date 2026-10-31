@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.4"
+KIT_VERSION = "1.8.5"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3686,6 +3686,28 @@ def _seconds_keys(params: dict) -> list:
     return sorted(out)
 
 
+def att_work_window(params: dict) -> dict:
+    """Attestation work window (server release v0.72-fixc, engine edfbb6d4). From close epoch
+    `close_summary_from_epoch` on, an attestation counts as paid WORK at a close only if the verifier's
+    earliest valid attestation record lands within W seconds of the target tx's own timestamp, where
+    W = `close_summary_window_s` if set, else `auto_epoch_seconds` (else 21600). Finality is not affected.
+    Returns {"active": False} when the param is absent (legacy close, no window). Pure: no network."""
+    params = params if isinstance(params, dict) else {}
+    fe = params.get("close_summary_from_epoch")
+    if isinstance(fe, bool) or not isinstance(fe, int):
+        return {"active": False}
+    w = params.get("close_summary_window_s")
+    if isinstance(w, int) and not isinstance(w, bool):
+        src = "close_summary_window_s"
+    else:
+        w, src = params.get("auto_epoch_seconds"), "auto_epoch_seconds"
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or w <= 0:
+            w, src = 21600, "default"
+    return {"active": True, "from_close_epoch": fe, "window_seconds": int(w), "window_hours": round(w / 3600, 2),
+            "window_source": src,
+            "rule": "an attestation counts as paid work only if made within the window after the target tx's timestamp; finality unaffected"}
+
+
 def epoch_time_table(params: dict, epochs_res, now: float = None, window: int = 8) -> dict:
     """Convert every epoch-counted setting in /api/params to hours and days, using both the
     nominal epoch length and the observed close cadence from /api/epochs. Pure: no network."""
@@ -3724,6 +3746,7 @@ def epoch_time_table(params: dict, epochs_res, now: float = None, window: int = 
         "pauses": [{"from": g["from"], "to": g["to"], "hours": round(g["seconds"] / 3600, 2)} for g in pauses],
         "rows": rows,
         "seconds_rows": seconds_rows,
+        "att_work_window": att_work_window(params),
         "note": ("Public reads of GET /api/params and GET /api/epochs only. Observed cadence = mean of the last "
                  f"{window} close gaps, leaving out pauses (gaps over {PAUSE_GAP_FACTOR:g}x nominal). Real time for any "
                  "setting stretches further if closes pause again; estimates, not network rules."),
@@ -3756,6 +3779,10 @@ def print_epoch_time(r: dict) -> None:
         nom = f"{row['nominal']['hours']}h / {row['nominal']['days']}d"
         ob = f"{row['observed']['hours']}h / {row['observed']['days']}d" if row.get("observed") else "-"
         print(f"{row['setting']:32} {row['epochs']:>7} {nom:>18} {ob:>18}")
+    aw = r.get("att_work_window") or {}
+    if aw.get("active"):
+        print(f"Attestation work window: {aw['window_hours']}h ({aw['window_source']}) from close E{aw['from_close_epoch']}: "
+              "attestations made later than that after the target tx earn no work credit (finality unaffected)")
     if r.get("seconds_rows"):
         print(f"\n{'setting (seconds)':32} {'seconds':>9} {'hours':>8} {'epochs':>8}")
         for row in r["seconds_rows"]:

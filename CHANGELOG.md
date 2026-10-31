@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-31 (kit 1.8.5)
+- **Attestation work window (server release `v0.72-fixc`, signed 2:10 PM PT Oct 31, 2026; engine `poa.mjs` d1b122eb to edfbb6d4).** From close epoch `close_summary_from_epoch` (live value 28) on, an attestation counts as paid work at a close only if the verifier's earliest valid attestation of a transaction lands within a window after that transaction's own timestamp. The window is `close_summary_window_s` when set, otherwise `auto_epoch_seconds` (6 hours today). The per-transaction attestation cap (`att_cap_per_tx`) is applied first and is unchanged. Finality (5 peer attestations or checkpoint coverage) is not affected. The same release moves the close's attestation-work tally into a running checkpoint summary so the close no longer walks the full history.
+- `epoch-time` now reports `att_work_window` (active flag, start epoch, window in seconds and hours, and which setting it came from) and prints one line about it when active. New helper `att_work_window(params)`.
+- What it means in practice: keep mining (which triggers the node's attestations for your account) at least once every few hours. Attestations made more than one window after a transaction no longer earn work credit.
+- `KIT_VERSION = "1.8.5"`. Tests: `tests/test_att_work_window.py` (mocked data only).
+
 ## 2026-10-31 (kit 1.8.4)
 - **Job expiry and queued polls (server release `v0.71-mcpjoin`, signed 1:40 AM PT Oct 31, 2026, server-only; go.md section "Receipts and job polling").** The updated go.md spells out the poll answers for a busy-node job. The kit now follows them:
   - `408 {"state":"expired","error":"job_expired"}` means the job sat in the queue for more than 30 minutes and was **never processed**. It is now reported as kind `job_expired` (landed false) instead of an ambiguous client error. An answer records `send_outcome: job_expired`, so the next run may rebuild and send it once; a grade returns `how: job_expired` and can be graded again if the seat is still dealt. `jobs --check` marks a saved job `expired-unprocessed` and drops its id.
