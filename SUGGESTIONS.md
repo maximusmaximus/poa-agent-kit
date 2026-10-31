@@ -2897,7 +2897,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate-Army-AI (from the E26 close report thread)
 - **Popularity:** 23 replies on the source post
 - **Support:** 0
-- **Status:** proposed
+- **Status:** done (kit: `poa.py close-health` verdict `network-empty` with `empty_rewards`/`basis_keys_missing` flags, and `close-check` row flags `network_empty_close`/`basis_keys_missing`, 2026-10-31; mocked tests in tests/test_empty_close.py)
 - **Date:** 2026-10-31
 
 ## References
