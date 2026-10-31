@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.3"
+KIT_VERSION = "1.8.4"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1202,7 +1202,33 @@ def is_busy_receipt(res) -> bool:
     if any(k in res for k in BUSY_RESULT_KEYS):
         return False
     status = str(res.get("status") or res.get("state") or "").lower()
+    if is_job_expired(res):
+        return False
+    if str(res.get("state") or "").lower() in BUSY_PENDING_STATES and not res.get("error"):
+        # go.md (v0.71-mcpjoin): a still-waiting poll answers 202 {"state":"queued"} with no job_id.
+        return True
     return bool(res.get("poll_url")) or (bool(res.get("job_id")) and (not status or status in BUSY_PENDING_STATES))
+
+
+# go.md "Receipts and job polling" (release v0.71-mcpjoin, Oct 31, 2026): a poll answering
+# 408 {"state":"expired","error":"job_expired"} means the job sat in the queue past 30 minutes
+# WITHOUT being processed. That is the one case where a new submit (fresh text/ts) is right.
+# A 404 still means "result forgotten (kept 1 hour) or never existed": outcome unknown, no resend.
+def is_job_expired(res_or_err) -> bool:
+    if isinstance(res_or_err, dict):
+        return (str(res_or_err.get("error") or "").lower() == "job_expired"
+                or str(res_or_err.get("state") or "").lower() == "expired")
+    if getattr(res_or_err, "status", None) == 408:
+        return True
+    return "job_expired" in str(res_or_err).lower()
+
+
+def _job_expired_error(job_id, poll_path, path: str = "") -> "PoaHTTPError":
+    err = PoaHTTPError("job_expired", f"busy-node job {job_id} on {path} expired unprocessed (408 job_expired, "
+                                      f">30 min in queue); it did NOT land. Rebuild and submit once.", 408)
+    err.job_id, err.poll_path = job_id, poll_path
+    err.unprocessed = True
+    return err
 
 
 def _same_origin_poll_path(pu: str) -> str:
@@ -1270,6 +1296,8 @@ def resolve_busy_receipt(res, path: str = "", sleep=None, max_wait: float = None
         try:
             cur = api_call("GET", poll_path, timeout=30, retries=2)
         except PoaHTTPError as e:
+            if is_job_expired(e):
+                raise _job_expired_error(job_id, poll_path, path) from None
             if e.status in (404, 410):
                 err = PoaHTTPError("queued", f"busy-node job {job_id} result no longer fetchable ({e.status}); it was "
                                              f"accepted, so do not resubmit; confirm on the ledger.", e.status)
@@ -1277,6 +1305,8 @@ def resolve_busy_receipt(res, path: str = "", sleep=None, max_wait: float = None
                 err.expired = True
                 raise err from None
             raise
+        if isinstance(cur, dict) and is_job_expired(cur):
+            raise _job_expired_error(job_id, poll_path, path)
         if not is_busy_receipt(cur):
             if isinstance(cur, dict):
                 cur = dict(cur)
@@ -1381,13 +1411,24 @@ def check_busy_jobs(epoch=None, poll=None) -> list:
         try:
             res = poll(f"/api/job/{jid}")
         except PoaHTTPError as e:
+            if is_job_expired(e):
+                r["state"], r["job_id"] = "expired-unprocessed", None
+                r["last_poll"] = "HTTP 408 job_expired: never processed (>30 min in queue); did not land, safe to rebuild and submit once"
+                if r.get("route") == "/api/hosted/answer" and r.get("epoch") is not None:
+                    save_epoch_cache(r["epoch"], send_outcome="job_expired", landed=False)
+                out.append(dict(r, job_id=mask_job_id(jid))); continue
             if e.status in (404, 410):
                 r["state"] = "tombstone"
                 r["last_poll"] = f"HTTP {e.status}: job result expired; outcome unknown until /me, /challenge or the explorer settles it"
             else:
                 r["last_poll"] = f"poll failed ({e.kind}); still queued, try again next run"
             out.append(dict(r, job_id=mask_job_id(jid))); continue
-        if is_busy_receipt(res):
+        if isinstance(res, dict) and is_job_expired(res):
+            r["state"], r["job_id"] = "expired-unprocessed", None
+            r["last_poll"] = "job_expired: never processed (>30 min in queue); did not land, safe to rebuild and submit once"
+            if r.get("route") == "/api/hosted/answer" and r.get("epoch") is not None:
+                save_epoch_cache(r["epoch"], send_outcome="job_expired", landed=False)
+        elif is_busy_receipt(res):
             r["last_poll"] = "still queued"
         elif isinstance(res, dict) and res.get("error"):
             r["state"] = "failed"
@@ -1420,7 +1461,7 @@ def submit_answer_safely(text: str, epoch) -> dict:
                 return {"landed": True, "how": "busy_job", "txid": r.get("txid"),
                         "note": f"queued answer for epoch {epoch} resolved from its saved busy job; not resending"}
         cache = load_epoch_cache(epoch)
-    if cache.get("sent_at") and cache.get("send_outcome") not in ("halted", "rejected", "stale"):
+    if cache.get("sent_at") and cache.get("send_outcome") not in ("halted", "rejected", "stale", "job_expired"):
         return {"landed": cache.get("landed"), "how": "sent_before", "note": f"already sent for epoch {epoch} at {cache['sent_at']} ({cache.get('send_outcome')}); not resending",
                 "txid": cache.get("txid_answer")}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1446,6 +1487,10 @@ def submit_answer_safely(text: str, epoch) -> dict:
             remember_busy_job(e, "/api/hosted/answer", epoch=epoch, intent=text)
             return {"landed": None, "how": "queued", "kind": "queued", "error": str(e)[:300],
                     "note": "accepted by a busy node; not resending. Confirm on the next run."}
+        if e.kind == "job_expired":
+            save_epoch_cache(epoch, send_outcome="job_expired", landed=False, error=str(e)[:300])
+            return {"landed": False, "how": "job_expired", "kind": "job_expired", "error": str(e)[:300],
+                    "note": "queued job expired unprocessed (408); did not land. Safe to rebuild and send once on the next run."}
         if e.kind in ("nonce", "nonce-lag", "busy"):
             save_epoch_cache(epoch, send_outcome="rejected", landed=False, error=str(e)[:300])
             return {"landed": False, "how": e.kind, "error": str(e)[:300], "kind": e.kind,
@@ -1508,6 +1553,9 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
             return {"landed": False, "how": "rate-limited", "kind": "rate-limited", "error": str(e)[:300],
                     "retry_after": e.retry_after if e.retry_after is not None else GRADE_RATE_LIMIT_DEFAULT_WAIT_S,
                     "note": "not landed (global grade ceiling); safe to grade this seat again after retry_after seconds"}
+        if e.kind == "job_expired":
+            return {"landed": False, "how": "job_expired", "kind": "job_expired", "error": str(e)[:300],
+                    "note": "queued grade expired unprocessed (408); did not land. Safe to grade this seat again if it is still dealt."}
         if e.kind == "queued":
             # Accepted by a busy node; the assignments read-back below decides, never a resend.
             sent = {"how": "queued", "error": str(e)[:300], "kind": "queued"}
@@ -3538,6 +3586,8 @@ def cmd_jobs(args: argparse.Namespace) -> None:
         print(f"{r.get('state'):10} {what:22} job {r.get('job_id') or '-':8} saved {str(r.get('saved_at'))[:19]}{tx}  {r.get('last_poll') or ''}")
     if any(r.get("state") == "tombstone" for r in rows):
         print("tombstone = the job result expired before we read it. Outcome unknown, NOT unsent: check `answer-status`/`me` first, and resend identical text once only if a fresh read still says unanswered.")
+    if any(r.get("state") == "expired-unprocessed" for r in rows):
+        print("expired-unprocessed = the node answered 408 job_expired: the job sat in the queue over 30 minutes and was never processed. It did not land; rebuild and submit once.")
 
 
 def cmd_intake(args: argparse.Namespace) -> None:

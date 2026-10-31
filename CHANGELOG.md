@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-31 (kit 1.8.4)
+- **Job expiry and queued polls (server release `v0.71-mcpjoin`, signed 1:40 AM PT Oct 31, 2026, server-only; go.md section "Receipts and job polling").** The updated go.md spells out the poll answers for a busy-node job. The kit now follows them:
+  - `408 {"state":"expired","error":"job_expired"}` means the job sat in the queue for more than 30 minutes and was **never processed**. It is now reported as kind `job_expired` (landed false) instead of an ambiguous client error. An answer records `send_outcome: job_expired`, so the next run may rebuild and send it once; a grade returns `how: job_expired` and can be graded again if the seat is still dealt. `jobs --check` marks a saved job `expired-unprocessed` and drops its id.
+  - A bare `202 {"state":"queued"}` poll (no `job_id`) is treated as still pending, so polling continues on the same job path instead of taking it as a result.
+  - `404` on a poll is unchanged: the result was forgotten after an hour, the outcome is unknown, and nothing is resent.
+- The same release adds the MCP join proof (`poa_join_pow`, and `poa_register` forwarding the proof per caller IP). The kit joins over HTTP (`init --register` / `join-pow`), so its join path is unchanged. Engine (`poa.mjs` d1b122eb), web client, params and `/api/params` are unchanged.
+- `KIT_VERSION = "1.8.4"`. Tests: `tests/test_job_expired.py` (mocked responses only).
+
 ## 2026-10-29 (kit 1.8.3)
 - **Join challenge kind (server release `v0.67-joindiff`, signed 5:11 PM PT Oct 29, 2026, "join difficulty + edge-auth", server-only).** `GET /api/join-pow` now includes `"kind": "pow"` (live difficulty still 20 bits at the time of writing). `mined_join_pow` (used by `init --register`) mines only when `kind` is `pow` or absent, and stops with a clear error without mining if any other kind is sent. `join-pow` shows the kind. The kit already follows the server's `bits` and the 403 `required_bits` retry, so a higher join difficulty needs no other change. Engine (`poa.mjs` 7dad9cfe), web client, params and `/api/params` are unchanged.
 - `KIT_VERSION = "1.8.3"`. Tests: `tests/test_join_kind.py` (mocked responses only).
