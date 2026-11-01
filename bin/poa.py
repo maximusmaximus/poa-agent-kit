@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.5"
+KIT_VERSION = "1.8.6"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -2852,6 +2852,178 @@ def cmd_backlog(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# disposal: projected disposal close and seal-based jury odds (SUGGESTIONS.md #92)
+# ---------------------------------------------------------------------------
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def norm_txid(t) -> str:
+    """Normalize a row key for joining /me, basis.pending and basis.settled: lowercase hex, no 0x.
+    Returns '' for a display form with an ellipsis or anything that is not hex."""
+    s = str(t if t is not None else "").strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if not s or "..." in s or "\u2026" in s or not re.fullmatch(r"[0-9a-f]+", s):
+        return ""
+    return s
+
+
+def disposal_schedule(pending: dict, snapshot_close: int, ttl: int, cap: int, horizon: int = 64) -> dict:
+    """Project the close at which each pending row leaves pending, assuming the live settle rule:
+    at close C the rows with since + ttl <= C settle in (since, txid) order, at most `cap` per close.
+    Rows that settle early by reaching quorum are ignored (rare), so this is the latest likely close.
+    Returns {txid: close}. Pure function: no network."""
+    order = sorted(((int(r.get("since")), k) for k, r in pending.items()
+                    if isinstance(r, dict) and isinstance(r.get("since"), int)))
+    out, done, i = {}, 0, 0
+    n = len(order)
+    c = snapshot_close
+    while done < n and c < snapshot_close + horizon:
+        c += 1
+        due = i
+        while due < n and order[due][0] + ttl <= c:
+            due += 1
+        take = min(cap, due - done) if cap > 0 else due - done
+        for j in range(done, done + take):
+            out[order[j][1]] = c
+        done += take
+        i = due
+    return out
+
+
+def jury_rates(prev_pending: dict, settled: list) -> dict:
+    """Observed jury rate at one close, split by the seal count each row had in the previous
+    close's pending snapshot: {'0': {...}, '1+': {...}}. Pure function: no network."""
+    rates = {"0": {"rows": 0, "juried": 0}, "1+": {"rows": 0, "juried": 0}}
+    for s in settled or []:
+        if not isinstance(s, dict):
+            continue
+        r = prev_pending.get(norm_txid(s.get("answer"))) if isinstance(prev_pending, dict) else None
+        if not isinstance(r, dict):
+            continue
+        b = "1+" if (r.get("grades") or []) else "0"
+        rates[b]["rows"] += 1
+        rates[b]["juried"] += 1 if s.get("jury") else 0
+    for v in rates.values():
+        v["rate"] = round(v["juried"] / v["rows"], 4) if v["rows"] else None
+    return rates
+
+
+def disposal_report(epochs_res, txids, ttl: int = 16, cap: int = 2000) -> dict:
+    """For each txid: nominal due close, projected disposal close, seals and the observed jury
+    rate for rows with that many seals; or the terminal record if it already left pending.
+    Pure function over a GET /api/epochs response: no network."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    last = eps[-1]
+    snap = int(last["epoch"])
+    lb = last.get("basis") if isinstance(last.get("basis"), dict) else {}
+    pending = {norm_txid(k): v for k, v in (lb.get("pending") or {}).items() if norm_txid(k)}
+    prev = eps[-2] if len(eps) > 1 else {}
+    pb = prev.get("basis") if isinstance(prev.get("basis"), dict) else {}
+    prev_pending = {norm_txid(k): v for k, v in (pb.get("pending") or {}).items() if norm_txid(k)}
+    rates = jury_rates(prev_pending, lb.get("settled") or []) if prev_pending else None
+    sched = disposal_schedule(pending, snap, ttl, cap)
+    closes = [int(e["epoch"]) for e in eps]
+    missing = sorted(set(range(closes[0], closes[-1] + 1)) - set(closes))
+    with_basis = [int(e["epoch"]) for e in eps if isinstance(e.get("basis"), dict) and "settled" in e["basis"]]
+    complete = not missing and len(with_basis) == len(eps)
+    rows = []
+    for raw in txids:
+        t = norm_txid(raw)
+        if not t:
+            rows.append({"txid": str(raw)[:20], "state": "bad-key",
+                         "reason": "not a full hex txid (ellipsis or display form); use the 64-character key"})
+            continue
+        key = t if t in pending else (next((k for k in pending if k.startswith(t)), None) if len(t) >= 8 else None)
+        if key:
+            r = pending[key]
+            since = r.get("since") if isinstance(r.get("since"), int) else None
+            seals = len(r.get("grades") or [])
+            nominal = since + ttl if since is not None else None
+            proj = sched.get(key)
+            b = "1+" if seals else "0"
+            rows.append({
+                "txid": key[:16], "state": "pending", "since": since, "seals": seals,
+                "panel_size": len(r.get("panel") or []),
+                "nominal_due_close": nominal, "projected_disposal_close": proj,
+                "carried_closes": (proj - nominal) if proj is not None and nominal is not None else None,
+                "closes_left": (proj - snap) if proj is not None else None,
+                "jury_rate_for_seal_bucket": (dict(rates[b], bucket=b) if rates else None),
+                "likely_outcome": ("jury likely" if rates and (rates[b]["rate"] or 0) >= 0.5 else
+                                   "expiry likely (no jury)" if rates and rates[b]["rate"] is not None else "unknown"),
+            })
+            continue
+        hit = None
+        for e in reversed(eps):
+            eb = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+            for s in eb.get("settled") or []:
+                a = norm_txid(s.get("answer")) if isinstance(s, dict) else ""
+                if a and (a == t or (len(t) >= 8 and a.startswith(t))):
+                    hit = (int(e["epoch"]), s)
+                    break
+            if hit:
+                break
+        if hit:
+            c, s = hit
+            state = "expired" if s.get("expired") is True else ("passed" if s.get("passed") else "failed")
+            rows.append({"txid": t[:16], "state": state, "settled_close": c, "jurors": len(s.get("jury") or []),
+                         "since": None, "nominal_due_close": None})
+        else:
+            rows.append({"txid": t[:16], "state": "unresolved",
+                         "reason": ("history complete, no match: check the txid or whether the answer landed"
+                                    if complete else "history incomplete: fetch the missing closes before calling it lost"),
+                         "history_complete": complete})
+    return {
+        "ok": True, "read_only": True, "snapshot_close": snap, "pending_ttl_epochs": ttl,
+        "settle_cap_per_close": cap, "pending_total": len(pending),
+        "history_complete": complete, "searched_close_range": [closes[0], closes[-1]], "missing_closes": missing,
+        "jury_rates_at_snapshot": rates, "rows": rows,
+        "assumptions": ("At each close, rows with since + pending_ttl_epochs <= close leave pending in (since, txid) order, "
+                        "at most settle_cap_per_close per close; early quorum settlements are ignored. Jury rate = share of rows "
+                        "settled at the snapshot close that got a non-empty jury, split by seals in the previous close's pending "
+                        "snapshot. 'expired' uses the explicit expired field, never an empty jury."),
+    }
+
+
+def cmd_disposal(args: argparse.Namespace) -> None:
+    params = {}
+    try:
+        params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+    except Exception:
+        params = {}
+    ttl = int(params.get("pending_ttl_epochs", 16) or 16)
+    cap = int(params.get("settle_cap_per_close", 2000) or 2000)
+    txids = list(args.txid or [])
+    if args.mine or not txids:
+        me = (args.address or local_address()).strip()
+        txids += [t for t in own_answer_candidates(me, pathlib.Path(args.log).expanduser() if args.log else None) if t not in txids]
+    epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    res = disposal_report(epochs_res, txids, ttl=ttl, cap=cap)
+    if args.json or not res.get("ok"):
+        print(json.dumps(res, indent=2))
+        return
+    if not args.all:
+        res["rows"] = [r for r in res["rows"] if r["state"] != "unresolved" or not res["history_complete"]]
+    print(f"snapshot close E{res['snapshot_close']}  ttl {ttl}  cap {cap}/close  pending {res['pending_total']}  "
+          f"history {'complete' if res['history_complete'] else 'INCOMPLETE'} E{res['searched_close_range'][0]}-E{res['searched_close_range'][1]}")
+    jr = res.get("jury_rates_at_snapshot") or {}
+    for b in ("1+", "0"):
+        if jr.get(b):
+            print(f"  jury rate at E{res['snapshot_close']}, rows with {b} seals: {jr[b]['juried']}/{jr[b]['rows']}")
+    print("txid              state      since seals due    projected carried  outcome")
+    for r in res["rows"]:
+        if r["state"] == "pending":
+            print(f"{r['txid']}  pending    E{r['since']!s:<4} {r['seals']:>5} E{r['nominal_due_close']!s:<5} E{r['projected_disposal_close']!s:<8} "
+                  f"{r['carried_closes']!s:>7}  {r['likely_outcome']}")
+        elif r["state"] in ("expired", "passed", "failed"):
+            print(f"{r['txid']}  {r['state']:<10} settled at E{r['settled_close']} ({r['jurors']} jurors)")
+        else:
+            print(f"{r['txid']}  {r['state']:<10} {r.get('reason', '')}")
+
+
+# ---------------------------------------------------------------------------
 # close-health: keyless read of the newest epoch close (SUGGESTIONS.md #39)
 # ---------------------------------------------------------------------------
 CLOSE_THIN_RATIO = 0.5  # eligible below half the median of earlier closes = thin (signal only)
@@ -5174,6 +5346,15 @@ def main() -> None:
     p_bl.add_argument("--table", action="store_true", help="With --mine: plain-text table instead of JSON")
     p_bl.add_argument("--log", default="", help="With --mine: handoff LOG.md for our answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
 
+    p_dp = sub.add_parser("disposal", help="Keyless: per pending answer, nominal due close, projected disposal close under the settle cap, seals and observed jury odds; terminal state if it already left pending")
+    p_dp.add_argument("txid", nargs="*", help="Answer txids (full 64-hex or 8+ char prefix); default: our own answers")
+    p_dp.add_argument("--mine", action="store_true", help="Add our own answer txids (explorer + handoff log) to any given")
+    p_dp.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
+    p_dp.add_argument("--log", default="", help="Handoff LOG.md for our answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
+    p_dp.add_argument("--all", action="store_true", help="Also list unresolved candidates when history is complete")
+    p_dp.add_argument("--json", action="store_true", help="JSON output")
+    p_dp.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+
     p_ch = sub.add_parser("close-health", help="Keyless: health of the newest epoch close (attesters vs K, eligible, settled, removed, burned, your address)")
     p_ch.add_argument("--epoch", type=int, default=None, help="Close to read (default: newest)")
     p_ch.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address)")
@@ -5506,6 +5687,8 @@ def main() -> None:
                 sys.exit(2)
         elif args.command == "backlog":
             cmd_backlog(args)
+        elif args.command == "disposal":
+            cmd_disposal(args)
         elif args.command == "close-health":
             cmd_close_health(args)
         elif args.command == "close-check":
