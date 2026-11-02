@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-01 (kit 1.8.7)
+- **Settlement cap removed from live settings.** Between 7:58 PM and 8:54 PM PT on Nov 1, 2026, the `settle_cap_per_close` key (2000) disappeared from the live `/api/params`. No new release was signed (still `v0.75-fp2regrow`) and the served engine `poa.mjs` (3cf2b226) is unchanged. That engine only paces settlement when the key is an integer, so with it absent every pending answer that is due (`since + pending_ttl_epochs <= close`) settles at that close instead of at most 2,000 per close.
+- `disposal` no longer assumes a 2,000 cap when the key is missing: it now reads the cap with the same integer rule as the engine (new helper `settle_cap_from_params`), projects with no cap when it's absent, prints `cap none`, and reports `settle_cap_per_close: null` in `--json`.
+- `KIT_VERSION = "1.8.7"`. Tests: `tests/test_disposal.py` (mocked responses only).
+
 ## 2026-11-01 (kit 1.8.6)
 - **New keyless command `disposal` (SUGGESTIONS.md #92).** For each pending answer it prints the nominal due close (`since` + `pending_ttl_epochs`) next to the projected disposal close under the live settle rule: at each close, rows with `since + pending_ttl_epochs <= close` leave pending in (`since`, txid) order, at most `settle_cap_per_close` (2,000 today) per close. It also prints the row's seal count and the observed jury rate at the newest close for rows with no seal versus one or more seals (rows settled at that close, split by their seals in the previous close's pending snapshot), plus the snapshot close and the assumptions, so a carried row isn't read as lost and an expiring row isn't read as about to be judged.
 - Rows that already left pending report their terminal state from `basis.settled` (`expired` from the explicit `expired` field, never from an empty jury; otherwise `passed` or `failed`). A txid found nowhere is `unresolved`, with `history_complete`, `searched_close_range` and `missing_closes`, so a gap in the close history never reads as an expiry. Keys are normalized before joining (lowercase hex, no `0x`); an ellipsis display form is refused as `bad-key`.

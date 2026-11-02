@@ -86,6 +86,27 @@ class DisposalTests(unittest.TestCase):
         self.assertEqual(out["rows"][0]["projected_disposal_close"], 7)
         self.assertEqual(sorted(calls), ["/api/epochs", "/api/params"])
 
+    def test_settle_cap_from_params(self):
+        self.assertEqual(poa.settle_cap_from_params({"settle_cap_per_close": 2000}), 2000)
+        self.assertEqual(poa.settle_cap_from_params({}), 0)
+        self.assertEqual(poa.settle_cap_from_params({"settle_cap_per_close": None}), 0)
+        self.assertEqual(poa.settle_cap_from_params({"settle_cap_per_close": "2000"}), 0)
+        self.assertEqual(poa.settle_cap_from_params({"settle_cap_per_close": True}), 0)
+        self.assertEqual(poa.settle_cap_from_params(None), 0)
+
+    def test_cmd_no_cap_when_key_absent(self):
+        eps = build()
+        args = argparse.Namespace(txid=[tx(5)], mine=False, address="", log="", all=False, json=True, timeout=5)
+        buf = io.StringIO()
+        with mock.patch.object(poa, "api_call", side_effect=lambda m, path, **k: eps if path == "/api/epochs" else {"pending_ttl_epochs": 2}), \
+             mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")), \
+             contextlib.redirect_stdout(buf):
+            poa.cmd_disposal(args)
+        out = json.loads(buf.getvalue())
+        self.assertIsNone(out["settle_cap_per_close"])
+        capped = poa.disposal_report(eps, [tx(5)], ttl=2, cap=3)["rows"][0]["projected_disposal_close"]
+        self.assertLessEqual(out["rows"][0]["projected_disposal_close"], capped)
+
     def test_cmd_table_mine(self):
         eps = build()
         args = argparse.Namespace(txid=[], mine=True, address="poa1TEST", log="", all=False, json=False, timeout=5)

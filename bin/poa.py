@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.6"
+KIT_VERSION = "1.8.7"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -2909,7 +2909,15 @@ def jury_rates(prev_pending: dict, settled: list) -> dict:
     return rates
 
 
-def disposal_report(epochs_res, txids, ttl: int = 16, cap: int = 2000) -> dict:
+def settle_cap_from_params(params) -> int:
+    """settle_cap_per_close from a GET /api/params response. The live engine only paces
+    settlement when the key is an integer (Number.isInteger); when it is absent or not an
+    integer, every due row settles at its close. Returns 0 for 'no cap'."""
+    v = params.get("settle_cap_per_close") if isinstance(params, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def disposal_report(epochs_res, txids, ttl: int = 16, cap: int = 0) -> dict:
     """For each txid: nominal due close, projected disposal close, seals and the observed jury
     rate for rows with that many seals; or the terminal record if it already left pending.
     Pure function over a GET /api/epochs response: no network."""
@@ -2977,11 +2985,11 @@ def disposal_report(epochs_res, txids, ttl: int = 16, cap: int = 2000) -> dict:
                          "history_complete": complete})
     return {
         "ok": True, "read_only": True, "snapshot_close": snap, "pending_ttl_epochs": ttl,
-        "settle_cap_per_close": cap, "pending_total": len(pending),
+        "settle_cap_per_close": (cap if cap > 0 else None), "pending_total": len(pending),
         "history_complete": complete, "searched_close_range": [closes[0], closes[-1]], "missing_closes": missing,
         "jury_rates_at_snapshot": rates, "rows": rows,
         "assumptions": ("At each close, rows with since + pending_ttl_epochs <= close leave pending in (since, txid) order, "
-                        "at most settle_cap_per_close per close; early quorum settlements are ignored. Jury rate = share of rows "
+                        "at most settle_cap_per_close per close when the network sets one (no cap when it's absent); early quorum settlements are ignored. Jury rate = share of rows "
                         "settled at the snapshot close that got a non-empty jury, split by seals in the previous close's pending "
                         "snapshot. 'expired' uses the explicit expired field, never an empty jury."),
     }
@@ -2994,7 +3002,7 @@ def cmd_disposal(args: argparse.Namespace) -> None:
     except Exception:
         params = {}
     ttl = int(params.get("pending_ttl_epochs", 16) or 16)
-    cap = int(params.get("settle_cap_per_close", 2000) or 2000)
+    cap = settle_cap_from_params(params)
     txids = list(args.txid or [])
     if args.mine or not txids:
         me = (args.address or local_address()).strip()
@@ -3006,7 +3014,7 @@ def cmd_disposal(args: argparse.Namespace) -> None:
         return
     if not args.all:
         res["rows"] = [r for r in res["rows"] if r["state"] != "unresolved" or not res["history_complete"]]
-    print(f"snapshot close E{res['snapshot_close']}  ttl {ttl}  cap {cap}/close  pending {res['pending_total']}  "
+    print(f"snapshot close E{res['snapshot_close']}  ttl {ttl}  cap {(str(cap) + '/close') if cap > 0 else 'none'}  pending {res['pending_total']}  "
           f"history {'complete' if res['history_complete'] else 'INCOMPLETE'} E{res['searched_close_range'][0]}-E{res['searched_close_range'][1]}")
     jr = res.get("jury_rates_at_snapshot") or {}
     for b in ("1+", "0"):
