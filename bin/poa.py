@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.9"
+KIT_VERSION = "1.9.0"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4106,6 +4106,245 @@ def cmd_release(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# insights: the per-close read-only network insight endpoints (server release v0.80-insights)
+# ---------------------------------------------------------------------------
+INSIGHT_VIEWS = {
+    "established": "/api/established",
+    "close-report": "/api/close-report",
+    "settled": "/api/settled",
+    "expiry": "/api/expiry-schedule",
+    "facts": "/api/network-facts",
+}
+_POA_ADDR_RE = re.compile(r"^poa1[1-9A-HJ-NP-Za-km-z]{20,60}$")
+
+
+def insights_report(close_report=None, facts=None, established=None, mine=None, params=None, release=None) -> dict:
+    """Pure function. Summarises the keyless insight endpoints (precomputed once per close):
+    GET /api/close-report, /api/network-facts, /api/established and /api/established/<addr>.
+    Cross-checks the economics block in /api/network-facts against /api/params and the
+    params hash against the signed release. Never returns any address."""
+    res = {"ok": True, "read_only": True, "flags": []}
+    cr = close_report if isinstance(close_report, dict) and "close_epoch" in close_report else None
+    if cr:
+        est = cr.get("establishment") or {}
+        conc = cr.get("concentration") or {}
+        panels = cr.get("panels") or {}
+        res["close"] = {
+            "close_epoch": cr.get("close_epoch"),
+            "close_ts": cr.get("close_ts"),
+            "close_at_utc": _iso(cr["close_ts"]) if isinstance(cr.get("close_ts"), (int, float)) else None,
+            "grade_quorum": cr.get("grade_quorum"),
+            "establishment": {k: est.get(k) for k in ("established_before", "eligible", "admitted", "waitlisted",
+                                                     "removed_ttl", "removed_slashed")},
+            "settled_split": cr.get("settled_split"),
+            "settled_count": cr.get("settled_count"),
+            "grades_cast": panels.get("grades_cast"),
+            "rows_reaching_quorum": panels.get("rows_reaching_quorum"),
+            "pending_rows": panels.get("rows"),
+            "distinct_graders": conc.get("distinct_graders"),
+            "top_grader_share": conc.get("top_grader_share"),
+            "n_eff_graders": conc.get("n_eff_inverse_herfindahl"),
+            "panel_data": cr.get("panel_data"),
+        }
+        split = cr.get("settled_split") or {}
+        tot = sum(v for v in split.values() if isinstance(v, (int, float)))
+        if tot:
+            res["close"]["expired_share"] = round((split.get("expired_empty_jury", 0) + split.get("expired_with_seals", 0)) / tot, 3)
+        if cr.get("panel_data") and str(cr.get("panel_data")).startswith("unavailable"):
+            res["flags"].append("close_report_panel_data_unavailable")
+    elif close_report is not None:
+        res["flags"].append("close_report_unreadable")
+    if isinstance(facts, dict) and isinstance(facts.get("economics"), dict):
+        econ = facts["economics"]
+        res["economics"] = econ
+        res["facts_open_epoch"] = facts.get("open_epoch")
+        res["system_accounts"] = len(facts.get("system_addresses") or [])
+        res["trusted_graders"] = len(facts.get("trusted_graders") or [])
+        if isinstance(params, dict) and params:
+            diff = sorted(k for k, v in econ.items() if k in params and params[k] != v)
+            missing = sorted(k for k in econ if k not in params)
+            res["economics_vs_params"] = {"differs": diff, "not_in_params": missing}
+            if diff:
+                res["flags"].append("facts_economics_differ_from_params")
+        rel = (release or {}).get("current") if isinstance(release, dict) else None
+        if isinstance(rel, dict) and rel.get("params_sha256") and facts.get("params_sha256"):
+            res["params_hash_matches_release"] = rel["params_sha256"] == facts["params_sha256"]
+            if not res["params_hash_matches_release"]:
+                res["flags"].append("facts_params_hash_differs_from_release")
+    elif facts is not None:
+        res["flags"].append("network_facts_unreadable")
+    if isinstance(established, dict) and isinstance(established.get("current"), dict):
+        cur = established["current"]
+        members = [m for m in (cur.get("members") or []) if isinstance(m, dict)]
+        exp = sorted(m.get("expires_after_epoch") for m in members if isinstance(m.get("expires_after_epoch"), int))
+        res["established"] = {"epoch": cur.get("epoch"), "size": cur.get("size", len(members)),
+                              "computed_at_close": established.get("computed_at_close"),
+                              "earliest_expiry_after_epoch": exp[0] if exp else None}
+        if isinstance(established.get("estab_ttl"), int):
+            res["established"]["estab_ttl"] = established["estab_ttl"]
+        delta = established.get("delta") if isinstance(established.get("delta"), dict) else {}
+        for k in ("added", "removed"):
+            v = delta.get(k, established.get(k))
+            if isinstance(v, list):
+                res["established"][k] = len(v)
+        prior = established.get("prior")
+        if isinstance(prior, dict):
+            res["established"]["prior_size"] = prior.get("size", len(prior.get("members") or []))
+    if isinstance(mine, dict) and "established" in mine:
+        res["you"] = {k: mine.get(k) for k in ("established", "since_epoch", "expires_after_epoch", "in_prior_set", "epoch")
+                      if k in mine}
+        if mine.get("established") is False:
+            res["flags"].append("you_not_established")
+    res["note"] = ("Keyless: these endpoints are precomputed once per close and served from the edge, so the data "
+                   "changes only at a close. Add --epoch N for that close's archived copy. No address is printed.")
+    return res
+
+
+def print_insights(r: dict) -> None:
+    c = r.get("close")
+    if c:
+        e = c["establishment"]
+        print(f"close E{c['close_epoch']}  {c['close_at_utc'] or '-'}  grade quorum {c['grade_quorum']}")
+        print(f"  establishment: {e.get('established_before')} established before, {e.get('eligible')} eligible, "
+              f"{e.get('admitted')} admitted, {e.get('waitlisted')} waitlisted, removed ttl {e.get('removed_ttl')} / slashed {e.get('removed_slashed')}")
+        s = c.get("settled_split") or {}
+        print(f"  settled {c.get('settled_count')}: passed {s.get('passed')}, failed {s.get('failed')}, "
+              f"expired empty jury {s.get('expired_empty_jury')}, expired with seals {s.get('expired_with_seals')}"
+              + (f" (expired share {c['expired_share']:.1%})" if c.get("expired_share") is not None else ""))
+        print(f"  grading: {c.get('grades_cast')} grades cast, {c.get('rows_reaching_quorum')} rows reached quorum, "
+              f"{c.get('distinct_graders')} distinct graders, top grader share {c.get('top_grader_share')}")
+        if c.get("panel_data"):
+            print(f"  panel data: {c['panel_data']}")
+    if r.get("established"):
+        s = r["established"]
+        extra = "".join(f", {k} {s[k]}" for k in ("added", "removed", "prior_size", "estab_ttl") if k in s)
+        print(f"established set at E{s['epoch']}: {s['size']} accounts{extra}; earliest expiry after E{s['earliest_expiry_after_epoch']}")
+    if r.get("you"):
+        y = r["you"]
+        if y.get("established"):
+            print(f"you: established since E{y.get('since_epoch')}, keeps standing through E{y.get('expires_after_epoch')}"
+                  + (" (also in the prior set)" if y.get("in_prior_set") else ""))
+        else:
+            print("you: not established" + (" (was in the prior set)" if y.get("in_prior_set") else ""))
+    if r.get("economics"):
+        print("economics (network-facts): " + ", ".join(f"{k}={v}" for k, v in sorted(r["economics"].items())))
+        evp = r.get("economics_vs_params")
+        if evp:
+            print(f"  vs /api/params: differs {evp['differs'] or 'none'}; not in /api/params {evp['not_in_params'] or 'none'}")
+        if "params_hash_matches_release" in r:
+            print(f"  params hash matches signed release: {r['params_hash_matches_release']}")
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
+def expiry_report(sched) -> dict:
+    """Pure function over GET /api/expiry-schedule: per close, pending answers that expire there if never
+    settled, split by how many seals they hold ('0', '1', '2', '3+')."""
+    if not isinstance(sched, dict) or not isinstance(sched.get("schedule"), list):
+        return {"ok": False, "error": "no 'schedule' in /api/expiry-schedule response"}
+    rows = []
+    for s in sched["schedule"]:
+        if not isinstance(s, dict):
+            continue
+        seals = {"0": 0, "1": 0, "2": 0, "3+": 0}
+        for kind in (s.get("by_kind") or {}).values():
+            for b, n in (kind or {}).items():
+                if b in seals and isinstance(n, int):
+                    seals[b] += n
+        rows.append({"expires_at_close": s.get("expires_at_close"), "total": s.get("total"), "seals": seals})
+    return {"ok": True, "read_only": True, "as_of_close": sched.get("as_of_close"),
+            "pending_ttl_epochs": sched.get("pending_ttl_epochs"), "total_pending": sched.get("total_pending"), "rows": rows}
+
+
+def settled_report(settled, me: str = "") -> dict:
+    """Pure function over GET /api/settled: outcome counts and jury sizes at the close; with `me`, only
+    that account's rows (answer ids shortened, the address itself is never returned)."""
+    if not isinstance(settled, dict) or not isinstance(settled.get("rows"), list):
+        return {"ok": False, "error": "no 'rows' in /api/settled response"}
+    rows = [x for x in settled["rows"] if isinstance(x, dict)]
+    outcomes, jury_hist = {}, {}
+    for x in rows:
+        outcomes[x.get("outcome")] = outcomes.get(x.get("outcome"), 0) + 1
+        n = len(x.get("jury") or [])
+        jury_hist[str(n)] = jury_hist.get(str(n), 0) + 1
+    res = {"ok": True, "read_only": True, "epoch": settled.get("epoch"), "count": settled.get("count", len(rows)),
+           "outcomes": outcomes, "jury_size_hist": jury_hist}
+    if me:
+        res["yours"] = [{"answer": str(x.get("answer") or "")[:12], "outcome": x.get("outcome"),
+                         "jury": len(x.get("jury") or [])} for x in rows if x.get("from") == me]
+    return res
+
+
+def _insight_get(path: str, epoch=None, timeout: float = 30):
+    q = {"epoch": int(epoch)} if epoch is not None else None
+    return api_call("GET", path, query=q, need_key=False, timeout=timeout, retries=2)
+
+
+def cmd_insights(args: argparse.Namespace) -> None:
+    view = args.view
+    me = "" if args.network else (args.address or local_address()).strip()
+    if me and not _POA_ADDR_RE.match(me):
+        me = ""
+
+    def get(path):
+        try:
+            return _insight_get(path, args.epoch)
+        except Exception as ex:
+            return {"_error": redact(str(ex))}
+
+    if view == "summary":
+        cr, facts, est = get("/api/close-report"), get("/api/network-facts"), get("/api/established")
+        mine = get(f"/api/established/{me}") if me else None
+        try:
+            params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+        except Exception:
+            params = {}
+        try:
+            rel = api_call("GET", "/api/release", need_key=False, timeout=30, retries=1)
+        except Exception:
+            rel = {}
+        r = insights_report(cr, facts, est, mine, params if isinstance(params, dict) else {}, rel if isinstance(rel, dict) else {})
+        if not any(k in r for k in ("close", "economics", "established")):
+            r["ok"] = False
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_insights(r)
+    elif view == "expiry":
+        r = expiry_report(get("/api/expiry-schedule"))
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif r.get("ok"):
+            print(f"expiry schedule as of close E{r['as_of_close']} (pending_ttl_epochs {r['pending_ttl_epochs']}, {r['total_pending']} pending)")
+            print(f"  {'close':>6} {'total':>6} {'0 seals':>8} {'1':>5} {'2':>5} {'3+':>5}")
+            for x in r["rows"]:
+                s = x["seals"]
+                print(f"  {'E' + str(x['expires_at_close']):>6} {x['total']:>6} {s['0']:>8} {s['1']:>5} {s['2']:>5} {s['3+']:>5}")
+        else:
+            print(f"insights expiry: {r.get('error')}")
+    elif view == "settled":
+        r = settled_report(get("/api/settled"), me)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif r.get("ok"):
+            print(f"settled at close E{r['epoch']}: {r['count']} answers; outcomes {r['outcomes']}; jury sizes {r['jury_size_hist']}")
+            if "yours" in r:
+                print(f"yours: {len(r['yours'])}" + "".join(f"\n  {y['answer']}  {y['outcome']}  jury {y['jury']}" for y in r["yours"]))
+        else:
+            print(f"insights settled: {r.get('error')}")
+    else:
+        raw = get(INSIGHT_VIEWS[view])
+        r = {"ok": "_error" not in raw, "view": view, "data": raw}
+        if not args.json and r["ok"]:
+            # Raw JSON, addresses included as the endpoint serves them (public data); use --json for the same.
+            pass
+        print(json.dumps(raw, indent=2))
+    if not r.get("ok"):
+        sys.exit(2)
+
+
 def cmd_jobs(args: argparse.Namespace) -> None:
     """List saved busy-node jobs; with --check, poll each queued one once (never resends)."""
     rows = check_busy_jobs(args.epoch) if args.check else [dict(r, job_id=mask_job_id(r.get("job_id"))) for r in load_busy_jobs()
@@ -5726,6 +5965,13 @@ def main() -> None:
     p_rl = sub.add_parser("release", help="Keyless: the current signed release (version, time, changelog, which hashes changed) next to the close-econ settings /api/params serves")
     p_rl.add_argument("--json", action="store_true", help="JSON output")
 
+    p_is = sub.add_parser("insights", help="Keyless: per-close network insights (close report, established set and your standing, settled, expiry schedule, network facts); never prints an address")
+    p_is.add_argument("view", nargs="?", default="summary", choices=["summary"] + list(INSIGHT_VIEWS), help="summary (default), established, close-report, settled, expiry, facts")
+    p_is.add_argument("--epoch", type=int, default=None, help="Archived copy for this close (?epoch=N)")
+    p_is.add_argument("--address", default="", help="Account to check (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_is.add_argument("--network", action="store_true", help="Network view only: no per-account lookup")
+    p_is.add_argument("--json", action="store_true", help="JSON output")
+
     p_jb = sub.add_parser("jobs", help="Saved busy-node (202) jobs: --check polls each queued job once (done / still queued / tombstone when expired); never resends")
     p_jb.add_argument("--check", action="store_true", help="Poll each queued job once and update the store")
     p_jb.add_argument("--epoch", type=int, default=None, help="Only this epoch's jobs")
@@ -6041,6 +6287,8 @@ def main() -> None:
             cmd_intake(args)
         elif args.command == "release":
             cmd_release(args)
+        elif args.command == "insights":
+            cmd_insights(args)
         elif args.command == "jobs":
             cmd_jobs(args)
         elif args.command == "epoch-time":
