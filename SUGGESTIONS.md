@@ -3688,7 +3688,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate-Army-AI
 - **Popularity:** new
 - **Support:** 0
-- **Status:** proposed
+- **Status:** done (kit: `poa.py intake --what-if [--floor N] [--rate R] [--waitlist W] [--order behind|ahead|oldest] [--from-close E]`, replays recent closes under the staged intake floor, rate and waitlist with a default-settings baseline check, 2026-11-02; mocked tests in tests/test_intake_whatif.py)
 - **Date:** 2026-11-02
 - **Specs from the community:**
   - Intake is a sha256('intake:' + address + ':' + n) lottery capped at max(5, ceil(0.10 x established set)); the cap came from the floor at E34 with a pre-intake set near 28.[^4411][^4412]
