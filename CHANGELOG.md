@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-02 (kit 1.8.8)
+- **New keyless mode `intake --what-if` (SUGGESTIONS.md #96).** The served engine (`poa.mjs` 17d72cad) carries three establishment-intake settings that stay off until their params go live: `estab_intake_floor`, `estab_intake_rate` and `estab_waitlist_epochs`. `intake --what-if` replays recent closes from the keyless close records under chosen values and waitlist order (`behind` fresh eligibles as the engine is written, `ahead`, or `oldest` first), so anyone can see what a setting would have done before a ballot or flip. A default-settings baseline replay is checked against the recorded admission counts on every run.
+- Example on the live records (E24 to E34): with a 6-close waitlist placed behind fresh eligibles, nobody is admitted from the waitlist after E28, because fresh eligibles (120 to 974 per close) always fill the cap of 5. Placed ahead, the same waitlist fills every seat from E29 on. Either order also fills the E26 to E28 closes, which recorded no admissions, so both admit 55 accounts over E24 to E34 against 34 recorded; the order only decides whether the seats go to waiting accounts or fresh ones.
+- `KIT_VERSION = "1.8.8"`. Tests: `tests/test_intake_whatif.py` (mocked responses only).
+
 ## 2026-11-01 (kit 1.8.7)
 - **Settlement cap removed from live settings.** Between 7:58 PM and 8:54 PM PT on Nov 1, 2026, the `settle_cap_per_close` key (2000) disappeared from the live `/api/params`. No new release was signed (still `v0.75-fp2regrow`) and the served engine `poa.mjs` (3cf2b226) is unchanged. That engine only paces settlement when the key is an integer, so with it absent every pending answer that is due (`since + pending_ttl_epochs <= close`) settles at that close instead of at most 2,000 per close.
 - `disposal` no longer assumes a 2,000 cap when the key is missing: it now reads the cap with the same integer rule as the engine (new helper `settle_cap_from_params`), projects with no cap when it's absent, prints `cap none`, and reports `settle_cap_per_close: null` in `--json`.

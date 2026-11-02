@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.7"
+KIT_VERSION = "1.8.8"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3795,6 +3795,177 @@ def print_intake(r: dict) -> None:
     print(r["note"])
 
 
+# ---------------------------------------------------------------------------
+# intake --what-if: replay each close's admission under staged intake settings (SUGGESTIONS.md #96)
+# ---------------------------------------------------------------------------
+WAITLIST_ORDERS = ("behind", "ahead", "oldest")
+
+
+def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int = None, rate: float = None,
+                  waitlist: int = None, order: str = "behind", start: int = None, last: int = 0) -> dict:
+    """Pure function. Replays establishment intake over the keyless close records under chosen
+    settings, the way the served engine (poa.mjs 17d72cad, CLOSE-ECON A and E) would run them:
+    cap = max(estab_intake_floor, ceil(|established| * estab_intake_rate)); candidates are this close's
+    challenge_eligible not yet established ("fresh"), ordered by sha256('intake:' + address + ':' + n);
+    with estab_waitlist_epochs W > 0, eligible-but-not-admitted accounts from the last W closes are
+    added as a waitlist. order='behind' is the engine as written (waitlist after every fresh eligible);
+    'ahead' puts the waitlist first in hash order; 'oldest' puts it first, longest-waiting first.
+    Unset settings fall back to the live /api/params value, then to the engine default (5, 0.10, 0).
+    Before close `start` the replay follows the recorded admissions; from it on,
+    the counterfactual established set drives the cap, removals (estab_ttl decay plus recorded slashes)
+    and later candidates. With no start given, the replay begins after the last close where a default-settings
+    replay can't reproduce the recorded admission count (genesis-era closes). A baseline replay with the default settings is run alongside and compared to the
+    records, so you can see how faithful the replay is. Never prints any address."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    params = params if isinstance(params, dict) else {}
+    order = order if order in WAITLIST_ORDERS else "behind"
+
+    def _int(v, d):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else d
+
+    def _rate(v, d):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < float(v) <= 1 else d
+
+    live = {"floor": _int(params.get("estab_intake_floor"), 5), "rate": _rate(params.get("estab_intake_rate"), 0.10),
+            "waitlist": _int(params.get("estab_waitlist_epochs"), 0)}
+    cfg = {"floor": _int(floor, live["floor"]) if floor is not None else live["floor"],
+           "rate": _rate(rate, live["rate"]) if rate is not None else live["rate"],
+           "waitlist": (max(0, int(waitlist)) if waitlist is not None else live["waitlist"]), "order": order}
+    try:
+        ttl = int(params.get("estab_ttl", 6))
+    except (TypeError, ValueError):
+        ttl = 6
+    first = int(eps[0]["epoch"])
+    auto_start = start is None
+    start = first if start is None else int(start)
+    me = (address or "").strip()
+
+    def run(c):
+        est, hist, waiting_since, rows = set(), [], {}, []
+        for e in eps:
+            n = int(e["epoch"])
+            b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+            elig = [a for a in (b.get("challenge_eligible") or []) if isinstance(a, str)]
+            rec_adm = [a for a in (b.get("established_after") or []) if isinstance(a, str)]
+            rec_rem = [a for a in (b.get("established_removed") or []) if isinstance(a, str)]
+            pre = len(est)
+            cap = max(c["floor"], -(-int(pre * c["rate"] * 1_000_000) // 1_000_000))
+            fresh = intake_order([a for a in elig if a not in est], n)
+            fs = set(fresh)
+            ws = set()
+            if c["waitlist"]:
+                for _, el in hist[-c["waitlist"]:]:
+                    ws |= {a for a in el if a not in est and a not in fs}
+            wait = intake_order(sorted(ws), n)
+            if c["order"] == "oldest":
+                wait.sort(key=lambda a: waiting_since.get(a, n))  # stable: ties keep hash order
+            queue = (fresh + wait) if c["order"] == "behind" else (wait + fresh)
+            if n < start:
+                admitted = list(rec_adm)
+            else:
+                admitted = queue[:cap]
+            adm = set(admitted)
+            # removals: estab_ttl decay over the last ttl closes plus this one, and recorded slashes/ejections
+            recent = {a for m, el in hist if m >= n - ttl for a in el} | set(elig)
+            if n < start:
+                removed = set(rec_rem)
+            else:
+                decayed = {a for a in est if a not in recent}
+                removed = decayed | {a for a in rec_rem if a in est and a in recent}
+            row = {"close": n, "cap": cap, "established_before": pre, "fresh": len(fresh), "waitlist": len(wait),
+                   "admitted": len(admitted), "from_fresh": len(adm & fs), "from_waitlist": len(adm - fs),
+                   "removed": len(removed), "replayed": n >= start}
+            if me:
+                pos = {a: i + 1 for i, a in enumerate(queue)}
+                row["me"] = {"queued": me in pos, "position": pos.get(me), "of": len(queue),
+                             "on_waitlist": me in ws, "admitted": me in adm, "established_before": me in est}
+            rows.append(row)
+            for a in elig:
+                if a not in est and a not in adm:
+                    waiting_since.setdefault(a, n)
+            for a in adm:
+                waiting_since.pop(a, None)
+            est |= adm
+            est -= removed
+            hist.append((n, elig))
+        return rows, est
+
+    base_cfg = {"floor": 5, "rate": 0.10, "waitlist": 0, "order": "behind"}
+    rec = {int(e["epoch"]): len([a for a in ((e.get("basis") or {}).get("established_after") or []) if isinstance(a, str)])
+           for e in eps}
+    base_rows, _ = run(dict(base_cfg))
+    if auto_start:
+        # replay from the close after the last one where a default-settings replay misses the recorded count
+        # (early closes admitted more than the cap the records can explain, because the genesis carry isn't listed)
+        miss = [r["close"] for r in base_rows if r["admitted"] != rec[r["close"]]]
+        if miss:
+            later = [int(e["epoch"]) for e in eps if int(e["epoch"]) > miss[-1]]
+            start = later[0] if later else int(eps[-1]["epoch"])
+            base_rows, _ = run(dict(base_cfg))
+    rows, est_end = run(cfg)
+    replayed_base = [r for r in base_rows if r["replayed"]]
+    base_match = sum(1 for r in replayed_base if r["admitted"] == rec[r["close"]])
+    for r in rows:
+        r["recorded_admitted"] = rec[r["close"]]
+    sel = rows[-last:] if last and last > 0 else rows
+    res = {"ok": True, "read_only": True, "what_if": True, "settings": cfg, "live_settings": live,
+           "engine_defaults": {"floor": 5, "rate": 0.10, "waitlist": 0, "order": "behind"},
+           "estab_ttl": ttl, "replay_from_close": start, "replay_start_auto": auto_start, "newest_close": int(eps[-1]["epoch"]), "rows": sel,
+           "total_admitted": sum(r["admitted"] for r in rows if r["replayed"]),
+           "total_recorded_admitted": sum(rec[r["close"]] for r in rows if r["replayed"]),
+           "admitted_from_waitlist": sum(r["from_waitlist"] for r in rows if r["replayed"]),
+           "established_at_end": len(est_end),
+           "baseline_count_match": f"{base_match} of {len(replayed_base)}", "flags": []}
+    if me:
+        hit = next((r for r in rows if r["replayed"] and r["me"]["admitted"]), None)
+        res["you"] = {"admitted_at_close": hit["close"] if hit else None,
+                      "via_waitlist": bool(hit and hit["me"]["on_waitlist"]),
+                      "closes_queued": sum(1 for r in rows if r["replayed"] and r["me"]["queued"])}
+    if replayed_base and base_match < len(replayed_base):
+        res["flags"].append("baseline_differs_from_records")
+    res["note"] = ("Keyless what-if over GET /api/epochs and /api/params; a model, not a network rule. The records don't "
+                   "list accounts established through the genesis carry or late-settled passes outside challenge_eligible, "
+                   "so the baseline line shows how closely a default-settings replay reproduces the recorded admission "
+                   "counts. No address is ever printed.")
+    return res
+
+
+def print_intake_whatif(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"intake what-if: {r.get('error')}")
+        return
+    s = r["settings"]
+    print(f"intake what-if: floor {s['floor']}, rate {s['rate']:g}, waitlist {s['waitlist']} closes "
+          f"({s['order']}), replayed from E{r['replay_from_close']} | live: floor {r['live_settings']['floor']}, "
+          f"rate {r['live_settings']['rate']:g}, waitlist {r['live_settings']['waitlist']}")
+    print("close cap  est   fresh wait  admitted (fresh+wait)  recorded  you")
+    for x in r["rows"]:
+        you = "-"
+        m = x.get("me")
+        if m:
+            if m["established_before"]:
+                you = "established"
+            elif m["admitted"]:
+                you = f"ADMITTED at {m['position']} of {m['of']}" + (" (waitlist)" if m["on_waitlist"] else "")
+            elif m["queued"]:
+                you = f"{m['position']} of {m['of']}" + (" (waitlist)" if m["on_waitlist"] else "")
+        mark = "" if x["replayed"] else " (recorded)"
+        print(f"E{x['close']:<4} {x['cap']:<4} {x['established_before']:<5} {x['fresh']:<5} {x['waitlist']:<5} "
+              f"{x['admitted']:>3} ({x['from_fresh']}+{x['from_waitlist']}){'':10} {x['recorded_admitted']:<9} {you}{mark}")
+    print(f"total admitted {r['total_admitted']} (recorded {r['total_recorded_admitted']}), {r['admitted_from_waitlist']} "
+          f"from the waitlist; established at end {r['established_at_end']}; baseline replay matches recorded counts "
+          f"at {r['baseline_count_match']} closes")
+    y = r.get("you")
+    if y:
+        print(f"you: " + (f"admitted at E{y['admitted_at_close']}" + (" from the waitlist" if y["via_waitlist"] else "")
+                          if y["admitted_at_close"] is not None else f"not admitted (queued at {y['closes_queued']} close(s))"))
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
 def cmd_jobs(args: argparse.Namespace) -> None:
     """List saved busy-node jobs; with --check, poll each queued one once (never resends)."""
     rows = check_busy_jobs(args.epoch) if args.check else [dict(r, job_id=mask_job_id(r.get("job_id"))) for r in load_busy_jobs()
@@ -3828,11 +3999,20 @@ def cmd_intake(args: argparse.Namespace) -> None:
     except Exception:
         params = {}
     me = "" if args.network else (args.address or local_address()).strip()
-    r = intake_report(epochs_res, me, params=params if isinstance(params, dict) else {}, last=args.last)
-    if args.json:
-        print(json.dumps(r, indent=2))
+    params = params if isinstance(params, dict) else {}
+    if getattr(args, "what_if", False):
+        r = intake_whatif(epochs_res, me, params=params, floor=args.floor, rate=args.rate, waitlist=args.waitlist,
+                          order=args.order, start=args.from_close, last=args.last)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_intake_whatif(r)
     else:
-        print_intake(r)
+        r = intake_report(epochs_res, me, params=params, last=args.last)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_intake(r)
     if not r.get("ok"):
         sys.exit(2)
 
@@ -5395,6 +5575,12 @@ def main() -> None:
     p_in.add_argument("--network", action="store_true", help="Network rows only, no address")
     p_in.add_argument("--json", action="store_true", help="JSON output")
     p_in.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
+    p_in.add_argument("--what-if", dest="what_if", action="store_true", help="Replay admissions under chosen staged-intake settings (floor/rate/waitlist/order) instead of reading the draw")
+    p_in.add_argument("--floor", type=int, default=None, help="--what-if: estab_intake_floor (default: live value, else 5)")
+    p_in.add_argument("--rate", type=float, default=None, help="--what-if: estab_intake_rate, 0-1 (default: live value, else 0.10)")
+    p_in.add_argument("--waitlist", type=int, default=None, help="--what-if: estab_waitlist_epochs W (default: live value, else 0 = off)")
+    p_in.add_argument("--order", choices=list(WAITLIST_ORDERS), default="behind", help="--what-if: waitlist behind fresh eligibles (engine as written), ahead of them, or ahead oldest-first")
+    p_in.add_argument("--from-close", dest="from_close", type=int, default=None, help="--what-if: replay from this close on; earlier closes follow the records (default: after the last close a default replay can't reproduce)")
 
     p_jb = sub.add_parser("jobs", help="Saved busy-node (202) jobs: --check polls each queued job once (done / still queued / tombstone when expired); never resends")
     p_jb.add_argument("--check", action="store_true", help="Poll each queued job once and update the store")
