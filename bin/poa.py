@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.8.8"
+KIT_VERSION = "1.8.9"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3659,6 +3659,30 @@ def cmd_standing(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # intake: where an account sits in each close's establishment draw (SUGGESTIONS.md #70)
 # ---------------------------------------------------------------------------
+def intake_settings(params) -> dict:
+    """Staged-intake settings as the served engine reads them from /api/params (CLOSE-ECON A and E):
+    estab_intake_floor (positive integer, else 5), estab_intake_rate (0 < r <= 1, else 0.10),
+    estab_waitlist_epochs (positive integer, else 0 = off). `served` lists the keys that are present
+    and valid, so an empty list means every value is the engine default. Pure."""
+    params = params if isinstance(params, dict) else {}
+
+    def _pint(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+    fl, rt, wl = params.get("estab_intake_floor"), params.get("estab_intake_rate"), params.get("estab_waitlist_epochs")
+    rate_ok = isinstance(rt, (int, float)) and not isinstance(rt, bool) and 0 < float(rt) <= 1
+    served = [k for k, ok in (("estab_intake_floor", _pint(fl)), ("estab_intake_rate", rate_ok),
+                              ("estab_waitlist_epochs", _pint(wl))) if ok]
+    return {"floor": fl if _pint(fl) else 5, "rate": float(rt) if rate_ok else 0.10,
+            "waitlist": wl if _pint(wl) else 0, "served": served}
+
+
+def intake_cap(established: int, floor: int, rate: float) -> int:
+    """The engine's newcomer cap for one close: max(floor, ceil(established x rate)). Computed in
+    micro-units so 0.1 x 30 is 3, not 4 from float error. Pure."""
+    return max(int(floor), -(-int(int(established) * float(rate) * 1_000_000) // 1_000_000))
+
+
 def intake_order(candidates, epoch: int) -> list:
     """The reference client's staged-intake order for one close: not-yet-established
     addresses with a pass, sorted by sha256('intake:' + address + ':' + epoch). Pure."""
@@ -3670,8 +3694,9 @@ def intake_report(epochs_res, address: str = "", params: dict = None, last: int 
     """Pure function. For each close in GET /api/epochs, rebuild the establishment intake the
     public reference client runs (poa.mjs, staged intake): candidates = basis.challenge_eligible
     minus the established set the close records show before that close, ordered by
-    sha256('intake:' + address + ':' + epoch); the first max(5, ceil(10% of established)) are
-    admitted (basis.established_after). The records don't list accounts established through the
+    sha256('intake:' + address + ':' + epoch); the first max(estab_intake_floor, ceil(established x
+    estab_intake_rate)) are admitted (basis.established_after). Floor and rate come from /api/params when
+    served, else the engine defaults 5 and 10%. The records don't list accounts established through the
     genesis carry, so the cap is read from established_after rather than computed, and a rank
     above the last admitted rank that was skipped is reported as a gap (probably an account that
     was already established), never as a broken draw. Our row says whether we were a candidate,
@@ -3686,6 +3711,7 @@ def intake_report(epochs_res, address: str = "", params: dict = None, last: int 
         ttl = int(params.get("estab_ttl", 6))
     except (TypeError, ValueError):
         ttl = 6
+    live = intake_settings(params)
     me = (address or "").strip()
     est = set()
     last_eligible = {}
@@ -3706,7 +3732,7 @@ def intake_report(epochs_res, address: str = "", params: dict = None, last: int 
         row = {"close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None,
                "candidates": len(order), "admitted": len(admitted), "admitted_ranks": ranks,
                "gaps": gaps, "admitted_not_in_order": off_order,
-               "cap_from_records": max(5, -(-len(est) // 10)), "established_in_records": len(est),
+               "cap_from_records": intake_cap(len(est), live["floor"], live["rate"]), "established_in_records": len(est),
                "matches_order": bool(admitted) and off_order == 0 and ranks == [r for r in range(1, top + 1) if r not in gaps]
                                 and len(gaps) <= 2,
                "removed": len(removed)}
@@ -3727,7 +3753,7 @@ def intake_report(epochs_res, address: str = "", params: dict = None, last: int 
             me_est, me_removed_at = False, n
     newest = int(eps[-1]["epoch"])
     sel = rows[-last:] if last and last > 0 else rows
-    res = {"ok": True, "read_only": True, "newest_close": newest, "estab_ttl": ttl, "rows": sel,
+    res = {"ok": True, "read_only": True, "newest_close": newest, "estab_ttl": ttl, "intake_settings": live, "rows": sel,
            "closes_matching_order": sum(1 for r in rows if r["admitted"] and r["matches_order"]),
            "closes_with_admissions": sum(1 for r in rows if r["admitted"]), "flags": []}
     if me:
@@ -3760,6 +3786,12 @@ def print_intake(r: dict) -> None:
         return
     print(f"intake: {r['closes_matching_order']} of {r['closes_with_admissions']} closes with admissions match the "
           f"sha256 intake order | estab_ttl {r['estab_ttl']} closes")
+    li = r.get("intake_settings")
+    if li:
+        print(f"live intake settings: floor {li['floor']}, rate {li['rate']:g}, waitlist "
+              + (f"{li['waitlist']} closes" if li["waitlist"] else "off")
+              + (" (all engine defaults: none of the keys is in /api/params)" if not li["served"] else
+                 " (served in /api/params: " + ", ".join(li["served"]) + ")"))
     print("close cand  admitted ranks                       gaps     you")
     for x in r["rows"]:
         rk = ",".join(str(v) for v in x["admitted_ranks"]) or "-"
@@ -3802,7 +3834,8 @@ WAITLIST_ORDERS = ("behind", "ahead", "oldest")
 
 
 def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int = None, rate: float = None,
-                  waitlist: int = None, order: str = "behind", start: int = None, last: int = 0) -> dict:
+                  waitlist: int = None, order: str = "behind", start: int = None, last: int = 0,
+                  ttl: int = None) -> dict:
     """Pure function. Replays establishment intake over the keyless close records under chosen
     settings, the way the served engine (poa.mjs 17d72cad, CLOSE-ECON A and E) would run them:
     cap = max(estab_intake_floor, ceil(|established| * estab_intake_rate)); candidates are this close's
@@ -3811,6 +3844,8 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
     added as a waitlist. order='behind' is the engine as written (waitlist after every fresh eligible);
     'ahead' puts the waitlist first in hash order; 'oldest' puts it first, longest-waiting first.
     Unset settings fall back to the live /api/params value, then to the engine default (5, 0.10, 0).
+    `ttl` is the estab_ttl used for decay in the replayed closes (default: live value, else 6); the
+    baseline replay always uses the live estab_ttl, since that is what produced the records.
     Before close `start` the replay follows the recorded admissions; from it on,
     the counterfactual established set drives the cap, removals (estab_ttl decay plus recorded slashes)
     and later candidates. With no start given, the replay begins after the last close where a default-settings
@@ -3834,15 +3869,17 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
            "rate": _rate(rate, live["rate"]) if rate is not None else live["rate"],
            "waitlist": (max(0, int(waitlist)) if waitlist is not None else live["waitlist"]), "order": order}
     try:
-        ttl = int(params.get("estab_ttl", 6))
+        live_ttl = int(params.get("estab_ttl", 6))
     except (TypeError, ValueError):
-        ttl = 6
+        live_ttl = 6
+    live_ttl = live_ttl if live_ttl > 0 else 6
+    ttl = int(ttl) if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0 else live_ttl
     first = int(eps[0]["epoch"])
     auto_start = start is None
     start = first if start is None else int(start)
     me = (address or "").strip()
 
-    def run(c):
+    def run(c, ttl):
         est, hist, waiting_since, rows = set(), [], {}, []
         for e in eps:
             n = int(e["epoch"])
@@ -3851,7 +3888,7 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
             rec_adm = [a for a in (b.get("established_after") or []) if isinstance(a, str)]
             rec_rem = [a for a in (b.get("established_removed") or []) if isinstance(a, str)]
             pre = len(est)
-            cap = max(c["floor"], -(-int(pre * c["rate"] * 1_000_000) // 1_000_000))
+            cap = intake_cap(pre, c["floor"], c["rate"])
             fresh = intake_order([a for a in elig if a not in est], n)
             fs = set(fresh)
             ws = set()
@@ -3895,7 +3932,7 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
     base_cfg = {"floor": 5, "rate": 0.10, "waitlist": 0, "order": "behind"}
     rec = {int(e["epoch"]): len([a for a in ((e.get("basis") or {}).get("established_after") or []) if isinstance(a, str)])
            for e in eps}
-    base_rows, _ = run(dict(base_cfg))
+    base_rows, _ = run(dict(base_cfg), live_ttl)
     if auto_start:
         # replay from the close after the last one where a default-settings replay misses the recorded count
         # (early closes admitted more than the cap the records can explain, because the genesis carry isn't listed)
@@ -3903,8 +3940,8 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
         if miss:
             later = [int(e["epoch"]) for e in eps if int(e["epoch"]) > miss[-1]]
             start = later[0] if later else int(eps[-1]["epoch"])
-            base_rows, _ = run(dict(base_cfg))
-    rows, est_end = run(cfg)
+            base_rows, _ = run(dict(base_cfg), live_ttl)
+    rows, est_end = run(cfg, ttl)
     replayed_base = [r for r in base_rows if r["replayed"]]
     base_match = sum(1 for r in replayed_base if r["admitted"] == rec[r["close"]])
     for r in rows:
@@ -3912,7 +3949,7 @@ def intake_whatif(epochs_res, address: str = "", params: dict = None, floor: int
     sel = rows[-last:] if last and last > 0 else rows
     res = {"ok": True, "read_only": True, "what_if": True, "settings": cfg, "live_settings": live,
            "engine_defaults": {"floor": 5, "rate": 0.10, "waitlist": 0, "order": "behind"},
-           "estab_ttl": ttl, "replay_from_close": start, "replay_start_auto": auto_start, "newest_close": int(eps[-1]["epoch"]), "rows": sel,
+           "estab_ttl": ttl, "live_estab_ttl": live_ttl, "replay_from_close": start, "replay_start_auto": auto_start, "newest_close": int(eps[-1]["epoch"]), "rows": sel,
            "total_admitted": sum(r["admitted"] for r in rows if r["replayed"]),
            "total_recorded_admitted": sum(rec[r["close"]] for r in rows if r["replayed"]),
            "admitted_from_waitlist": sum(r["from_waitlist"] for r in rows if r["replayed"]),
@@ -3938,8 +3975,9 @@ def print_intake_whatif(r: dict) -> None:
         return
     s = r["settings"]
     print(f"intake what-if: floor {s['floor']}, rate {s['rate']:g}, waitlist {s['waitlist']} closes "
-          f"({s['order']}), replayed from E{r['replay_from_close']} | live: floor {r['live_settings']['floor']}, "
-          f"rate {r['live_settings']['rate']:g}, waitlist {r['live_settings']['waitlist']}")
+          f"({s['order']}), estab_ttl {r['estab_ttl']}, replayed from E{r['replay_from_close']} | live: floor "
+          f"{r['live_settings']['floor']}, rate {r['live_settings']['rate']:g}, waitlist {r['live_settings']['waitlist']}, "
+          f"estab_ttl {r.get('live_estab_ttl', r['estab_ttl'])}")
     print("close cap  est   fresh wait  admitted (fresh+wait)  recorded  you")
     for x in r["rows"]:
         you = "-"
@@ -3964,6 +4002,108 @@ def print_intake_whatif(r: dict) -> None:
     for f in r["flags"]:
         print(f"flag: {f}")
     print(r["note"])
+
+
+# ---------------------------------------------------------------------------
+# release: the signed release next to the close-economics settings /api/params actually serves
+# ---------------------------------------------------------------------------
+RELEASE_HASH_KEYS = ("engine_sha256", "client_sha256", "server_sha256", "params_sha256", "worker_sha256", "web_client_sha256")
+# Settings the served engine (poa.mjs 17d72cad) reads at each close, with what it does when a key is absent.
+CLOSE_ECON_SETTINGS = (
+    ("estab_intake_floor", "5"),
+    ("estab_intake_rate", "0.10"),
+    ("estab_waitlist_epochs", "off"),
+    ("estab_ttl", "6"),
+    ("final_payout_basis_from_epoch", "off"),
+    ("emission_carry_from_epoch", "off"),
+    ("carry_cap_pools", "1 (only used when carry is on)"),
+)
+
+
+def release_report(release_res, params=None) -> dict:
+    """Pure function. Reads a GET /api/release response and a GET /api/params response.
+    Returns the current signed release (version, signing time, txid, changelog_ref), which hashes
+    changed against the previous release in `history`, and for each close-economics setting the
+    value /api/params serves or the engine default when the key is absent. A release can sign a
+    new params hash before the served /api/params shows the new values; this report puts the two
+    side by side and never guesses values from the changelog text."""
+    if not isinstance(release_res, dict) or not isinstance(release_res.get("current"), dict):
+        return {"ok": False, "error": "no 'current' release in /api/release response"}
+    cur = release_res["current"]
+    hist = [h for h in (release_res.get("history") or []) if isinstance(h, dict)]
+    idx = next((i for i in range(len(hist) - 1, -1, -1)
+                if hist[i].get("txid") == cur.get("txid") and hist[i].get("version") == cur.get("version")), None)
+    prev = hist[idx - 1] if idx is not None and idx > 0 else (hist[-1] if hist and idx is None else None)
+    changed = [k for k in RELEASE_HASH_KEYS if prev and cur.get(k) and prev.get(k) and cur.get(k) != prev.get(k)]
+    params = params if isinstance(params, dict) else {}
+    settings = []
+    for key, default in CLOSE_ECON_SETTINGS:
+        if key in params:
+            settings.append({"key": key, "served": True, "value": params[key]})
+        else:
+            settings.append({"key": key, "served": False, "engine_default": default})
+    ts = cur.get("ts")
+    res = {"ok": True, "read_only": True,
+           "current": {"version": cur.get("version"), "signed_ts": ts,
+                       "signed_at_utc": _iso(ts) if isinstance(ts, (int, float)) else None,
+                       "txid": (cur.get("txid") or "")[:16], "changelog_ref": cur.get("changelog_ref"),
+                       "hashes": {k: (cur.get(k) or "")[:8] for k in RELEASE_HASH_KEYS}},
+           "previous": ({"version": prev.get("version"), "signed_ts": prev.get("ts"),
+                         "hashes": {k: (prev.get(k) or "")[:8] for k in RELEASE_HASH_KEYS}} if prev else None),
+           "changed_vs_previous": changed,
+           "params_only_release": changed == ["params_sha256"],
+           "close_econ_settings": settings,
+           "close_econ_served": [x["key"] for x in settings if x["served"] and x["key"] != "estab_ttl"],
+           "flags": []}
+    if "params_sha256" in changed:
+        res["flags"].append("params_hash_changed")
+        if not res["close_econ_served"]:
+            res["flags"].append("close_econ_settings_not_served")
+    res["note"] = ("Keyless: GET /api/release and /api/params. params_sha256 is the hash the operator signed for the "
+                   "ledger's params file; /api/params is what the node serves now. If the changelog names values that "
+                   "/api/params doesn't show yet, read it again later; this report never takes values from the changelog text.")
+    return res
+
+
+def print_release(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"release: {r.get('error')}")
+        return
+    c = r["current"]
+    print(f"release {c['version']}  signed {c['signed_at_utc'] or '-'}  txid {c['txid']}")
+    if c.get("changelog_ref"):
+        print(f"changelog: {c['changelog_ref']}")
+    if r.get("previous"):
+        ch = ", ".join(k.replace("_sha256", "") for k in r["changed_vs_previous"]) or "nothing"
+        print(f"vs previous {r['previous']['version']}: changed {ch}")
+    print("close-econ settings in /api/params:")
+    for x in r["close_econ_settings"]:
+        if x["served"]:
+            print(f"  {x['key']:<30} {x['value']}")
+        else:
+            print(f"  {x['key']:<30} not served (engine default: {x['engine_default']})")
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
+def cmd_release(args: argparse.Namespace) -> None:
+    try:
+        rel = api_call("GET", "/api/release", need_key=False, timeout=30, retries=2)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"release: could not read /api/release: {redact(str(ex))}")
+        sys.exit(2)
+    try:
+        params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+    except Exception:
+        params = {}
+    r = release_report(rel, params if isinstance(params, dict) else {})
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_release(r)
+    if not r.get("ok"):
+        sys.exit(2)
 
 
 def cmd_jobs(args: argparse.Namespace) -> None:
@@ -4002,7 +4142,7 @@ def cmd_intake(args: argparse.Namespace) -> None:
     params = params if isinstance(params, dict) else {}
     if getattr(args, "what_if", False):
         r = intake_whatif(epochs_res, me, params=params, floor=args.floor, rate=args.rate, waitlist=args.waitlist,
-                          order=args.order, start=args.from_close, last=args.last)
+                          order=args.order, start=args.from_close, last=args.last, ttl=getattr(args, "ttl", None))
         if args.json:
             print(json.dumps(r, indent=2))
         else:
@@ -5580,7 +5720,11 @@ def main() -> None:
     p_in.add_argument("--rate", type=float, default=None, help="--what-if: estab_intake_rate, 0-1 (default: live value, else 0.10)")
     p_in.add_argument("--waitlist", type=int, default=None, help="--what-if: estab_waitlist_epochs W (default: live value, else 0 = off)")
     p_in.add_argument("--order", choices=list(WAITLIST_ORDERS), default="behind", help="--what-if: waitlist behind fresh eligibles (engine as written), ahead of them, or ahead oldest-first")
+    p_in.add_argument("--ttl", type=int, default=None, help="--what-if: estab_ttl in closes for decay in the replayed closes (default: live value, else 6)")
     p_in.add_argument("--from-close", dest="from_close", type=int, default=None, help="--what-if: replay from this close on; earlier closes follow the records (default: after the last close a default replay can't reproduce)")
+
+    p_rl = sub.add_parser("release", help="Keyless: the current signed release (version, time, changelog, which hashes changed) next to the close-econ settings /api/params serves")
+    p_rl.add_argument("--json", action="store_true", help="JSON output")
 
     p_jb = sub.add_parser("jobs", help="Saved busy-node (202) jobs: --check polls each queued job once (done / still queued / tombstone when expired); never resends")
     p_jb.add_argument("--check", action="store_true", help="Poll each queued job once and update the store")
@@ -5895,6 +6039,8 @@ def main() -> None:
             cmd_join_pow(args)
         elif args.command == "intake":
             cmd_intake(args)
+        elif args.command == "release":
+            cmd_release(args)
         elif args.command == "jobs":
             cmd_jobs(args)
         elif args.command == "epoch-time":
