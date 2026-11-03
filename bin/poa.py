@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.1"
+KIT_VERSION = "1.9.2"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4065,7 +4065,7 @@ CLOSE_ECON_SETTINGS = (
     ("estab_ttl", "6"),
     ("final_payout_basis_from_epoch", "off"),
     ("emission_carry_from_epoch", "off"),
-    ("carry_cap_pools", "1 (only used when carry is on)"),
+    ("carry_cap_pools", "1 (only used when carry is on; 0 burns all carry)"),
 )
 
 
@@ -4104,6 +4104,20 @@ def release_report(release_res, params=None) -> dict:
            "close_econ_settings": settings,
            "close_econ_served": [x["key"] for x in settings if x["served"] and x["key"] != "estab_ttl"],
            "flags": []}
+    # Carry effect (engine 17d72cad): carry_in = min(previous carry_out, carry_cap_pools x base pool); the rest is burned.
+    served = {x["key"]: x["value"] for x in settings if x["served"]}
+    cf, cap = served.get("emission_carry_from_epoch"), served.get("carry_cap_pools", 1)
+    if not isinstance(cf, int) or isinstance(cf, bool):
+        res["carry_effect"] = "off (emission_carry_from_epoch not served)"
+    elif isinstance(cap, int) and not isinstance(cap, bool) and cap == 0:
+        res["carry_effect"] = (f"burn: carry is switched on from epoch {cf} but carry_cap_pools is 0, so a close's "
+                               "unallocated emission is burned and nothing is added to the next pool")
+        res["flags"].append("carry_capped_to_zero")
+    elif isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        res["carry_effect"] = (f"carry: from epoch {cf}, up to {cap}x the base pool of a close's unallocated emission "
+                               "is added to the next pool; any excess is burned")
+    else:
+        res["carry_effect"] = f"unclear (carry_cap_pools served as {cap!r})"
     if "params_sha256" in changed:
         res["flags"].append("params_hash_changed")
         if not res["close_econ_served"]:
@@ -4131,6 +4145,8 @@ def print_release(r: dict) -> None:
             print(f"  {x['key']:<30} {x['value']}")
         else:
             print(f"  {x['key']:<30} not served (engine default: {x['engine_default']})")
+    if r.get("carry_effect"):
+        print(f"carry effect (as served): {r['carry_effect']}")
     for f in r["flags"]:
         print(f"flag: {f}")
     print(r["note"])
