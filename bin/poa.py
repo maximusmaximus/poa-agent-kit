@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.2"
+KIT_VERSION = "1.9.3"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4172,6 +4172,176 @@ def cmd_release(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# intake --waitlist-report: did the establishment waitlist admit anyone? (SUGGESTIONS.md #102)
+# ---------------------------------------------------------------------------
+WAITLIST_REPORT_DEFAULT_LAST = 5
+
+
+def waitlist_report(epochs_res, close_reports: dict = None, address: str = "", params: dict = None,
+                    last: int = 0, waitlist: int = None) -> dict:
+    """Pure function. For each close in GET /api/epochs, splits the establishment admissions
+    (basis.established_after) into accounts that passed at that close (fresh) and accounts that
+    only sat on the waitlist: passed at one of the previous W closes (W = estab_waitlist_epochs),
+    weren't admitted, and aren't established. Next to that it puts the counts the close report
+    records (GET /api/close-report?epoch=N: eligible, admitted, waitlisted, admitted_with_seats)
+    and checks that the rebuilt left-waiting count matches the recorded `waitlisted`. With an
+    address it says whether that account is waiting now, its place in the next close's sha256
+    order among the waiting accounts, and how many closes it has left on the waitlist.
+    W is the live value for every close (the records don't say when it was switched on).
+    Output never contains any address."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    params = params if isinstance(params, dict) else {}
+    live = intake_settings(params)
+    try:
+        w = live["waitlist"] if waitlist is None else max(0, int(waitlist))
+    except (TypeError, ValueError):
+        w = live["waitlist"]
+    crs = close_reports if isinstance(close_reports, dict) else {}
+    me = (address or "").strip()
+    est, hist, rows = set(), [], []
+    me_left_at = None
+    for e in eps:
+        n = int(e["epoch"])
+        b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+        eligible = {a for a in (b.get("challenge_eligible") or []) if isinstance(a, str)}
+        admitted = {a for a in (b.get("established_after") or []) if isinstance(a, str)}
+        removed = {a for a in (b.get("established_removed") or []) if isinstance(a, str)}
+        fresh = eligible - est
+        carried = set()
+        if w:
+            for _, left in hist[-w:]:
+                carried |= left
+        carried -= est
+        carried -= fresh
+        left_waiting = fresh - admitted
+        row = {"close": n, "established_before": len(est), "fresh": len(fresh), "waitlist_carried_in": len(carried),
+               "admitted": len(admitted), "admitted_fresh": len(admitted & fresh),
+               "admitted_from_waitlist": len(admitted & carried),
+               "admitted_other": len(admitted - fresh - carried), "left_waiting": len(left_waiting)}
+        cr = crs.get(n)
+        est_rec = (cr.get("establishment") if isinstance(cr, dict) else None) or {}
+        if isinstance(est_rec, dict) and est_rec:
+            row["recorded"] = {k: est_rec.get(k) for k in ("established_before", "eligible", "admitted",
+                                                            "waitlisted", "admitted_with_seats")}
+            row["recorded_match"] = (est_rec.get("waitlisted") in (None, len(left_waiting))
+                                     and est_rec.get("admitted") in (None, len(admitted)))
+        else:
+            row["recorded"] = None
+            row["recorded_match"] = None
+        if me:
+            row["me"] = {"fresh": me in fresh, "on_waitlist": me in carried, "admitted": me in admitted,
+                         "admitted_from_waitlist": me in admitted and me in carried,
+                         "left_waiting": me in left_waiting}
+        rows.append(row)
+        hist.append((n, left_waiting))
+        if me in left_waiting:
+            me_left_at = n
+        est |= admitted
+        est -= removed
+    newest = int(eps[-1]["epoch"])
+    sel = rows[-last:] if last and last > 0 else rows
+    res = {"ok": True, "read_only": True, "newest_close": newest, "waitlist_closes": w,
+           "waitlist_served": "estab_waitlist_epochs" in live.get("served", []), "rows": sel,
+           "closes": len(sel),
+           "carried_in_total": sum(r["waitlist_carried_in"] for r in sel),
+           "admitted_total": sum(r["admitted"] for r in sel),
+           "admitted_from_waitlist_total": sum(r["admitted_from_waitlist"] for r in sel),
+           "admitted_fresh_total": sum(r["admitted_fresh"] for r in sel),
+           "admitted_with_seats_total": (sum(r["recorded"].get("admitted_with_seats") or 0 for r in sel if r["recorded"])
+                                         if any(r["recorded"] for r in sel) else None),
+           "flags": []}
+    if w and res["carried_in_total"] and res["admitted_total"] and not res["admitted_from_waitlist_total"]:
+        res["flags"].append("waitlist_admitted_nobody")
+    if any(r["recorded_match"] is False for r in sel):
+        res["flags"].append("recorded_counts_differ")
+    if any(r["recorded"] is None for r in sel):
+        res["flags"].append("close_report_missing")
+    if me:
+        waiting_next = set()
+        if w:
+            for k, left in hist[-w:]:
+                waiting_next |= left
+        waiting_next -= est
+        you = {"established_per_records": me in est, "waiting_for_next_close": me in waiting_next,
+               "last_left_waiting_close": me_left_at,
+               "times_on_waitlist": sum(1 for r in rows if r["me"]["on_waitlist"]),
+               "admitted_from_waitlist": any(r["me"]["admitted_from_waitlist"] for r in rows)}
+        if me in waiting_next:
+            order = intake_order(waiting_next, newest + 1)
+            you["waitlist_position"] = order.index(me) + 1
+            you["waitlist_size"] = len(order)
+            you["closes_left_on_waitlist"] = max(0, me_left_at + w - newest)
+        res["you"] = you
+    res["note"] = ("Keyless: GET /api/epochs, /api/params and /api/close-report?epoch=N only. 'Waitlist' = passed at one "
+                   "of the previous W closes, not admitted and not established; 'fresh' = passed at this close. The "
+                   "position is the account's place in the next close's sha256 intake order among waiting accounts "
+                   "only; under the engine as written fresh passers are drawn first, so it is not a promise of a seat. "
+                   "No address is ever printed.")
+    return res
+
+
+def print_waitlist_report(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"intake waitlist: {r.get('error')}")
+        return
+    print(f"intake waitlist report: waitlist {r['waitlist_closes']} closes"
+          + (" (served in /api/params)" if r["waitlist_served"] else " (estab_waitlist_epochs not served; engine default off)")
+          + f" | newest close E{r['newest_close']}")
+    print("close est  fresh waiting admitted (fresh+waitlist) left  recorded elig/adm/wait/with-seats  you")
+    for x in r["rows"]:
+        rec = x["recorded"]
+        rs = ("/".join("-" if rec.get(k) is None else str(rec.get(k)) for k in ("eligible", "admitted", "waitlisted",
+                                                                                "admitted_with_seats"))
+              if rec else "not read")
+        if x["recorded_match"] is False:
+            rs += " (differs)"
+        you = "-"
+        m = x.get("me")
+        if m:
+            if m["admitted"]:
+                you = "ADMITTED" + (" from the waitlist" if m["admitted_from_waitlist"] else " (fresh)")
+            elif m["on_waitlist"]:
+                you = "waiting, not admitted"
+            elif m["left_waiting"]:
+                you = "passed, not admitted (waitlisted)"
+        print(f"E{x['close']:<4} {x['established_before']:<4} {x['fresh']:<5} {x['waitlist_carried_in']:<7} "
+              f"{x['admitted']:>3} ({x['admitted_fresh']}+{x['admitted_from_waitlist']}){'':12} {x['left_waiting']:<5} "
+              f"{rs:<33} {you}")
+    seats = r["admitted_with_seats_total"]
+    print(f"over {r['closes']} closes: {r['admitted_total']} admitted, {r['admitted_fresh_total']} fresh and "
+          f"{r['admitted_from_waitlist_total']} from the waitlist ({r['carried_in_total']} waiting account-closes)"
+          + (f"; {seats} admitted with grading seats" if seats is not None else ""))
+    y = r.get("you")
+    if y:
+        if y.get("waitlist_position"):
+            print(f"you: waiting, position {y['waitlist_position']} of {y['waitlist_size']} among waiting accounts for the "
+                  f"E{r['newest_close'] + 1} close, {y['closes_left_on_waitlist']} close(s) left on the waitlist")
+        elif y["established_per_records"]:
+            print("you: established per records")
+        else:
+            print("you: not on the waitlist" + (f" (last left waiting at E{y['last_left_waiting_close']})"
+                                                if y["last_left_waiting_close"] is not None else ""))
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
+def fetch_close_reports(closes, timeout: int = 30) -> dict:
+    """Keyless GET /api/close-report?epoch=N for each close; unreadable ones are left out."""
+    out = {}
+    for n in closes:
+        try:
+            cr = api_call("GET", "/api/close-report", query={"epoch": int(n)}, need_key=False, timeout=timeout, retries=1)
+        except Exception:
+            continue
+        if isinstance(cr, dict):
+            out[int(n)] = cr
+    return out
+
+
+# ---------------------------------------------------------------------------
 # insights: the per-close read-only network insight endpoints (server release v0.80-insights)
 # ---------------------------------------------------------------------------
 INSIGHT_VIEWS = {
@@ -4444,7 +4614,16 @@ def cmd_intake(args: argparse.Namespace) -> None:
         params = {}
     me = "" if args.network else (args.address or local_address()).strip()
     params = params if isinstance(params, dict) else {}
-    if getattr(args, "what_if", False):
+    if getattr(args, "waitlist_report", False):
+        last = args.last if args.last and args.last > 0 else WAITLIST_REPORT_DEFAULT_LAST
+        closes = [int(e["epoch"]) for e in _epoch_list(epochs_res)][-last:]
+        r = waitlist_report(epochs_res, fetch_close_reports(closes), me, params=params, last=last,
+                            waitlist=args.waitlist)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_waitlist_report(r)
+    elif getattr(args, "what_if", False):
         r = intake_whatif(epochs_res, me, params=params, floor=args.floor, rate=args.rate, waitlist=args.waitlist,
                           order=args.order, start=args.from_close, last=args.last, ttl=getattr(args, "ttl", None))
         if args.json:
@@ -6031,9 +6210,10 @@ def main() -> None:
     p_in.add_argument("--json", action="store_true", help="JSON output")
     p_in.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
     p_in.add_argument("--what-if", dest="what_if", action="store_true", help="Replay admissions under chosen staged-intake settings (floor/rate/waitlist/order) instead of reading the draw")
+    p_in.add_argument("--waitlist-report", dest="waitlist_report", action="store_true", help="Per close: admissions from the waitlist vs fresh passers, next to the close report's recorded counts; your waitlist position and closes left (default last 5 closes)")
     p_in.add_argument("--floor", type=int, default=None, help="--what-if: estab_intake_floor (default: live value, else 5)")
     p_in.add_argument("--rate", type=float, default=None, help="--what-if: estab_intake_rate, 0-1 (default: live value, else 0.10)")
-    p_in.add_argument("--waitlist", type=int, default=None, help="--what-if: estab_waitlist_epochs W (default: live value, else 0 = off)")
+    p_in.add_argument("--waitlist", type=int, default=None, help="--what-if / --waitlist-report: estab_waitlist_epochs W (default: live value, else 0 = off)")
     p_in.add_argument("--order", choices=list(WAITLIST_ORDERS), default="behind", help="--what-if: waitlist behind fresh eligibles (engine as written), ahead of them, or ahead oldest-first")
     p_in.add_argument("--ttl", type=int, default=None, help="--what-if: estab_ttl in closes for decay in the replayed closes (default: live value, else 6)")
     p_in.add_argument("--from-close", dest="from_close", type=int, default=None, help="--what-if: replay from this close on; earlier closes follow the records (default: after the last close a default replay can't reproduce)")

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-03 (kit 1.9.3)
+- **New keyless mode `intake --waitlist-report` (SUGGESTIONS.md #102).** `estab_waitlist_epochs` is served as 3, and the close reports list 398, 29 and 15 accounts waitlisted at E36, E37 and E38, but nothing showed whether any of them were later admitted. The report rebuilds, per close, the fresh passers and the accounts waiting from the previous W closes, splits the admissions between them, and prints the recorded close-report counts (eligible, admitted, waitlisted, admitted_with_seats) next to the rebuilt ones. With an address it gives your place among waiting accounts for the next close and how many closes you have left on the waitlist. Flags `waitlist_admitted_nobody`, `recorded_counts_differ` and `close_report_missing`.
+- On the live records (E34 to E38, run 10:20 AM PT Nov 3, 2026) every recorded count matched the rebuild, and all 85 admissions went to fresh passers: 0 came from the waitlist, and 0 were admitted with grading seats.
+- `KIT_VERSION = "1.9.3"`. Tests: `tests/test_waitlist_report.py` (mocked responses only).
+
 ## 2026-11-03 (kit 1.9.2)
 - **Release `v0.82-carryoff` (signed 12:12 AM PT Nov 3, 2026, txid 0be19220).** Its changelog reads "carry_cap_pools 1->0 (burn not carry; ep37 stands)". Only the signed params hash changed (0f79f0cd to 5e142ea9); engine and client (`poa.mjs` 17d72cad), server (45394f22), worker (2867c013) and web client (911b833b) are unchanged. The ledger's `params.json` on `poa-mainnet-1` was changed to match in commit c588020d. At the time of this release `/api/params` still served `carry_cap_pools: 1`.
 - **What `carry_cap_pools` 0 does.** In the served engine, from `emission_carry_from_epoch` on, a close adds the previous close's unallocated emission to its pool, bounded by `carry_cap_pools` times the base pool, and burns the rest. With the cap at 0, nothing is carried and all unallocated emission is burned. Closes that pay nobody no longer make later pools bigger.
