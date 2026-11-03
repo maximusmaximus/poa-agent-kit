@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.0"
+KIT_VERSION = "1.9.1"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -408,6 +408,53 @@ def api_call(
     raise last
 
 
+# Release v0.81-asgcap (Nov 2, 2026): the assignment listings are paged. The server caps `limit` at 100
+# (default 50) and returns `offset`, `limit`, `total` and `has_more`; callers must follow `offset` while
+# `has_more` is true, or seats past the first page are silently missed.
+ASSIGNMENTS_PAGE_LIMIT = 100
+ASSIGNMENTS_MAX_PAGES = 50
+
+
+def _paged_assignments(fetch_page, max_pages: int = ASSIGNMENTS_MAX_PAGES) -> dict:
+    """Follow `offset` while `has_more`, merging `assignments`. fetch_page(offset) -> one page dict.
+
+    Returns the first page's fields with the merged list plus `pages`, and `truncated: True` if
+    max_pages ran out (seats beyond that are unknown, not absent). A page with no `has_more` field
+    (older servers) ends the walk."""
+    first = None
+    rows = []
+    offset = 0
+    pages = 0
+    seen = set()
+    while True:
+        page = fetch_page(offset)
+        pages += 1
+        if not isinstance(page, dict):
+            return page if first is None else dict(first, assignments=rows, pages=pages)
+        if first is None:
+            first = dict(page)
+        batch = [r for r in (page.get("assignments") or [])]
+        for r in batch:
+            key = (r.get("txid") or r.get("answer_txid")) if isinstance(r, dict) else None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            rows.append(r)
+        if not page.get("has_more") or not batch:
+            break
+        if pages >= max_pages:
+            first["truncated"] = True
+            break
+        offset = int(page.get("offset") or offset) + len(batch)
+    out = dict(first)
+    out["assignments"] = rows
+    out["pages"] = pages
+    out["has_more"] = bool(out.get("truncated"))
+    out.setdefault("truncated", False)
+    return out
+
+
 def hosted_assignments(timeout: int = None, retries: int = None, max_warming_waits: int = 2, sleep=time.sleep) -> dict:
     """Keyed seat listing, header-only (HOSTED_ASSIGNMENTS_PATH). Never falls back to ?key=.
 
@@ -417,8 +464,10 @@ def hosted_assignments(timeout: int = None, retries: int = None, max_warming_wai
     waits = 0
     while True:
         try:
-            return api_call("GET", HOSTED_ASSIGNMENTS_PATH, query={"sort": "oldest", "limit": 200},
-                            timeout=timeout, retries=retries)
+            return _paged_assignments(
+                lambda off: api_call("GET", HOSTED_ASSIGNMENTS_PATH,
+                                     query={"sort": "oldest", "limit": ASSIGNMENTS_PAGE_LIMIT, "offset": off},
+                                     timeout=timeout, retries=retries))
         except PoaHTTPError as e:
             warming = e.status == 503 and "warming" in str(e).lower()
             if warming and waits < max_warming_waits:
@@ -4619,17 +4668,28 @@ def classify_pull(res, http_code, close_epoch, close_ts, sent_ts, recv_ts, label
 def _keyless_assignments(address: str, timeout: float = 30):
     """(http_code, parsed_json_or_None). Keyless public route; never sends a key."""
     path = f"/api/assignments/{urllib.parse.quote(address)}/"
-    try:
-        raw = http_request("GET", f"{BASE_URL}{path}", headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                           timeout=timeout)
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return None, None
-    try:
-        return 200, json.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        return 200, None
+    status = {"code": 200}
+
+    def _page(off):
+        qs = urllib.parse.urlencode({"limit": ASSIGNMENTS_PAGE_LIMIT, "offset": off})
+        try:
+            raw = http_request("GET", f"{BASE_URL}{path}?{qs}",
+                               headers={"Accept": "application/json", "User-Agent": USER_AGENT}, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            status["code"] = e.code
+            return None
+        except Exception:
+            status["code"] = None
+            return None
+        try:
+            return json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    res = _paged_assignments(_page)
+    if not isinstance(res, dict):
+        return status["code"], None
+    return 200, res
 
 
 def _epochs_closed(timeout: float = 15):
