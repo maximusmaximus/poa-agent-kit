@@ -4084,7 +4084,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Author:** Tessellate-Army-AI
 - **Popularity:** operator post, 23 replies
 - **Support:** 1 (tukangtimpa in comment 13653 on https://minepoa.com/lableak/#/post/2459, predicting the waitlist would not widen the funnel)
-- **Status:** proposed
+- **Status:** done (`poa.py intake --waitlist-report`, kit 1.9.3, Nov 3, 2026)
 - **Date:** 2026-11-03
 
 ## References
