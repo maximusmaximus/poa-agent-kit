@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.3"
+KIT_VERSION = "1.9.4"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4057,7 +4057,7 @@ def print_intake_whatif(r: dict) -> None:
 # release: the signed release next to the close-economics settings /api/params actually serves
 # ---------------------------------------------------------------------------
 RELEASE_HASH_KEYS = ("engine_sha256", "client_sha256", "server_sha256", "params_sha256", "worker_sha256", "web_client_sha256")
-# Settings the served engine (poa.mjs 17d72cad) reads at each close, with what it does when a key is absent.
+# Settings the served engine (poa.mjs 87607a57, v0.83) reads at each close, with what it does when a key is absent.
 CLOSE_ECON_SETTINGS = (
     ("estab_intake_floor", "5"),
     ("estab_intake_rate", "0.10"),
@@ -4118,6 +4118,9 @@ def release_report(release_res, params=None) -> dict:
                                "is added to the next pool; any excess is burned")
     else:
         res["carry_effect"] = f"unclear (carry_cap_pools served as {cap!r})"
+    res["carry_correction"] = carry_correction_report(params)
+    if res["carry_correction"]["served"] and not res["carry_correction"].get("table_ok"):
+        res["flags"].append("carry_correction_table_mismatch")
     if "params_sha256" in changed:
         res["flags"].append("params_hash_changed")
         if not res["close_econ_served"]:
@@ -4126,6 +4129,55 @@ def release_report(release_res, params=None) -> dict:
                    "ledger's params file; /api/params is what the node serves now. If the changelog names values that "
                    "/api/params doesn't show yet, read it again later; this report never takes values from the changelog text.")
     return res
+
+
+def _js_string(v) -> str:
+    """String(v) as JavaScript writes it, for the values a carry_correction table holds (strings and plain numbers)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v == int(v) and abs(v) < 1e21:
+            return str(int(v))
+        return repr(v)
+    return str(v)
+
+
+def carry_correction_table_sha(entries) -> str:
+    """Same hash as the engine's carryCorrectionTableSha (v0.83): sha256 of JSON.stringify of the
+    key-sorted [addr, String(amount)] pairs."""
+    entries = entries if isinstance(entries, dict) else {}
+    pairs = [[k, _js_string(entries[k])] for k in sorted(entries)]
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def carry_correction_report(params) -> dict:
+    """Pure function. Engine v0.83 (#40, ballot 2464 = A) can burn a pinned per-address amount from LOCKED
+    balances once, at the close of carry_correction.from_epoch, clamped down to what is locked. The code is
+    inert while /api/params doesn't serve carry_correction. When it is served, this reports from_epoch, the
+    number of entries, the pinned total, and whether table_sha256 matches the entries (the same check the
+    engine runs before it will close). It never prints an address."""
+    params = params if isinstance(params, dict) else {}
+    cc = params.get("carry_correction")
+    if not isinstance(cc, dict):
+        return {"served": False,
+                "effect": "inert (carry_correction not served; engine v0.83 changes nothing until it is)"}
+    entries = cc.get("entries") if isinstance(cc.get("entries"), dict) else {}
+    total = 0.0
+    for v in entries.values():
+        try:
+            total += float(v)
+        except (TypeError, ValueError):
+            pass
+    computed = carry_correction_table_sha(entries)
+    fe = cc.get("from_epoch")
+    ok = bool(cc.get("table_sha256")) and computed == cc.get("table_sha256")
+    return {"served": True, "from_epoch": fe, "entries": len(entries), "pinned_total": round(total, 6),
+            "table_sha256": (cc.get("table_sha256") or "")[:16], "computed_sha256": computed[:16], "table_ok": ok,
+            "effect": (f"at the close of epoch {fe}, up to the pinned amount is burned from each listed account's "
+                       "locked balance (and its balance), clamped to what is locked; spendable is unchanged; "
+                       "applied once")}
 
 
 def print_release(r: dict) -> None:
@@ -4147,6 +4199,12 @@ def print_release(r: dict) -> None:
             print(f"  {x['key']:<30} not served (engine default: {x['engine_default']})")
     if r.get("carry_effect"):
         print(f"carry effect (as served): {r['carry_effect']}")
+    cc = r.get("carry_correction") or {}
+    if cc.get("served"):
+        print(f"carry correction (as served): from epoch {cc['from_epoch']}, {cc['entries']} entries, "
+              f"pinned total {cc['pinned_total']} POA, table hash {'ok' if cc['table_ok'] else 'MISMATCH'}")
+    elif cc:
+        print(f"carry correction: {cc['effect']}")
     for f in r["flags"]:
         print(f"flag: {f}")
     print(r["note"])
