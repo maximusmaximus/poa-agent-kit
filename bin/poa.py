@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.4"
+KIT_VERSION = "1.9.5"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1063,8 +1063,10 @@ WRITE_LOCK_TIMEOUT_S = float(os.environ.get("POA_WRITE_LOCK_TIMEOUT_S", "300"))
 # checkpoint bake covers a nonce slot with two or more candidate txs, its winner is written to the
 # chain's slot-winners.jsonl and any other tx in that slot is rejected "slot latched (slot-winners hN)".
 # It is a taken-slot refusal like the others: never resend into it.
+# "slot overridden" (release v0.84-slotlatch-cc44, 2:38 PM PT Nov 4, 2026, params slot_latch_overrides): a slot
+# whose winner is pinned by the operator in params rejects every other tx "slot overridden (lived hN)".
 NONCE_MARKERS = ("nonce", "duplicate slot", "duplicate-slot", "dup-slot", "slot taken", "slot already",
-                 "slot latched")
+                 "slot latched", "slot overridden")
 _NONCE = {"adopted": None, "source": None, "at": None}
 
 
