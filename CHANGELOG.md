@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-05 (kit 1.9.6)
+- **New keyless mode `standing --roster` (SUGGESTIONS.md #111).** Per close, joins `/api/epochs` with `/api/close-report?epoch=N` to say whether your address was on the prior established roster, on the seatless list, waitlisted, admitted (`established_after`), or in `basis.graders_served`. When `panel_data` is unavailable and `seatless` is null, the row marks seatless as unknown rather than no. Summarises the window as a lane (`never-dealt-or-seatless`, `on-roster-grader`, …). Never prints an address.
+- `KIT_VERSION = "1.9.6"`. Tests: `tests/test_roster.py` (mocked responses only).
+
+
 ## 2026-11-04 (kit 1.9.5)
 - **Release `v0.84-slotlatch-cc44` (signed 2:38 PM PT Nov 4, 2026, txid caa3a21f).** Its changelog reads "v0.84 slot-latch repair (4 lived overrides+latch freshness+deferral fix) + #40 carry_correction @E44; fork healed". Engine and client (`poa.mjs`) changed from 87607a57 to d30ea55b and the signed params hash from 5e142ea9 to 6de5b2fc; server (45394f22), worker (a2e1cf2a) and web client (911b833b) are unchanged.
 - **Live `/api/params` now serves two new keys.** `carry_correction` (from_epoch 44, 92 accounts, 940.52M POA pinned in total, `table_sha256` be455270, which matches the entries) turns on the one-time locked-balance burn from ballot 2464 at the E44 close; `poa.py release` already reports it. `slot_latch_overrides` lists 4 nonce slots whose winner is pinned to the tx that an earlier checkpoint actually accepted.

@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.5"
+KIT_VERSION = "1.9.6"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3671,6 +3671,171 @@ def print_standing(r: dict) -> None:
         print(f"flag: {f}")
 
 
+
+# ---------------------------------------------------------------------------
+# standing --roster: per-address roster membership per close (SUGGESTIONS.md #111)
+# ---------------------------------------------------------------------------
+ROSTER_REPORT_DEFAULT_LAST = 5
+
+
+def roster_report(epochs_res, close_reports: dict = None, address: str = "", params: dict = None,
+                  last: int = 0) -> dict:
+    """Pure function. For each close, reports whether `address` sat on the prior established
+    roster, on the close-report seatless list, on the establishment waitlist, in
+    established_after (admitted), or in basis.graders_served. When the close report's
+    panel_data is unavailable (seatless null), seatless is marked unknown rather than no.
+    Prior roster is the running established set rebuilt from established_after /
+    established_removed (same as intake). Waitlisted = carried onto this close's waitlist
+    or left waiting after this close's admissions. Output never contains any address."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    params = params if isinstance(params, dict) else {}
+    live = intake_settings(params)
+    w = live["waitlist"]
+    crs = close_reports if isinstance(close_reports, dict) else {}
+    me = (address or "").strip()
+    if not me:
+        return {"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}
+    est, hist, rows = set(), [], []
+    for e in eps:
+        n = int(e["epoch"])
+        b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+        eligible = {a for a in (b.get("challenge_eligible") or []) if isinstance(a, str)}
+        admitted = {a for a in (b.get("established_after") or []) if isinstance(a, str)}
+        removed = {a for a in (b.get("established_removed") or []) if isinstance(a, str)}
+        gs = b.get("graders_served") if isinstance(b.get("graders_served"), dict) else {}
+        fresh = eligible - est
+        carried = set()
+        if w:
+            for _, left in hist[-w:]:
+                carried |= left
+        carried -= est
+        carried -= fresh
+        left_waiting = fresh - admitted
+        prior = me in est
+        on_waitlist = me in carried
+        left_wait = me in left_waiting
+        cr = crs.get(n) if isinstance(crs.get(n), dict) else None
+        panel_data = cr.get("panel_data") if cr else None
+        seatless_list = cr.get("seatless") if cr else None
+        seatless_count = cr.get("seatless_count") if cr else None
+        if isinstance(seatless_list, list):
+            seatless = me in seatless_list
+            seatless_known = True
+        elif cr is None:
+            seatless, seatless_known = None, False
+        else:
+            # close report present but seatless null (panel_data unavailable) → unknown
+            seatless, seatless_known = None, False
+        est_rec = (cr.get("establishment") if cr else None) or {}
+        row = {
+            "close": n,
+            "closed_at": _iso(e["ts"]) if e.get("ts") else None,
+            "prior_roster": prior,
+            "seatless": seatless,
+            "seatless_known": seatless_known,
+            "waitlisted": on_waitlist or left_wait,
+            "on_waitlist": on_waitlist,
+            "left_waiting": left_wait,
+            "admitted": me in admitted,
+            "graders_served": me in gs,
+            "graders_served_seats": int(gs[me]) if me in gs and isinstance(gs[me], (int, float)) else (1 if me in gs else 0),
+            "network": {
+                "established_before": len(est),
+                "seatless_count": seatless_count if isinstance(seatless_count, int) else (len(seatless_list) if isinstance(seatless_list, list) else None),
+                "graders_served": len(gs),
+                "admitted": len(admitted),
+                "waitlisted_left": len(left_waiting),
+                "recorded_established_before": est_rec.get("established_before") if isinstance(est_rec, dict) else None,
+                "recorded_waitlisted": est_rec.get("waitlisted") if isinstance(est_rec, dict) else None,
+                "panel_data": panel_data,
+            },
+            "flags": [],
+        }
+        if not seatless_known:
+            row["flags"].append("seatless_unknown")
+            if panel_data and str(panel_data).startswith("unavailable"):
+                row["flags"].append("panel_data_unavailable")
+        if seatless is True and prior:
+            row["flags"].append("seatless_and_prior_roster")  # should not happen under the published definition
+        if seatless is False and not prior and seatless_known:
+            # settled-author check isn't in this view; only flag if CR listed seatless and we're outside it while not prior
+            pass
+        if row["admitted"] and prior:
+            row["flags"].append("admitted_while_prior")  # unusual; established_after while already on roster
+        rows.append(row)
+        hist.append((n, left_waiting))
+        est |= admitted
+        est -= removed
+    newest = int(eps[-1]["epoch"])
+    sel = rows[-last:] if last and last > 0 else rows
+    times_seatless = sum(1 for r in sel if r["seatless"] is True)
+    times_unknown = sum(1 for r in sel if not r["seatless_known"])
+    times_prior = sum(1 for r in sel if r["prior_roster"])
+    times_waitlisted = sum(1 for r in sel if r["waitlisted"])
+    times_admitted = sum(1 for r in sel if r["admitted"])
+    times_gs = sum(1 for r in sel if r["graders_served"])
+    # lane label for the window
+    if times_prior == 0 and times_gs == 0 and times_admitted == 0 and (times_seatless or times_unknown):
+        lane = "never-dealt-or-seatless"
+    elif times_prior and times_gs:
+        lane = "on-roster-grader"
+    elif times_prior:
+        lane = "on-roster"
+    elif times_admitted:
+        lane = "newly-admitted"
+    else:
+        lane = "off-roster"
+    res = {
+        "ok": True, "read_only": True, "newest_close": newest, "waitlist_closes": w,
+        "closes": len(sel), "rows": sel,
+        "you": {
+            "times_prior_roster": times_prior,
+            "times_seatless": times_seatless,
+            "times_seatless_unknown": times_unknown,
+            "times_waitlisted": times_waitlisted,
+            "times_admitted": times_admitted,
+            "times_graders_served": times_gs,
+            "lane": lane,
+        },
+        "flags": [],
+        "note": ("Keyless: GET /api/epochs, /api/params and /api/close-report?epoch=N. "
+                 "Prior roster = running established set from established_after/removed. "
+                 "Seatless comes from the close report; when panel_data is unavailable, seatless is unknown, not no. "
+                 "No address is printed."),
+    }
+    if times_unknown:
+        res["flags"].append("seatless_unknown_in_window")
+    if times_seatless and times_prior == 0 and times_gs == 0:
+        res["flags"].append("seatless_lane")
+    if any("seatless_and_prior_roster" in r["flags"] for r in sel):
+        res["flags"].append("seatless_definition_conflict")
+    return res
+
+
+def print_roster(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"standing roster: {r.get('error')}")
+        return
+    y = r["you"]
+    print(f"standing roster: lane {y['lane']} | prior {y['times_prior_roster']}, seatless {y['times_seatless']}"
+          f" (unknown {y['times_seatless_unknown']}), waitlisted {y['times_waitlisted']}, "
+          f"admitted {y['times_admitted']}, graders_served {y['times_graders_served']} "
+          f"over {r['closes']} closes (waitlist W={r['waitlist_closes']})")
+    print("close prior seatless waitlisted admitted graders_served  net seatless/est_before/gs  flags")
+    for x in r["rows"]:
+        ss = "unknown" if x["seatless"] is None else str(x["seatless"])
+        nw = x["network"]
+        sc = "-" if nw["seatless_count"] is None else str(nw["seatless_count"])
+        print(f"E{x['close']:<4} {str(x['prior_roster']):<5} {ss:<8} {str(x['waitlisted']):<10} "
+              f"{str(x['admitted']):<8} {str(x['graders_served']):<15} "
+              f"{sc}/{nw['established_before']}/{nw['graders_served']:<4} {','.join(x['flags']) or '-'}")
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
 def cmd_standing(args: argparse.Namespace) -> None:
     try:
         epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
@@ -3681,6 +3846,23 @@ def cmd_standing(args: argparse.Namespace) -> None:
     if not me:
         print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
         sys.exit(2)
+    if getattr(args, "roster", False):
+        params = {}
+        try:
+            params = api_call("GET", "/api/params", need_key=False, timeout=30, retries=1)
+        except Exception:
+            params = {}
+        last = args.last if args.last and args.last > 0 else ROSTER_REPORT_DEFAULT_LAST
+        closes = [int(e["epoch"]) for e in _epoch_list(epochs_res)][-last:]
+        r = roster_report(epochs_res, fetch_close_reports(closes, timeout=args.timeout), me,
+                          params=params if isinstance(params, dict) else {}, last=last)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_roster(r)
+        if not r.get("ok"):
+            sys.exit(2)
+        return
     txs = []
     try:
         d = explorer_get(f"/api/explorer/address/{me}?sort=new")
@@ -6255,11 +6437,12 @@ def main() -> None:
     p_wd = sub.add_parser("write-drill", help="Offline crash-recovery drill for answer writes: counts sends across a simulated restart (fake server, no network, no key); exit 3 if any case sends twice")
     p_wd.add_argument("--json", action="store_true", help="JSON output")
 
-    p_sd = sub.add_parser("standing", help="Own-standing row per close: our settled answers (passed, aligned jurors), eligible, attested, established_after/removed, payout; flags passed-and-eligible-but-not-established")
-    p_sd.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close in /api/epochs)")
+    p_sd = sub.add_parser("standing", help="Own-standing row per close: our settled answers (passed, aligned jurors), eligible, attested, established_after/removed, payout; flags passed-and-eligible-but-not-established. --roster: prior roster / seatless / waitlist / admitted / graders_served per close")
+    p_sd.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close in /api/epochs; with --roster default 5)")
     p_sd.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
     p_sd.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_sd.add_argument("--no-me", action="store_true", help="Skip the keyed /api/hosted/me read (fully keyless)")
+    p_sd.add_argument("--roster", action="store_true", help="Per close: prior roster, seatless (unknown when panel_data unavailable), waitlisted, admitted, graders_served; keyless close-report join")
     p_sd.add_argument("--json", action="store_true", help="JSON output")
     p_sd.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
