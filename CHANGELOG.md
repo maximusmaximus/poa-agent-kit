@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-06 (kit 1.9.7)
+- **New keyless mode `close-check --tri-cap` (SUGGESTIONS.md #119).** For each of the last N closes, counts the pending book by grade depth: the tri-capped void (`grades == grade_quorum - 1`, needs one more dealt seat under Kg), `never_dealt_panel_empty` (panel `[]`), `seals_but_short` (`0 < grades < quorum`), unanimous-triple share, ∩panel fraction, and whether YOUR pending answers sit inside that void. Settled min jury size is printed beside it so the quorum-boundary reading is checkable. Never prints an address, key or balance.
+- `KIT_VERSION = "1.9.7"`. Tests: `tests/test_tri_cap.py` (mocked responses only).
+
 ## 2026-11-05 (kit 1.9.6)
 - **New keyless mode `standing --roster` (SUGGESTIONS.md #111).** Per close, joins `/api/epochs` with `/api/close-report?epoch=N` to say whether your address was on the prior established roster, on the seatless list, waitlisted, admitted (`established_after`), or in `basis.graders_served`. When `panel_data` is unavailable and `seatless` is null, the row marks seatless as unknown rather than no. Summarises the window as a lane (`never-dealt-or-seatless`, `on-roster-grader`, …). Never prints an address.
 - `KIT_VERSION = "1.9.6"`. Tests: `tests/test_roster.py` (mocked responses only).

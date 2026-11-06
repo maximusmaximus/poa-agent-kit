@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.6"
+KIT_VERSION = "1.9.7"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3532,6 +3532,201 @@ def print_close_check(r: dict) -> None:
               + (f" [{','.join(a['flags'])}]" if a['flags'] else ""))
 
 
+
+def _pending_grade_count(row) -> int:
+    """Number of seals on a pending row. grades is usually a list of {grader,score,ts}."""
+    if not isinstance(row, dict):
+        return 0
+    grades = row.get("grades")
+    if isinstance(grades, list):
+        return len(grades)
+    if isinstance(grades, dict):
+        return len(grades)
+    try:
+        return int(grades or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pending_panel_len(row) -> int:
+    if not isinstance(row, dict):
+        return 0
+    panel = row.get("panel")
+    return len(panel) if isinstance(panel, list) else 0
+
+
+def _grades_unanimous(row) -> bool:
+    """True when every listed grade score is the same (and there is at least one)."""
+    if not isinstance(row, dict):
+        return False
+    grades = row.get("grades") or []
+    if not isinstance(grades, list) or not grades:
+        return False
+    scores = []
+    for g in grades:
+        if isinstance(g, dict) and "score" in g:
+            scores.append(g["score"])
+        elif isinstance(g, (int, float)):
+            scores.append(g)
+    return bool(scores) and len(set(scores)) == 1
+
+
+def tri_cap_report(epochs_res, answers: dict = None, address: str = "", quorum: int = 4,
+                   last: int = 4) -> dict:
+    """Pure function (SUGGESTIONS.md #119). For each of the last `last` closes, count the
+    pending book by grade depth: the tri-capped void is grades == quorum-1 (needs one more
+    dealt seat to settle under Kg), split never-dealt (panel empty) vs seals-but-short
+    (0 < grades < quorum), and flag whether OUR pending answers sit inside that void.
+    Output never contains the address, a key, a balance, or full grader addresses."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    q = max(2, int(quorum or 4))
+    tri_n = q - 1
+    me = (address or "").strip()
+    # answers: {born_epoch: txid} and/or we also accept {txid: born}
+    ans = dict(answers or {})
+    if ans and all(isinstance(k, str) for k in ans):
+        # already txid->born; build epoch map best-effort
+        by_ep = {}
+        for tx, born in ans.items():
+            if born is not None:
+                by_ep.setdefault(int(born), tx)
+        epoch_answers = by_ep
+        tx_list = list(ans.keys())
+    else:
+        epoch_answers = {int(k): v for k, v in ans.items() if v}
+        tx_list = list(epoch_answers.values())
+
+    start = max(0, len(eps) - max(1, last))
+    rows = []
+    for e in eps[start:]:
+        n = int(e["epoch"])
+        b = e.get("basis") or {}
+        pending = b.get("pending") if isinstance(b.get("pending"), dict) else {}
+        settled = b.get("settled") if isinstance(b.get("settled"), list) else []
+        by_grades = {}
+        tri = 0
+        tri_with_panel = 0
+        tri_unanimous = 0
+        zero = 0
+        seals_short = 0
+        never_dealt = 0  # panel empty
+        for _tx, pr in pending.items():
+            if not isinstance(pr, dict):
+                continue
+            g = _pending_grade_count(pr)
+            p = _pending_panel_len(pr)
+            by_grades[g] = by_grades.get(g, 0) + 1
+            if g == 0:
+                zero += 1
+            if 0 < g < q:
+                seals_short += 1
+            if p == 0:
+                never_dealt += 1
+            if g == tri_n:
+                tri += 1
+                if p > 0:
+                    tri_with_panel += 1
+                if _grades_unanimous(pr):
+                    tri_unanimous += 1
+        # settled jury size floor (informational: should be >= quorum when juried)
+        jury_sizes = []
+        for srow in settled:
+            if isinstance(srow, dict):
+                jury = srow.get("jury") or []
+                if isinstance(jury, list) and jury:
+                    jury_sizes.append(len(jury))
+        settled_min_jury = min(jury_sizes) if jury_sizes else None
+        # own pending inside this close's pending snapshot
+        own = []
+        for tx in tx_list:
+            ph = _find_tx(pending.keys(), tx)
+            if not ph:
+                continue
+            pr = pending[ph] if isinstance(pending[ph], dict) else {}
+            g = _pending_grade_count(pr)
+            p = _pending_panel_len(pr)
+            own.append({
+                "txid": (tx or "")[:12],
+                "grades": g,
+                "panel": p,
+                "since": pr.get("since"),
+                "tri_capped": g == tri_n,
+                "seals_but_short": 0 < g < q,
+                "never_dealt_panel": p == 0,
+                "unanimous": _grades_unanimous(pr) if g else False,
+            })
+        own_in_void = sum(1 for o in own if o["tri_capped"])
+        row = {
+            "close": n,
+            "closed_at": _iso(e["ts"]) if e.get("ts") else None,
+            "pending_total": len(pending),
+            "by_grades": {str(k): by_grades[k] for k in sorted(by_grades)},
+            "tri_capped": tri,
+            "tri_capped_with_panel": tri_with_panel,
+            "tri_capped_panel_pct": round(100.0 * tri_with_panel / tri, 1) if tri else 0.0,
+            "tri_capped_unanimous": tri_unanimous,
+            "zero_grade": zero,
+            "seals_but_short": seals_short,
+            "never_dealt_panel_empty": never_dealt,
+            "quorum": q,
+            "tri_cap_at": tri_n,
+            "settled_rows": len(settled),
+            "settled_min_jury": settled_min_jury,
+            "own_pending": own,
+            "own_in_tri_cap": own_in_void,
+            "flags": [],
+        }
+        if tri and settled_min_jury is not None and settled_min_jury >= q:
+            row["flags"].append("tri_cap_is_quorum_boundary")
+        if own_in_void:
+            row["flags"].append("own_pending_tri_capped")
+        rows.append(row)
+
+    newest = rows[-1]
+    res = {
+        "ok": True,
+        "read_only": True,
+        "mode": "tri-cap",
+        "newest_close": newest["close"],
+        "quorum": q,
+        "tri_cap_at": tri_n,
+        "tri_capped_newest": newest["tri_capped"],
+        "own_in_tri_cap_newest": newest["own_in_tri_cap"],
+        "closes_checked": len(rows),
+        "rows": rows,
+        "verdict": ("own-tri-capped" if newest["own_in_tri_cap"]
+                    else ("tri-cap-void" if newest["tri_capped"] else "no-tri-cap")),
+        "note": ("Public GET /api/epochs only. Tri-capped = pending rows with exactly "
+                 f"{tri_n} grades (Kg={q} quorum boundary): they still need a dealt "
+                 f"{q}th seat to settle. never_dealt_panel_empty counts panel==[] rows; "
+                 "seals_but_short counts 0<grades<quorum. Grades can land on undealt rows, "
+                 "so a tri-capped row often has an empty panel. Output never prints an "
+                 "address, key or balance."),
+    }
+    return res
+
+
+def print_tri_cap(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-check --tri-cap: {r.get('error')}")
+        return
+    print(f"close-check --tri-cap: newest close E{r['newest_close']} -> {r['verdict'].upper()}"
+          f" | Kg={r['quorum']} tri-cap at {r['tri_cap_at']} grades"
+          f" | void {r['tri_capped_newest']} | own-in-void {r['own_in_tri_cap_newest']}")
+    print("close pending  zero  short  tri-cap  ∩panel%  unan   never-dealt  settled-min-jury  own flags")
+    for x in r["rows"]:
+        print(f"E{x['close']:<4} {x['pending_total']:<8} {x['zero_grade']:<5} {x['seals_but_short']:<6} "
+              f"{x['tri_capped']:<8} {x['tri_capped_panel_pct']:<7} {x['tri_capped_unanimous']:<6} "
+              f"{x['never_dealt_panel_empty']:<12} {str(x['settled_min_jury']):<17} "
+              f"{x['own_in_tri_cap']:<3} {','.join(x['flags']) or '-'}")
+        for o in x.get("own_pending") or []:
+            print(f"      own {o['txid']} grades={o['grades']} panel={o['panel']} since={o['since']}"
+                  + (" TRI-CAPPED" if o['tri_capped'] else "")
+                  + (" unanimous" if o.get('unanimous') else ""))
+
+
 def cmd_close_check(args: argparse.Namespace) -> None:
     try:
         epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
@@ -3557,6 +3752,19 @@ def cmd_close_check(args: argparse.Namespace) -> None:
         quorum = int((api_call("GET", "/api/params", need_key=False, timeout=30, retries=1) or {}).get("grade_quorum", 4) or 4)
     except Exception:
         pass
+    if getattr(args, "tri_cap", False):
+        # Prefer all_answers (txid -> born) so multi-answer epochs show in own_pending
+        src = all_answers if all_answers else answers
+        r = tri_cap_report(epochs_res, src, me, last=args.last, quorum=quorum)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_tri_cap(r)
+        if not r.get("ok"):
+            sys.exit(2)
+        if r.get("own_in_tri_cap_newest"):
+            sys.exit(3)
+        return
     r = close_check(epochs_res, answers, me, last=args.last, quorum=quorum, all_answers=all_answers)
     if args.json:
         print(json.dumps(r, indent=2))
@@ -3566,6 +3774,7 @@ def cmd_close_check(args: argparse.Namespace) -> None:
         sys.exit(2)
     if r["verdict"] != "paid":
         sys.exit(3)
+
 
 
 # ---------------------------------------------------------------------------
@@ -6427,10 +6636,11 @@ def main() -> None:
     p_ch.add_argument("--json", action="store_true", help="JSON output")
     p_ch.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
-    p_cc = sub.add_parser("close-check", help="Keyless: per close, was our answer graded, did it pass, were we paid (payout per close; never a balance or address)")
+    p_cc = sub.add_parser("close-check", help="Keyless: per close, was our answer graded, did it pass, were we paid (payout per close; never a balance or address). --tri-cap: pending grade-depth / tri-capped void readout")
     p_cc.add_argument("--last", type=int, default=4, help="How many recent closes to check (default 4)")
     p_cc.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
     p_cc.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
+    p_cc.add_argument("--tri-cap", dest="tri_cap", action="store_true", help="Pending grade-depth readout: tri-capped void (grades==quorum-1), never-dealt vs seals-but-short, own pending in the void (SUGGESTIONS #119)")
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
