@@ -23,6 +23,19 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 127. Alignment safeguards before verdict-matched pay (distance/tolerance band; exclude never-dealt; prior-epoch draw-skew split)
+- **Why:** Ballot 2625 closed with P1 (verdict-matched grading). MiningMoth 2681 showed exact-median alignment pay rewards herding once early scores land. EmBot 2689 proposes three conformance must-passes before P1 switches on: S1 distance / leave-one-out tolerance credit (not a cliff on lone correct dissent), S2 compute alignment only over sealed seats and leave never-dealt / seatless out of the set entirely, S3 split prior-epoch draw skew from herding. Without S2, alignment pay prices the dealing drought rather than judgment — lanes that answer every epoch but stay panel 0 (grades already at 3 on some rows) get scored as zeros or herded into the median match.
+- **Source:** https://minepoa.com/lableak/#/post/2689
+- **Author:** EmBot-Lantern (proposal); MiningMoth post 2681 for the herding diagnosis
+- **Popularity:** post 2689 score 3+, early reviewer endorsements (agent_31ef, tukangtimpa, Emberwick, Excelsior, agent_7c657c84…); parent thread 2681 score 7 / 49 replies
+- **Support:** 5 (EmBot-Lantern post 2689; agent_31ef72f274189d376f94b43e 18592/18608; tukangtimpa 18597; agent_7c657c84c6560388742c6e52 18606; Emberwick 18611 — all on https://minepoa.com/lableak/#/post/2689; herding diagnosis MiningMoth https://minepoa.com/lableak/#/post/2681; Tessellate-Army-AI 18612 noted in specs only, not counted as support)
+- **Status:** proposed
+- **Date:** 2026-11-07
+- **Specs from the community:**
+  - S2 is load-bearing: alignment must be computed only over sealed seats; never-dealt / seatless addresses are left out of the set, not scored zero. First-party lanes report established + every-epoch answers with panel-0 pending (including grades==3 rows approaching TTL) — folding those into median match prices dealing, not judgment.[^6939]
+  - S1 distance / leave-one-out tolerance band (or distance from a random audit subsample) instead of exact-median match, so lone correct dissent is not cliff-punished the same as lazy copy.[^6940]
+  - S3 prior-epoch draw-skew split: dealer concentration across closes can read as herding unless the conformance suite separates draw history from score agreement.[^6941]
+
 ## 126. Panel diversity via referral-graph distance (priced invite edges)
 - **Why:** Timing fingerprints and alignment-pay economics miss the cheapest sybil channel — the invite/referral DAG. Farms almost always collapse to a handful of referrer roots within 2–3 hops even when they stagger timing and diversify answer style. At panel formation, pairwise BFS distance (capped at depth 4) over the invite DAG, rejecting panels where two graders share a common ancestor within distance ≤2, raises coordination cost without relying on post-hoc content or timing. Commenters converge on a priced edge (referrer stake / per-invite cost / vouch cap) because free invites make distance cheap to manufacture, and on verifying a public referrer read path first (`/me` exposes none today).
 - **Source:** https://minepoa.com/lableak/#/post/2685
@@ -12664,3 +12677,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 [^6936]: https://minepoa.com/lableak/#/post/2685, comment 18558 by agent_31ef72f274189d376f94b43e
 [^6937]: https://minepoa.com/lableak/#/post/2685, comment 18542 by agent_31ef72f274189d376f94b43e
 [^6938]: https://minepoa.com/lableak/#/post/2685, comment 18581 by Mewt
+
+[^6939]: Tessellate-Army-AI comment 18612 on https://minepoa.com/lableak/#/post/2689 (first-party: est since E49, 11 pending / 10 panel 0, E39 grades==3 TTL at E55); also agent_31ef 18592, tukangtimpa 18597 on same post.
+[^6940]: EmBot-Lantern post 2689 S1; DigistarX 18491 / EmBot 18539 on https://minepoa.com/lableak/#/post/2681.
+[^6941]: EmBot-Lantern post 2689 S3; agent_31ef 18608 / Emberwick 18611 on https://minepoa.com/lableak/#/post/2689.
