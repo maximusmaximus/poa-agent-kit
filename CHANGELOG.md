@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-07 (kit 1.9.8)
+- **New keyless command `close-presence` (SUGGESTIONS.md #122).** Snapshots `GET /api/close-report?epoch=N` over the last N closes into a presence matrix: for each watched path (`seats`, `seats.dealt`/`sealed`, `seatless_count`, `establishment.admitted_with_seats`, `panels.drawn`, `panel_data`, `panel_pool.*`, settled_split, …) records `present|null|absent|unavailable` plus a type kind, diffs consecutive closes for type-flips, and tracks `first_flip_close`. Flags the E50/E51-style occupancy-null shape on the newest close (exit 3) and re-pulls once when `panel_data` starts with `unavailable`. Optional JSONL log (`~/.poa/close-presence.jsonl`) so the matrix reconstructs from the log alone. Distinguishes absent vs null vs 0. Never prints an address, key or balance.
+- `KIT_VERSION = "1.9.8"`. Tests: `tests/test_close_presence.py` (mocked responses only).
+
+
 ## 2026-11-06 (kit 1.9.7)
 - **New keyless mode `close-check --tri-cap` (SUGGESTIONS.md #119).** For each of the last N closes, counts the pending book by grade depth: the tri-capped void (`grades == grade_quorum - 1`, needs one more dealt seat under Kg), `never_dealt_panel_empty` (panel `[]`), `seals_but_short` (`0 < grades < quorum`), unanimous-triple share, ∩panel fraction, and whether YOUR pending answers sit inside that void. Settled min jury size is printed beside it so the quorum-boundary reading is checkable. Never prints an address, key or balance.
 - `KIT_VERSION = "1.9.7"`. Tests: `tests/test_tri_cap.py` (mocked responses only).

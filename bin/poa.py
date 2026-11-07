@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.7"
+KIT_VERSION = "1.9.8"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4793,6 +4793,392 @@ def fetch_close_reports(closes, timeout: int = 30) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# close-presence: keyless close-report field-presence matrix + type-flip diff
+# (SUGGESTIONS.md #122)
+# ---------------------------------------------------------------------------
+# Occupancy / dealing paths that went null at E50/E51 and restored as integers
+# at E52–E54. Nested paths under a null parent read as absent.
+PRESENCE_PATHS = (
+    "seats",
+    "seats.dealt",
+    "seats.sealed",
+    "seats.expired_unsealed",
+    "seatless",
+    "seatless_count",
+    "establishment.admitted_with_seats",
+    "establishment.admitted",
+    "establishment.eligible",
+    "establishment.established_before",
+    "establishment.waitlisted",
+    "panels.drawn",
+    "panels.grades_cast",
+    "panels.rows",
+    "panels.rows_reaching_quorum",
+    "panels.carried_newly_dealt",
+    "panel_data",
+    "panel_pool",
+    "panel_pool.source",
+    "panel_pool.size",
+    "settled_split.passed",
+    "settled_split.failed",
+    "settled_split.expired_empty_jury",
+    "settled_split.expired_with_seals",
+    "settled_count",
+)
+
+# Four occupancy counters + panel_data: null/absent/unavailable is a first-flip alert.
+OCCUPANCY_CRITICAL = frozenset({
+    "seats", "seats.dealt", "seats.sealed", "seatless_count",
+    "establishment.admitted_with_seats", "panels.drawn", "panel_data",
+})
+
+
+def _presence_kind(value):
+    """Classify a close-report value for the presence matrix.
+    panel_data strings starting with 'unavailable' are their own kind so the
+    mid-close-restart shape flips separately from a normal string."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        if value.startswith("unavailable"):
+            return "unavailable"
+        return "str"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _walk_presence(report, path: str):
+    """Return (state, kind) for dotted path in a close-report dict.
+    state is present | null | absent. kind is the type tag (or None when absent)."""
+    if not isinstance(report, dict):
+        return "absent", None
+    cur = report
+    parts = path.split(".")
+    for i, part in enumerate(parts):
+        if not isinstance(cur, dict):
+            return "absent", None
+        if part not in cur:
+            return "absent", None
+        cur = cur[part]
+        if cur is None and i < len(parts) - 1:
+            # parent null → nested path is absent (not null at the leaf)
+            return "absent", None
+    if cur is None:
+        return "null", "null"
+    kind = _presence_kind(cur)
+    if kind == "unavailable":
+        return "unavailable", "unavailable"
+    return "present", kind
+
+
+def snapshot_close_report(report, paths=None) -> dict:
+    """Pure: one close-report → {path: {state, kind}} presence snapshot. No addresses."""
+    paths = list(paths) if paths is not None else list(PRESENCE_PATHS)
+    fields = {}
+    for p in paths:
+        state, kind = _walk_presence(report, p)
+        fields[p] = {"state": state, "kind": kind}
+    # Also record the sorted top-level key set (values ignored) for contract drift.
+    top_keys = sorted(report.keys()) if isinstance(report, dict) else []
+    return {
+        "close_epoch": report.get("close_epoch") if isinstance(report, dict) else None,
+        "top_keys": top_keys,
+        "fields": fields,
+    }
+
+
+def presence_report(close_reports: dict, last: int = 8, paths=None,
+                    log_rows: list = None) -> dict:
+    """Pure: presence matrix + consecutive-close flips over keyless close reports.
+
+    close_reports: {epoch:int -> report:dict}. Missing epochs are skipped.
+    log_rows: optional prior JSONL snapshots (list of snapshot dicts) used only to
+    seed first_flip_close; the live window always wins for the printed matrix.
+    Never returns an address, key or balance.
+    """
+    paths = list(paths) if paths is not None else list(PRESENCE_PATHS)
+    if not isinstance(close_reports, dict) or not close_reports:
+        return {"ok": False, "error": "no close reports", "rows": [], "flips": [],
+                "matrix": [], "flags": ["no_close_reports"]}
+
+    # Normalize keys to int
+    crs = {}
+    for k, v in close_reports.items():
+        try:
+            ek = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, dict):
+            crs[ek] = v
+    epochs = sorted(crs.keys())
+    if not epochs:
+        return {"ok": False, "error": "no close reports", "rows": [], "flips": [],
+                "matrix": [], "flags": ["no_close_reports"]}
+
+    if last and last > 0:
+        epochs = epochs[-int(last):]
+
+    snaps = []
+    for e in epochs:
+        snap = snapshot_close_report(crs[e], paths=paths)
+        snap["close_epoch"] = snap.get("close_epoch") if snap.get("close_epoch") is not None else e
+        snaps.append(snap)
+
+    # first_flip_close: earliest close in this window (or prior log) where state/kind
+    # differs from the previous observed snapshot for that path.
+    first_flip = {p: None for p in paths}
+    prior_state = {p: None for p in paths}  # (state, kind) or None
+    if isinstance(log_rows, list):
+        for prev in log_rows:
+            if not isinstance(prev, dict):
+                continue
+            fields = prev.get("fields") or {}
+            ce = prev.get("close_epoch")
+            for p in paths:
+                cur = fields.get(p) if isinstance(fields, dict) else None
+                if not isinstance(cur, dict):
+                    continue
+                pair = (cur.get("state"), cur.get("kind"))
+                if prior_state[p] is not None and prior_state[p] != pair and first_flip[p] is None:
+                    first_flip[p] = ce
+                prior_state[p] = pair
+
+    flips = []
+    flags = []
+    for i, snap in enumerate(snaps):
+        ce = snap["close_epoch"]
+        for p, cur in snap["fields"].items():
+            pair = (cur["state"], cur["kind"])
+            if prior_state[p] is not None and prior_state[p] != pair:
+                flip = {
+                    "close": ce,
+                    "path": p,
+                    "from_state": prior_state[p][0],
+                    "from_kind": prior_state[p][1],
+                    "to_state": cur["state"],
+                    "to_kind": cur["kind"],
+                    "critical": p in OCCUPANCY_CRITICAL,
+                }
+                flips.append(flip)
+                if first_flip[p] is None:
+                    first_flip[p] = ce
+                if p in OCCUPANCY_CRITICAL:
+                    flags.append(f"occupancy_flip:{p}@{ce}")
+            prior_state[p] = pair
+            # Flag critical paths that are null/absent/unavailable on the newest close
+            if i == len(snaps) - 1 and p in OCCUPANCY_CRITICAL:
+                if cur["state"] in ("null", "absent", "unavailable"):
+                    flags.append(f"occupancy_bad:{p}@{ce}")
+
+    # Presence matrix: one row per path
+    matrix = []
+    for p in paths:
+        series = []
+        for snap in snaps:
+            f = snap["fields"][p]
+            series.append({"close": snap["close_epoch"], "state": f["state"], "kind": f["kind"]})
+        newest = series[-1] if series else None
+        matrix.append({
+            "path": p,
+            "newest_state": newest["state"] if newest else None,
+            "newest_kind": newest["kind"] if newest else None,
+            "first_flip_close": first_flip[p],
+            "critical": p in OCCUPANCY_CRITICAL,
+            "series": series,
+        })
+
+    # Top-key set flips (contract drift)
+    key_flips = []
+    for i in range(1, len(snaps)):
+        a, b = set(snaps[i - 1]["top_keys"]), set(snaps[i]["top_keys"])
+        if a != b:
+            key_flips.append({
+                "close": snaps[i]["close_epoch"],
+                "added": sorted(b - a),
+                "removed": sorted(a - b),
+            })
+            flags.append(f"top_keys_flip@{snaps[i]['close_epoch']}")
+
+    newest = snaps[-1]
+    bad_newest = [p for p in OCCUPANCY_CRITICAL
+                  if newest["fields"][p]["state"] in ("null", "absent", "unavailable")]
+    verdict = ("occupancy-null" if bad_newest
+               else ("flips" if flips else "stable"))
+
+    # Compact per-close occupancy summary for the print table
+    rows = []
+    for snap in snaps:
+        f = snap["fields"]
+        pd = f["panel_data"]
+        rows.append({
+            "close": snap["close_epoch"],
+            "seats": f["seats"]["state"] if f["seats"]["state"] != "present" else f["seats"]["kind"],
+            "dealt": f["seats.dealt"]["state"] if f["seats.dealt"]["state"] != "present" else f["seats.dealt"]["kind"],
+            "sealed": f["seats.sealed"]["state"] if f["seats.sealed"]["state"] != "present" else f["seats.sealed"]["kind"],
+            "seatless_count": f["seatless_count"]["state"] if f["seatless_count"]["state"] != "present" else f["seatless_count"]["kind"],
+            "admitted_with_seats": f["establishment.admitted_with_seats"]["state"]
+                if f["establishment.admitted_with_seats"]["state"] != "present"
+                else f["establishment.admitted_with_seats"]["kind"],
+            "panels_drawn": f["panels.drawn"]["state"] if f["panels.drawn"]["state"] != "present" else f["panels.drawn"]["kind"],
+            "panel_data": pd["state"] if pd["state"] != "present" else pd["kind"],
+            "panel_pool_size": f["panel_pool.size"]["state"] if f["panel_pool.size"]["state"] != "present" else f["panel_pool.size"]["kind"],
+            "flags": ([f"bad:{p}" for p in OCCUPANCY_CRITICAL
+                       if snap["fields"][p]["state"] in ("null", "absent", "unavailable")]),
+        })
+
+    return {
+        "ok": True,
+        "mode": "close-presence",
+        "closes_checked": len(snaps),
+        "newest_close": newest["close_epoch"],
+        "verdict": verdict,
+        "occupancy_bad_newest": bad_newest,
+        "flip_count": len(flips),
+        "critical_flip_count": sum(1 for x in flips if x["critical"]),
+        "rows": rows,
+        "flips": flips,
+        "key_flips": key_flips,
+        "matrix": matrix,
+        "snapshots": snaps,
+        "flags": sorted(set(flags)),
+        "note": ("Keyless: GET /api/close-report?epoch=N. Presence matrix records "
+                 "present|null|absent|unavailable + type kind per watched path; diffs "
+                 "consecutive closes for type-flips. Occupancy critical paths: seats, "
+                 "seats.dealt/sealed, seatless_count, establishment.admitted_with_seats, "
+                 "panels.drawn, panel_data. Never prints an address, key or balance. "
+                 "Re-pull until panel_data reads in-memory before citing occupancy integers."),
+    }
+
+
+def print_presence(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-presence: {r.get('error')}")
+        return
+    print(f"close-presence: newest close E{r['newest_close']} -> {r['verdict'].upper()}"
+          f" | flips {r['flip_count']} (critical {r['critical_flip_count']})"
+          f" | closes {r['closes_checked']}")
+    if r.get("occupancy_bad_newest"):
+        print(f"  occupancy bad on newest: {', '.join(r['occupancy_bad_newest'])}")
+    print("close  seats  dealt  sealed  seatless  aws  drawn  panel_data     pool  flags")
+    for x in r["rows"]:
+        print(f"E{x['close']:<4} {x['seats']:<6} {x['dealt']:<6} {x['sealed']:<7} "
+              f"{x['seatless_count']:<8} {x['admitted_with_seats']:<4} {x['panels_drawn']:<6} "
+              f"{x['panel_data']:<14} {x['panel_pool_size']:<5} {','.join(x['flags']) or '-'}")
+    crit_flips = [f for f in r["flips"] if f["critical"]]
+    if crit_flips:
+        print("critical flips:")
+        for f in crit_flips:
+            print(f"  E{f['close']} {f['path']}: {f['from_state']}/{f['from_kind']} -> {f['to_state']}/{f['to_kind']}")
+    if r.get("key_flips"):
+        print("top-key set flips:")
+        for k in r["key_flips"]:
+            print(f"  E{k['close']} +{k['added']} -{k['removed']}")
+
+
+def append_presence_log(path: str, snapshots: list) -> None:
+    """Append one JSON line per snapshot to path (reconstructible matrix)."""
+    if not path:
+        return
+    p = pathlib.Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        for snap in snapshots:
+            # Drop address-bearing seatless arrays if somehow present; we only store kinds.
+            slim = {
+                "close_epoch": snap.get("close_epoch"),
+                "top_keys": snap.get("top_keys"),
+                "fields": snap.get("fields"),
+            }
+            fh.write(json.dumps(slim, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def load_presence_log(path: str) -> list:
+    p = pathlib.Path(path).expanduser()
+    if not p.is_file():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def cmd_close_presence(args: argparse.Namespace) -> None:
+    """Keyless: presence matrix + type-flip diff over recent close reports."""
+    last = max(1, int(getattr(args, "last", 8) or 8))
+    closes = []
+    try:
+        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=getattr(args, "timeout", 90), retries=2)
+        closes = [int(e["epoch"]) for e in _epoch_list(epochs_res)]
+    except Exception as ex:
+        msg = redact(str(ex))
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": msg}))
+        else:
+            print(f"close-presence: could not read /api/epochs: {msg}")
+        sys.exit(2)
+    if not closes:
+        try:
+            st = api_call("GET", "/api/status", need_key=False, timeout=20, retries=1) or {}
+            end = st.get("epochs_closed")
+            if isinstance(end, int) and end > 0:
+                closes = list(range(max(1, end - last + 1), end + 1))
+        except Exception:
+            pass
+    if not closes:
+        r = {"ok": False, "error": "no closes found"}
+        print(json.dumps(r) if args.json else "close-presence: no closes found")
+        sys.exit(2)
+    want = closes[-last:]
+    crs = fetch_close_reports(want, timeout=min(60, int(getattr(args, "timeout", 90) or 90)))
+    newest = want[-1] if want else None
+    # Re-pull once when newest panel_data is the mid-close unavailable shape.
+    if newest in crs:
+        pd = crs[newest].get("panel_data")
+        if isinstance(pd, str) and pd.startswith("unavailable"):
+            try:
+                again = api_call("GET", "/api/close-report", query={"epoch": int(newest)},
+                                 need_key=False, timeout=30, retries=1)
+                if isinstance(again, dict) and not str(again.get("panel_data") or "").startswith("unavailable"):
+                    crs[newest] = again
+            except Exception:
+                pass
+    log_path = getattr(args, "log", "") or ""
+    use_log = bool(log_path) and not getattr(args, "no_log", False)
+    prior = load_presence_log(log_path) if use_log else []
+    r = presence_report(crs, last=last, log_rows=prior)
+    if r.get("ok") and use_log:
+        append_presence_log(log_path, r.get("snapshots") or [])
+    if args.json:
+        out = dict(r)
+        if not getattr(args, "full", False):
+            out.pop("snapshots", None)
+            for m in out.get("matrix") or []:
+                m.pop("series", None)
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print_presence(r)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r.get("verdict") == "occupancy-null":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # insights: the per-close read-only network insight endpoints (server release v0.80-insights)
 # ---------------------------------------------------------------------------
 INSIGHT_VIEWS = {
@@ -6644,6 +7030,14 @@ def main() -> None:
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_cpn = sub.add_parser("close-presence", help="Keyless: close-report field-presence matrix + type-flip diff across recent closes (SUGGESTIONS #122); never prints an address")
+    p_cpn.add_argument("--last", type=int, default=8, help="How many recent closes to snapshot (default 8)")
+    p_cpn.add_argument("--log", default="", help="JSONL presence log path (default ~/.poa/close-presence.jsonl); appends one line per close")
+    p_cpn.add_argument("--no-log", action="store_true", help="Don't append to the presence log")
+    p_cpn.add_argument("--json", action="store_true", help="JSON output")
+    p_cpn.add_argument("--full", action="store_true", help="With --json: include per-close snapshots and full series")
+    p_cpn.add_argument("--timeout", type=int, default=90, help="Timeout for /api/epochs and close-report reads (default 90s)")
+
     p_wd = sub.add_parser("write-drill", help="Offline crash-recovery drill for answer writes: counts sends across a simulated restart (fake server, no network, no key); exit 3 if any case sends twice")
     p_wd.add_argument("--json", action="store_true", help="JSON output")
 
@@ -6986,6 +7380,10 @@ def main() -> None:
             cmd_close_health(args)
         elif args.command == "close-check":
             cmd_close_check(args)
+        elif args.command == "close-presence":
+            if not getattr(args, "log", None):
+                args.log = str(POA_DIR / "close-presence.jsonl")
+            cmd_close_presence(args)
         elif args.command == "standing":
             cmd_standing(args)
         elif args.command == "write-drill":
