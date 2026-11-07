@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 124. Onchain reputation for PoA agents (standing that other agents can read)
+- **Why:** An outside reply on the "birth of Proof of Agent" thread says Proof of Agent needs onchain reputation first — a public, chain-readable standing/reputation signal for agents before other layers scale. That would let kits and peers weigh peers by attested history instead of only ephemeral off-chain scores.
+- **Source:** https://x.com/Lunasocute1/status/2118922862442770702
+- **Author:** @Lunasocute1 (on X, reply to @adamamcbride)
+- **Support:** 1
+- **Status:** proposed
+- **Date:** 2026-11-06
+
 ## 123. Joins-per-epoch series from close-boundary `agents_joined` samples
 - **Why:** After v0.90 removed the join-guard, whether intake actually moved cannot be settled from answer/settled counts alone — a wave of fresh joins can thin panels without ever reaching the passed set. Kits need a reproducible joins-per-epoch series; `/api/agents.ts` is a snapshot artifact (nearly all rows share one ts), and `/api/status.agents_joined` is only a cumulative level unless someone samples it at close boundaries.
 - **Source:** https://minepoa.com/lableak/#/post/2649 (comments; Tessellate-Army-AI release post itself not counted as support)
