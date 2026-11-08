@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.8"
+KIT_VERSION = "1.9.9"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -5330,6 +5330,188 @@ def expiry_report(sched) -> dict:
             "pending_ttl_epochs": sched.get("pending_ttl_epochs"), "total_pending": sched.get("total_pending"), "rows": rows}
 
 
+# ---------------------------------------------------------------------------
+# juror-audit: keyless own alignment split by verdict over recent closes
+# (SUGGESTIONS.md #128)
+# ---------------------------------------------------------------------------
+# Settled jury entries carry only {grader, aligned}. Crossing `aligned` with the
+# row outcome tells a strict lane (misaligned on passed rows: graded below a pass)
+# from a lenient one (misaligned on failed rows: graded above a fail).
+JUROR_AUDIT_MIN_MISALIGNED = 3
+
+
+def parse_close_range(text: str) -> list:
+    """'50-58' -> [50..58]; '55' -> [55]; '50,52,54-55' -> [50, 52, 54, 55]."""
+    out = []
+    for part in str(text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            out.extend(range(a, b + 1))
+        else:
+            out.append(int(part))
+    return sorted(set(n for n in out if n > 0))
+
+
+def _ja_counts() -> dict:
+    return {"passed_aligned": 0, "passed_misaligned": 0, "failed_aligned": 0,
+            "failed_misaligned": 0, "expired_seats": 0, "other_seats": 0}
+
+
+def juror_direction(c: dict) -> str:
+    """strict | lenient | mixed | aligned | too-few-misaligned | no-seats."""
+    seats = (c["passed_aligned"] + c["passed_misaligned"] + c["failed_aligned"] + c["failed_misaligned"])
+    if seats == 0:
+        return "no-seats"
+    mp, mf = c["passed_misaligned"], c["failed_misaligned"]
+    mis = mp + mf
+    if mis == 0:
+        return "aligned"
+    if mis < JUROR_AUDIT_MIN_MISALIGNED:
+        return "too-few-misaligned"
+    if mp * 3 >= mis * 2:
+        return "strict"
+    if mf * 3 >= mis * 2:
+        return "lenient"
+    return "mixed"
+
+
+def _ja_rates(c: dict) -> dict:
+    p = c["passed_aligned"] + c["passed_misaligned"]
+    f = c["failed_aligned"] + c["failed_misaligned"]
+    tot = p + f
+    r = lambda a, b: round(a / b, 4) if b else None
+    return {"seats": tot, "aligned_rate": r(c["passed_aligned"] + c["failed_aligned"], tot),
+            "passed_aligned_rate": r(c["passed_aligned"], p), "failed_aligned_rate": r(c["failed_aligned"], f)}
+
+
+def juror_audit(settled_by_epoch: dict, me: str) -> dict:
+    """Pure function. settled_by_epoch: {epoch: /api/settled body or None (unavailable)}.
+    Returns per-close and pooled verdict x alignment counts for `me` as a juror.
+    The address is used only for matching and never returned."""
+    per, pooled = [], _ja_counts()
+    unavailable, measured = [], 0
+    for ep in sorted(settled_by_epoch):
+        body = settled_by_epoch[ep]
+        if not isinstance(body, dict) or not isinstance(body.get("rows"), list):
+            unavailable.append(int(ep))
+            per.append({"epoch": int(ep), "status": "unavailable"})
+            continue
+        measured += 1
+        c = _ja_counts()
+        for row in body["rows"]:
+            if not isinstance(row, dict):
+                continue
+            outcome = row.get("outcome")
+            for j in row.get("jury") or []:
+                if not isinstance(j, dict) or j.get("grader") != me:
+                    continue
+                al = j.get("aligned")
+                if outcome == "expired":
+                    c["expired_seats"] += 1
+                elif outcome in ("passed", "failed") and isinstance(al, bool):
+                    c[f"{outcome}_{'aligned' if al else 'misaligned'}"] += 1
+                else:
+                    c["other_seats"] += 1
+        for k in pooled:
+            pooled[k] += c[k]
+        row_out = {"epoch": int(ep), "status": "ok", "rows": len(body["rows"]), **c, **_ja_rates(c),
+                   "direction": juror_direction(c)}
+        per.append(row_out)
+    return {"ok": True, "read_only": True, "mode": "juror-audit",
+            "closes_requested": len(settled_by_epoch), "closes_measured": measured,
+            "closes_unavailable": unavailable, "per_close": per,
+            "pooled": {**pooled, **_ja_rates(pooled), "direction": juror_direction(pooled)},
+            "note": ("strict = misaligned mostly on passed rows (graded below a pass); "
+                     "lenient = misaligned mostly on failed rows (graded above a fail). "
+                     "An unavailable close is unknown, never zero.")}
+
+
+def _ja_load_file(path: str):
+    with open(path, "r", encoding="utf-8") as fh:
+        body = json.load(fh)
+    ep = body.get("epoch") if isinstance(body, dict) else None
+    if not isinstance(ep, int):
+        m = re.search(r"(\d+)", os.path.basename(path))
+        ep = int(m.group(1)) if m else None
+    return ep, body
+
+
+def _ja_print(r: dict) -> None:
+    pct = lambda v: "-" if v is None else f"{v * 100:.1f}%"
+    print(f"juror-audit: {r['closes_measured']} of {r['closes_requested']} closes measured"
+          + (f", unavailable {r['closes_unavailable']}" if r["closes_unavailable"] else ""))
+    print("  close  seats  pass a/m   fail a/m   expired  aligned  direction")
+    for x in r["per_close"]:
+        if x.get("status") != "ok":
+            print(f"  E{x['epoch']:<5} unavailable (unknown, not zero)")
+            continue
+        print(f"  E{x['epoch']:<5} {x['seats']:>5}  {x['passed_aligned']:>4}/{x['passed_misaligned']:<4} "
+              f"{x['failed_aligned']:>4}/{x['failed_misaligned']:<4} {x['expired_seats']:>7}  "
+              f"{pct(x['aligned_rate']):>7}  {x['direction']}")
+    p = r["pooled"]
+    print(f"  pooled {p['seats']:>5}  {p['passed_aligned']:>4}/{p['passed_misaligned']:<4} "
+          f"{p['failed_aligned']:>4}/{p['failed_misaligned']:<4} {p['expired_seats']:>7}  "
+          f"{pct(p['aligned_rate']):>7}  {p['direction']}")
+    print(f"  passed rows aligned {pct(p['passed_aligned_rate'])}, failed rows aligned {pct(p['failed_aligned_rate'])}")
+    print(f"  {r['note']}")
+
+
+def cmd_juror_audit(args: argparse.Namespace) -> None:
+    """Keyless: own juror alignment split by verdict (passed/failed x aligned/misaligned)."""
+    me = (getattr(args, "address", "") or local_address() or "").strip()
+    if not me or not _POA_ADDR_RE.match(me):
+        msg = "no valid address (pass --address or set POA_ADDRESS / ~/.poa/address)"
+        print(json.dumps({"ok": False, "error": msg}) if args.json else f"juror-audit: {msg}")
+        sys.exit(2)
+    data = {}
+    files = list(getattr(args, "file", None) or [])
+    if files:
+        for path in files:
+            try:
+                ep, body = _ja_load_file(path)
+            except Exception as ex:
+                print(json.dumps({"ok": False, "error": f"{path}: {ex}"}) if args.json else f"juror-audit: {path}: {ex}")
+                sys.exit(2)
+            if ep is None:
+                print(f"juror-audit: {path}: no epoch in file or name")
+                sys.exit(2)
+            data[int(ep)] = body
+    else:
+        closes = parse_close_range(getattr(args, "closes", "") or "")
+        if not closes:
+            last = max(1, int(getattr(args, "last", 8) or 8))
+            end = None
+            try:
+                st = api_call("GET", "/api/status", need_key=False, timeout=20, retries=1) or {}
+                end = st.get("epochs_closed")
+            except Exception:
+                end = None
+            if not isinstance(end, int) or end < 1:
+                msg = "could not read epochs_closed from /api/status; pass --closes A-B"
+                print(json.dumps({"ok": False, "error": msg}) if args.json else f"juror-audit: {msg}")
+                sys.exit(2)
+            closes = list(range(max(1, end - last + 1), end + 1))
+        for ep in closes:
+            try:
+                data[ep] = api_call("GET", "/api/settled", query={"epoch": int(ep)}, need_key=False,
+                                    timeout=getattr(args, "timeout", 60), retries=1)
+            except Exception:
+                data[ep] = None
+    r = juror_audit(data, me)
+    if args.json:
+        print(json.dumps(r))
+    else:
+        _ja_print(r)
+    if r["closes_measured"] == 0:
+        sys.exit(2)
+
+
 def settled_report(settled, me: str = "") -> dict:
     """Pure function over GET /api/settled: outcome counts and jury sizes at the close; with `me`, only
     that account's rows (answer ids shortened, the address itself is never returned)."""
@@ -7038,6 +7220,14 @@ def main() -> None:
     p_cpn.add_argument("--full", action="store_true", help="With --json: include per-close snapshots and full series")
     p_cpn.add_argument("--timeout", type=int, default=90, help="Timeout for /api/epochs and close-report reads (default 90s)")
 
+    p_ja = sub.add_parser("juror-audit", help="Keyless: your own juror alignment split by verdict (passed/failed x aligned/misaligned) over recent closes, strict vs lenient (SUGGESTIONS #128); never prints an address")
+    p_ja.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_ja.add_argument("--closes", default="", help="Close range, e.g. 50-58 or 50,52,55-58 (default: last --last closes)")
+    p_ja.add_argument("--last", type=int, default=8, help="How many recent closes when --closes is not given (default 8)")
+    p_ja.add_argument("--file", action="append", default=[], help="Offline: saved /api/settled JSON file (repeatable); no network")
+    p_ja.add_argument("--json", action="store_true", help="JSON output")
+    p_ja.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
+
     p_wd = sub.add_parser("write-drill", help="Offline crash-recovery drill for answer writes: counts sends across a simulated restart (fake server, no network, no key); exit 3 if any case sends twice")
     p_wd.add_argument("--json", action="store_true", help="JSON output")
 
@@ -7386,6 +7576,8 @@ def main() -> None:
             cmd_close_presence(args)
         elif args.command == "standing":
             cmd_standing(args)
+        elif args.command == "juror-audit":
+            cmd_juror_audit(args)
         elif args.command == "write-drill":
             cmd_write_drill(args)
         elif args.command == "join-pow":

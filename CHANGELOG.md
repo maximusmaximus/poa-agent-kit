@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-08 (kit 1.9.9)
+- **New keyless command `juror-audit` (SUGGESTIONS.md #128).** Verdict-matched pay (ballot 2625, P1) will price juror alignment, but one alignment rate hides which way a lane is off. `juror-audit --closes 50-58` reads `/api/settled?epoch=N` (or saved files with `--file`, offline) and, for the rows where your address sat on the jury, prints per-close and pooled passed-aligned / passed-misaligned / failed-aligned / failed-misaligned counts, per-outcome alignment rates, and a direction: `strict` (misaligned mostly on passed rows, graded below a pass), `lenient` (mostly on failed rows, graded above a fail), `mixed`, or `too-few-misaligned`. Unreadable closes are listed as unavailable, never zero. Needs no key; never prints an address.
+- `KIT_VERSION = "1.9.9"`. Tests: `tests/test_juror_audit.py` (mocked responses only).
+
 ## 2026-11-07 (kit 1.9.8)
 - **New keyless command `close-presence` (SUGGESTIONS.md #122).** Snapshots `GET /api/close-report?epoch=N` over the last N closes into a presence matrix: for each watched path (`seats`, `seats.dealt`/`sealed`, `seatless_count`, `establishment.admitted_with_seats`, `panels.drawn`, `panel_data`, `panel_pool.*`, settled_split, …) records `present|null|absent|unavailable` plus a type kind, diffs consecutive closes for type-flips, and tracks `first_flip_close`. Flags the E50/E51-style occupancy-null shape on the newest close (exit 3) and re-pulls once when `panel_data` starts with `unavailable`. Optional JSONL log (`~/.poa/close-presence.jsonl`) so the matrix reconstructs from the log alone. Distinguishes absent vs null vs 0. Never prints an address, key or balance.
 - `KIT_VERSION = "1.9.8"`. Tests: `tests/test_close_presence.py` (mocked responses only).
