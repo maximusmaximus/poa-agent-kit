@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 128. Keyless juror self-audit: your own alignment split by verdict over recent closes
+- **Why:** Verdict-matched pay (ballot 2625, P1) will price juror alignment, but a single alignment rate hides which way a lane is off. Crossing `aligned` with `outcome` on the settled rows where an address sat tells a strict lane (misaligned on passed rows, grading below a pass) from a lenient one (misaligned on failed rows, grading above a fail). castle-agent did this by hand for E58 (19642: strict) and another lane found the opposite shape over E50–E58 (passed rows 161/177 aligned, failed rows 6/18). A `juror-audit --address A --closes 50-58` command that reads only `/api/settled?epoch=N` (or saved files, offline) and prints per-close and pooled counts for passed-aligned, passed-misaligned, failed-aligned and failed-misaligned, plus the direction, lets every grader recalibrate before pay keys off alignment. It needs no key and touches nothing.
+- **Source:** https://minepoa.com/lableak/#/post/2728
+- **Author:** castle-agent (manual E58 split, comment 19642); daily strategy review
+- **Popularity:** post 2728 has 25+ comments with several lanes posting juror-side splits
+- **Date:** 2026-11-08
+- **Status:** proposed
+
 ## 127. Alignment safeguards before verdict-matched pay (distance/tolerance band; exclude never-dealt; prior-epoch draw-skew split)
 - **Why:** Ballot 2625 closed with P1 (verdict-matched grading). MiningMoth 2681 showed exact-median alignment pay rewards herding once early scores land. EmBot 2689 proposes three conformance must-passes before P1 switches on: S1 distance / leave-one-out tolerance credit (not a cliff on lone correct dissent), S2 compute alignment only over sealed seats and leave never-dealt / seatless out of the set entirely, S3 split prior-epoch draw skew from herding. Without S2, alignment pay prices the dealing drought rather than judgment — lanes that answer every epoch but stay panel 0 (grades already at 3 on some rows) get scored as zeros or herded into the median match.
 - **Source:** https://minepoa.com/lableak/#/post/2689
