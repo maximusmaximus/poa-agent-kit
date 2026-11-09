@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.10"
+KIT_VERSION = "1.9.11"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3751,10 +3751,122 @@ def print_tri_cap(r: dict) -> None:
                   + (" unanimous" if o.get('unanimous') else ""))
 
 
+CLOSE_CHECK_FALLBACK_UNAVAILABLE = ["per-address rewards (paid amount)", "weights", "basis.pending", "established_after for this address"]
+
+
+def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "") -> dict:
+    """Pure (SUGGESTIONS #131). Close check built only from keyless /api/close-report and /api/settled
+    (used while /api/epochs is paused or times out). reports/settled_by_epoch: {epoch: body or None}.
+    Fields those routes do not carry are listed in `unavailable`, never reported as zero."""
+    closes = []
+    for ep in sorted(set(reports) | set(settled_by_epoch), reverse=True):
+        cr, st = reports.get(ep), settled_by_epoch.get(ep)
+        row = {"close": int(ep), "close_report": isinstance(cr, dict), "settled_route": isinstance(st, dict)}
+        if isinstance(cr, dict):
+            est = cr.get("establishment") or {}
+            row["establishment"] = {k: est.get(k) for k in ("established_before", "eligible", "admitted", "waitlisted", "removed_ttl", "removed_slashed")}
+            row["settled_split"] = cr.get("settled_split")
+            row["settled_count"] = cr.get("settled_count")
+        if isinstance(st, dict) and isinstance(st.get("rows"), list):
+            rows = [x for x in st["rows"] if isinstance(x, dict)]
+            row["outcomes"] = settled_report(st)["outcomes"]
+            if me:
+                row["yours"] = [{"answer": str(x.get("answer") or "")[:12], "outcome": x.get("outcome"),
+                                 "jury": len(x.get("jury") or [])} for x in rows if x.get("from") == me]
+        closes.append(row)
+    readable = [c for c in closes if c["close_report"] or c["settled_route"]]
+    if not readable:
+        return {"ok": False, "via": "settled+close-report", "error": "neither /api/close-report nor /api/settled readable"}
+    newest = readable[0]
+    yours = newest.get("yours")
+    if not me or yours is None:
+        verdict = "unknown"
+    elif any(y["outcome"] == "passed" for y in yours):
+        verdict = "passed-at-newest"
+    elif yours:
+        verdict = "no-pass-at-newest"
+    else:
+        verdict = "no-row-at-newest"
+    return {"ok": True, "read_only": True, "via": "settled+close-report", "verdict": verdict,
+            "newest_close": newest["close"], "closes": closes, "unavailable": list(CLOSE_CHECK_FALLBACK_UNAVAILABLE),
+            "note": "Payout is NOT checked on this path: passed means graded-and-passed, not paid. Re-run plain close-check when /api/epochs is back."}
+
+
+def print_close_check_fallback(r: dict) -> None:
+    if not r.get("ok"):
+        print(f"close-check (via=settled+close-report): {r.get('error')}")
+        return
+    print(f"close-check via=settled+close-report | newest close E{r['newest_close']} | verdict {r['verdict']}")
+    for c in r["closes"]:
+        parts = [f"E{c['close']}"]
+        if c.get("settled_split") is not None:
+            parts.append("split " + json.dumps(c["settled_split"], sort_keys=True))
+        if c.get("establishment"):
+            e = c["establishment"]
+            parts.append(f"eligible {e.get('eligible')} admitted {e.get('admitted')} removed_ttl {e.get('removed_ttl')}")
+        if "yours" in c:
+            parts.append("yours " + (", ".join(f"{y['answer']}:{y['outcome']}/{y['jury']}j" for y in c["yours"]) or "none"))
+        if not c["close_report"]:
+            parts.append("close-report unavailable")
+        if not c["settled_route"]:
+            parts.append("settled unavailable")
+        print("  " + " | ".join(parts))
+    print("  unavailable on this path: " + "; ".join(r["unavailable"]))
+    print("  " + r["note"])
+
+
+def run_close_check_fallback(args: argparse.Namespace, me: str) -> dict:
+    """Keyless reads: newest close from /api/close-report, then each earlier close by epoch."""
+    last = max(1, int(getattr(args, "last", 4) or 4))
+    tmo = getattr(args, "timeout", 60)
+    reports, settled = {}, {}
+    try:
+        newest = api_call("GET", "/api/close-report", need_key=False, timeout=tmo, retries=1)
+    except Exception:
+        newest = None
+    if not isinstance(newest, dict) or not isinstance(newest.get("close_epoch"), int):
+        return {"ok": False, "via": "settled+close-report", "error": "could not read newest /api/close-report"}
+    top = int(newest["close_epoch"])
+    reports[top] = newest
+    for ep in range(top, max(0, top - last), -1):
+        if ep not in reports:
+            try:
+                reports[ep] = api_call("GET", "/api/close-report", query={"epoch": ep}, need_key=False, timeout=tmo, retries=1)
+            except Exception:
+                reports[ep] = None
+        try:
+            settled[ep] = api_call("GET", "/api/settled", query={"epoch": ep}, need_key=False, timeout=tmo, retries=1)
+        except Exception:
+            settled[ep] = None
+    return close_check_fallback(reports, settled, me)
+
+
 def cmd_close_check(args: argparse.Namespace) -> None:
+    me0 = (args.address or local_address() or "").strip()
+    if getattr(args, "via_settled", False):
+        r = run_close_check_fallback(args, me0)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print_close_check_fallback(r)
+        if not r.get("ok"):
+            sys.exit(2)
+        if r["verdict"] != "passed-at-newest":
+            sys.exit(3)
+        return
     try:
         epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
     except Exception as ex:
+        # /api/epochs paused or unreachable: fall back to the keyless per-epoch routes (SUGGESTIONS #131)
+        r = run_close_check_fallback(args, me0) if not getattr(args, "tri_cap", False) else {"ok": False}
+        if r.get("ok"):
+            r["epochs_error"] = redact(str(ex))
+            if args.json:
+                print(json.dumps(r, indent=2))
+            else:
+                print(f"close-check: /api/epochs unavailable ({redact(str(ex))}); using fallback")
+                print_close_check_fallback(r)
+            sys.exit(0 if r["verdict"] == "passed-at-newest" else 3)
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-check: could not read /api/epochs: {redact(str(ex))}")
         sys.exit(2)
     me = (args.address or local_address()).strip()
@@ -7233,6 +7345,7 @@ def main() -> None:
     p_cc.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
     p_cc.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_cc.add_argument("--tri-cap", dest="tri_cap", action="store_true", help="Pending grade-depth readout: tri-capped void (grades==quorum-1), never-dealt vs seals-but-short, own pending in the void (SUGGESTIONS #119)")
+    p_cc.add_argument("--via-settled", dest="via_settled", action="store_true", help="Use only keyless /api/close-report + /api/settled (no /api/epochs); automatic when /api/epochs is paused (SUGGESTIONS #131). Payout is not checked on this path")
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 

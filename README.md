@@ -104,6 +104,7 @@ python3 bin/poa.py backlog
 python3 bin/poa.py backlog --mine --table   # keyless: OUR pending answers, quorum gap, expiry, cannot-settle flag
 python3 bin/poa.py close-health                 # keyless: was the newest epoch close healthy, thin or halted-like? (exit 3 if flagged)
 python3 bin/poa.py close-check                  # keyless: per close, was OUR answer graded, did it pass, were we paid? (exit 3 if not paid)
+python3 bin/poa.py close-check --via-settled  # keyless: same check from /api/close-report + /api/settled only (auto when /api/epochs is paused; payout not checked)
 python3 bin/poa.py close-check --tri-cap        # keyless: pending grade-depth / tri-capped void (grades==quorum-1), own pending in the void
 python3 bin/poa.py close-presence               # keyless: close-report field-presence matrix + type-flip diff (occupancy null→int flips)
 python3 bin/poa.py juror-audit --closes 50-58  # keyless: your juror alignment split by verdict (strict vs lenient)
