@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.9"
+KIT_VERSION = "1.9.10"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1681,11 +1681,39 @@ def safe_mine() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Handoff helpers: PC silence + takeover decision for 6-hour epochs
+# Handoff helpers: PC silence + takeover decision (epoch length read from /api/params)
 # ---------------------------------------------------------------------------
 EPOCH_SECONDS = int(os.environ.get("POA_EPOCH_SECONDS", "21600"))
 EPOCH_ANCHOR_UTC = os.environ.get("POA_EPOCH_ANCHOR_UTC", "2026-10-24T21:01:00+00:00")
 SEGMENT2_GENESIS_DT = datetime.datetime.fromisoformat("2026-10-24T21:00:00+00:00")
+EPOCH_SECONDS_CACHE = POA_DIR / "epoch-seconds.json"
+
+
+def live_epoch_seconds(fetch: bool = True) -> float:
+    """Epoch length in seconds as the server serves it now (`auto_epoch_seconds` in /api/params).
+
+    The operator changed it from 21600 (6h) to 30600 (8.5h) at 5:48 AM PT Nov 9, 2026 without a
+    release, so nothing in the kit may assume 6h. Order: live /api/params (and remember it in
+    $POA_HOME/epoch-seconds.json), else the last remembered value, else POA_EPOCH_SECONDS / 21600."""
+    if fetch:
+        try:
+            v = _f((api_call("GET", "/api/params", need_key=False, timeout=15, retries=1) or {}).get("auto_epoch_seconds"))
+            if v and v > 0:
+                try:
+                    POA_DIR.mkdir(parents=True, exist_ok=True)
+                    EPOCH_SECONDS_CACHE.write_text(json.dumps({"auto_epoch_seconds": v}), encoding="utf-8")
+                except Exception:
+                    pass
+                return float(v)
+        except Exception:
+            pass
+    try:
+        v = _f(json.loads(EPOCH_SECONDS_CACHE.read_text(encoding="utf-8")).get("auto_epoch_seconds"))
+        if v and v > 0:
+            return float(v)
+    except Exception:
+        pass
+    return float(EPOCH_SECONDS)
 
 
 def _parse_log_ts(ts: str):
@@ -1813,11 +1841,7 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
         if isinstance(edge_ch, dict) and edge_ch.get("epoch") is not None:
             out["edge_epoch"] = edge_ch.get("epoch")
             out["edge_words"] = edge_ch.get("words", [])
-    seconds = None
-    try:
-        seconds = _f((api_call("GET", "/api/params", need_key=False, timeout=15, retries=1) or {}).get("auto_epoch_seconds")) or None
-    except Exception:
-        seconds = None
+    seconds = live_epoch_seconds()
     win = epoch_window(current_epoch=out["epoch"] if out["epoch"] is not None else out.get("edge_epoch"),
                        epoch_seconds=seconds)
     out["clock"] = win
@@ -7320,7 +7344,7 @@ def main() -> None:
     p_ro.add_argument("--confirm-min", type=int, default=EXPLORER_MIN_WAIT)
     p_ro.add_argument("--confirm-max", type=int, default=EXPLORER_MAX_WAIT)
 
-    p_tk = sub.add_parser("takeover-check", help="Read-only: should the backup answer this epoch? (6h epochs; PC silence >2h or epoch >45 min old with no PC claim)")
+    p_tk = sub.add_parser("takeover-check", help="Read-only: should the backup answer this epoch? (epoch length from /api/params; PC silence >2h or epoch >45 min old with no PC claim)")
     p_tk.add_argument("--log", default="", help="Path to LOG.md (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_tk.add_argument("--node", default="antigravity", help="Primary node name (default antigravity)")
     p_tk.add_argument("--hours", type=float, default=2.0, help="PC heartbeat silence threshold in hours (default 2)")
@@ -7485,13 +7509,13 @@ def main() -> None:
             if ch is None:
                 # Outage path: answer from the words+seed cached by an earlier successful read this epoch.
                 cached = load_epoch_cache(args.epoch)
-                win = epoch_window()
+                win = epoch_window(epoch_seconds=live_epoch_seconds())
                 first = cached.get("last_read") or cached.get("first_read") or ""
                 if not cached.get("words"):
                     print(json.dumps({"landed": False, "error": "challenge unreadable and no cached words/seed", "read_error": read_err}, indent=2))
                     sys.exit(2)
                 if first < win["window_start"] and args.epoch is None:
-                    print(json.dumps({"landed": False, "error": f"cached epoch {cached.get('epoch')} predates the current 6h window ({win['window_start']}); stale seed, not sending",
+                    print(json.dumps({"landed": False, "error": f"cached epoch {cached.get('epoch')} predates the current epoch window ({win['window_start']}); stale seed, not sending",
                                       "read_error": read_err}, indent=2))
                     sys.exit(2)
                 ch, source = {k: cached.get(k) for k in ("epoch", "words", "seed", "superseded", "answered_txid")}, "cache"
