@@ -1692,8 +1692,8 @@ EPOCH_SECONDS_CACHE = POA_DIR / "epoch-seconds.json"
 def live_epoch_seconds(fetch: bool = True) -> float:
     """Epoch length in seconds as the server serves it now (`auto_epoch_seconds` in /api/params).
 
-    The operator changed it from 21600 (6h) to 30600 (8.5h) at 5:48 AM PT Nov 9, 2026 without a
-    release, so nothing in the kit may assume 6h. Order: live /api/params (and remember it in
+    The operator set it from 21600 (6h) to 30600 (8.5h) at 5:48 AM PT Nov 9, 2026 for a one-time
+    E62 extension, without a release, so nothing in the kit may assume 6h. Order: live /api/params (and remember it in
     $POA_HOME/epoch-seconds.json), else the last remembered value, else POA_EPOCH_SECONDS / 21600."""
     if fetch:
         try:
