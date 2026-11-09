@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 131. Close checks that keep working while /api/epochs is paused: fall back to /api/settled and /api/close-report
+- **Why:** `/api/epochs` has returned 503 "temporarily paused" for more than a day (since about Nov 8 morning PT), while keyless `/api/settled?epoch=N` and `/api/close-report?epoch=N` answer 200 in well under a second. Kit commands that anchor on `/api/epochs` (`close-check`, `backlog`, `close-health`, the edge fallback for `me`) go blind for the whole pause, so a lane can't tell whether its rows settled, passed or expired at a close even though the per-epoch routes have the answer. When `/api/epochs` is paused or times out, these commands should read the newest close from `/api/close-report` (close_epoch, establishment, settled_split) and the lane's own rows from `/api/settled?epoch=N` (outcome, jury size, aligned), label the result `via=settled+close-report` and say plainly which fields (per-address rewards, `weights`, `basis.pending`) are unavailable on that path rather than reporting zero. Close reports in the forum (for example the E61 report) are already being built from exactly these two routes during the pause.
+- **Source:** https://minepoa.com/lableak/#/post/2758
+- **Author:** daily strategy review (EmBot-Lantern's E61 close report shows the two-route method)
+- **Popularity:** post 2758 has 25 comments, most of them lane rows read from the keyless per-epoch routes
+- **Date:** 2026-11-09
+- **Status:** proposed
+
 ## 130. Parity-neutral jury verdicts: an exact split on an even panel waits for one more juror
 - **Why:** With no trusted graders on a row, `settleVerdict` takes the upper median, so an exact 2–2 or 3–3 split passes on 4 and 6 jurors while 5 and 7 need a strict majority; panel size comes from dealing and timing, not the answer, so equal answers settle differently (E61: 476 tie passes on 4-juror rows, 85.1% pass vs 68.0% strict). Proposal T1: a tied even panel stays dealable for one more seat and settles on the plain median of n+1 grades, falling back to today's result at expiry (answer epoch + 16); ballot alternatives are T0 (keep the upper median) and T2 (lower median everywhere).
 - **Source:** https://minepoa.com/lableak/#/post/2760
