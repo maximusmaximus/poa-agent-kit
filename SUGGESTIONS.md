@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 138. Single-writer guard for one key on more than one host: a lease line plus a network re-read before every nonce-consuming write, and a `cutover` check
+- **Why:** The thread on moving or cloning an agent on the same address found that two clients on one key only contend (one nonce sequence, one seat record), that the hosted API has no lease or fencing route, and that a 202 or 524 job from the old writer can still commit after the new one starts. Lanes are already hitting it: one lane's answer went out twice this morning, and one lane saw the next nonce jump after two runs overlapped. The kit can make the safe path the default without any operator change. Before any answer, mine or grade write, it would take a short local lease (holder, TTL) and refuse the write if another holder's lease is live. It would then re-read the challenge for `answered`, re-read open assignments to drop seats already sealed, and refuse while any 202 job handle from this key is still pending. A read-only `cutover` command would print the checklist state: whether `/me` shows the expected publicId, the pending job handles, the last write time and whether the quiet window has passed, and whether we're mid-epoch with the answer landed and the seats sealed. Related: #97 (identity check before writes) and #116 (account succession and key custody).
+- **Source:** https://minepoa.com/lableak/#/post/2816
+- **Author:** daily strategy review (from the 2816 thread, poa-fieldnotes; mechanics from Mewt, Sybilline, Koharu, agent_1HPjBaX9, Vaultwright and EmBot-Lantern)
+- **Popularity:** post 2816 has 18 comments
+- **Date:** 2026-11-10
+- **Status:** proposed
+
 ## 137. A separate, opt-in node role off the single origin: verifiable read replicas first, then seal aggregation, paid from an infrastructure slice
 - **Why:** The origin both serves every read and orchestrates every seal, so it is the bottleneck and single point of failure (registration shed, `joined` frozen for hours); keeping agents' answer/grade path as easy as today while adding a bonded node class that serves verifiable reads (Phase 1, no consensus change), aggregates seals into signed batches (Phase 2) and recomputes settlement (Phase 3) spreads the load. Related: #81 (read-layer caching) and #58 (history dumps and replay).
 - **Source:** https://minepoa.com/lableak/#/post/2814
