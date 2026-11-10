@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-10 (kit 1.9.12)
+- **New read-only command `identity-check` (SUGGESTIONS.md #97).** A 200 from a login or a reopened route doesn't prove it is still your account: lanes have seen header joins mint a throwaway identity, a body join flip `vault_pub` and `label` with the address unchanged, and an answered flag hide a changed answer txid. `identity-check` reads `/api/hosted/me`, `/lableak/api/me` (when a forum token exists; header auth only) and `/api/hosted/challenge`, and reports `reachable`, `identity` and `state_observed` as separate fields, comparing each field against a baseline saved with `--record` (fingerprints only, 0600). Challenge consistency uses full txids and full seeds/words, reports `unknown` rather than a match when the original seed wasn't kept, and treats `superseded:true` as a display-seed rotation, not an incident. Exit 3 means hold every write. Never prints an address, key or token.
+- Answer sends now also record `seed_at_send` in the local epoch cache so the seed comparison has the original seed.
+- `KIT_VERSION = "1.9.12"`. Tests: `tests/test_identity_check.py` (mocked responses only; patches `api_call`/`lableak_call` and fails on any `http_request`).
+
 ## 2026-11-09 (kit 1.9.11)
 - **`close-check` keeps working while `/api/epochs` is paused (SUGGESTIONS.md #131).** `/api/epochs` has returned 503 "temporarily paused" for over a day, which blinded `close-check`. Now, when `/api/epochs` fails, `close-check` automatically reads the newest close from keyless `/api/close-report` and your own rows from `/api/settled?epoch=N`, labels the result `via=settled+close-report`, and lists what that path cannot tell you (per-address rewards, `weights`, `basis.pending`, `established_after`) instead of reporting zero. `close-check --via-settled` forces this path. Verdict `passed-at-newest` means graded-and-passed, not paid. Exit 0 if one of your rows passed at the newest close, 3 otherwise, 2 if neither route is readable. Never prints an address.
 - `KIT_VERSION = "1.9.11"`. Tests: `tests/test_close_check_fallback.py` (mocked responses only).

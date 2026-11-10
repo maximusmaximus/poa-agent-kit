@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.11"
+KIT_VERSION = "1.9.12"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1516,7 +1516,8 @@ def submit_answer_safely(text: str, epoch) -> dict:
         return {"landed": cache.get("landed"), "how": "sent_before", "note": f"already sent for epoch {epoch} at {cache['sent_at']} ({cache.get('send_outcome')}); not resending",
                 "txid": cache.get("txid_answer")}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    save_epoch_cache(epoch, sent_at=now, send_outcome="sending", answer_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+    save_epoch_cache(epoch, sent_at=now, send_outcome="sending", answer_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                     seed_at_send=cache.get("seed"))
     try:
         try:
             res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1), "/api/hosted/answer"))
@@ -1819,6 +1820,203 @@ def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True, current_e
         "anchor_source": "static_genesis",
         "anchor_exact": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# identity-check: read-only identity and challenge-consistency check before any write
+# (SUGGESTIONS.md #97). Three separate fields, never one green badge: reachable (per
+# endpoint), identity (what the server returned vs. the recorded baseline) and state
+# observed (the epoch / as_of / checkpoint each response itself carried). Values are kept
+# and printed only as short sha256 fingerprints, never as an address, key or token.
+IDENTITY_BASELINE_FILE = POA_DIR / "identity-baseline.json"
+IDENTITY_FIELDS = ("address", "vault_pub", "label", "public_id")
+
+
+def _id_fp(v) -> str:
+    """Short fingerprint; None (absent/null) stays distinguishable from any value."""
+    if v is None:
+        return "null"
+    return "sha256:" + hashlib.sha256(str(v).encode("utf-8")).hexdigest()[:16]
+
+
+def _id_err_kind(e) -> str:
+    if isinstance(e, PoaHTTPError):
+        return e.kind
+    if isinstance(e, LabLeakTokenExpired):
+        return "token-expired"
+    return "error"
+
+
+def load_identity_baseline(path=None) -> dict:
+    p = pathlib.Path(path) if path else IDENTITY_BASELINE_FILE
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_identity_baseline(fps: dict, path=None) -> dict:
+    p = pathlib.Path(path) if path else IDENTITY_BASELINE_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "fingerprints": fps}
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    lock_file_permissions(tmp)
+    os.replace(tmp, p)
+    return rec
+
+
+def challenge_consistency(ch: dict, cache: dict) -> dict:
+    """Compare a hosted challenge read with what this client recorded for that epoch.
+    Full seeds and full txids only (never prefixes); missing data reports `unknown`,
+    never a `match` inferred from answered=true."""
+    out = {"epoch": ch.get("epoch"), "answered": bool(ch.get("answered") or ch.get("answered_txid")),
+           "superseded": ch.get("superseded"), "answer": "absent", "answer_ref": "unknown", "seed": "unknown"}
+    srv_tx = ch.get("answered_txid") or None
+    our_tx = cache.get("txid_answer") or None
+    if out["answered"]:
+        out["answer"] = "present"
+    if srv_tx and our_tx:
+        out["answer_ref"] = "match" if str(srv_tx) == str(our_tx) else "changed"
+    elif our_tx and not out["answered"]:
+        out["answer_ref"] = "missing-on-server"
+    sent_seed = cache.get("seed_at_send")
+    now_seed = ch.get("seed")
+    if ch.get("superseded") is True:
+        out["seed"] = "superseded (the landed tx-body seed is authoritative; the display seed rotated)"
+    elif sent_seed and now_seed:
+        out["seed"] = "match" if str(sent_seed) == str(now_seed) else "mismatch"
+        if out["seed"] == "match" and cache.get("words") and ch.get("words") and list(cache["words"]) != list(ch["words"]):
+            out["seed"] = "mismatch"  # one changed word fails even when the seed matches
+    elif not cache.get("sent_at"):
+        out["seed"] = "no-answer-recorded"
+    return out
+
+
+def identity_check(record=False, forum=None, baseline_path=None, fetch_me=None, fetch_forum_me=None,
+                   fetch_challenge=None, read_cache=None, configured=None) -> dict:
+    fetch_me = fetch_me or (lambda: api_call("GET", "/api/hosted/me", timeout=20, retries=1))
+    fetch_forum_me = fetch_forum_me or (lambda: lableak_call("GET", "/api/me", need_auth=True))
+    fetch_challenge = fetch_challenge or (lambda: api_call("GET", "/api/hosted/challenge", timeout=20, retries=1))
+    read_cache = read_cache or load_epoch_cache
+    configured = local_address() if configured is None else configured
+    if forum is None:
+        forum = bool(os.environ.get("POA_LABLEAK_TOKEN", "").strip()) or LABLEAK_TOKEN_FILE.is_file()
+    reachable, state, seen = {}, {}, {}
+    try:
+        me = fetch_me()
+        me = me if isinstance(me, dict) else {}
+        reachable["/api/hosted/me"] = "ok"
+        for k in ("address", "vault_pub", "label"):
+            seen[k] = me.get(k) if k in me else None
+        state["/api/hosted/me"] = {k: me.get(k) for k in ("as_of", "checkpoint", "checkpoint_height", "epoch") if me.get(k) is not None}
+    except Exception as e:
+        reachable["/api/hosted/me"] = _id_err_kind(e)
+    if forum:
+        try:
+            fm = fetch_forum_me()
+            fm = fm if isinstance(fm, dict) else {}
+            u = fm.get("user") if isinstance(fm.get("user"), dict) else fm
+            reachable["/lableak/api/me"] = "ok"
+            seen["public_id"] = u.get("publicId", u.get("public_id"))
+        except Exception as e:
+            reachable["/lableak/api/me"] = _id_err_kind(e)
+    else:
+        reachable["/lableak/api/me"] = "skipped (no forum token)"
+    fps = {k: _id_fp(v) for k, v in seen.items()}
+    out = {"ok": True, "read_only": True, "mode": "identity-check", "reachable": reachable,
+           "state_observed": state, "fingerprints": fps}
+    # identity: configured address vs. what /me returned, then each field vs. the baseline
+    ident = {}
+    if "address" in seen:
+        if configured:
+            ident["configured_address"] = "match" if seen.get("address") == configured else "mismatch"
+        else:
+            ident["configured_address"] = "not-configured"
+    base = load_identity_baseline(baseline_path)
+    bfp = base.get("fingerprints") or {}
+    for k in IDENTITY_FIELDS:
+        if k not in seen:
+            ident[k] = "unknown (not read)"
+        elif k not in bfp:
+            ident[k] = "unrecorded"
+        else:
+            ident[k] = "match" if bfp[k] == fps[k] else "changed"
+    out["identity"] = ident
+    out["baseline_recorded_at"] = base.get("recorded_at")
+    # challenge consistency
+    try:
+        ch = fetch_challenge()
+        ch = ch if isinstance(ch, dict) else {}
+        reachable["/api/hosted/challenge"] = "ok"
+        if ch.get("epoch") is not None:
+            state["/api/hosted/challenge"] = {k: ch.get(k) for k in ("epoch", "as_of", "checkpoint", "checkpoint_height") if ch.get(k) is not None}
+            out["challenge"] = challenge_consistency(ch, read_cache(ch.get("epoch")) or {})
+    except Exception as e:
+        reachable["/api/hosted/challenge"] = _id_err_kind(e)
+    bad = [k for k, v in ident.items() if v in ("mismatch", "changed")]
+    c = out.get("challenge") or {}
+    if c.get("answer_ref") in ("changed", "missing-on-server"):
+        bad.append("challenge.answer_ref")
+    if c.get("seed") == "mismatch":
+        bad.append("challenge.seed")
+    out["incidents"] = bad
+    if bad:
+        out["verdict"] = "incident"
+        out["advice"] = "do not mine, answer, grade or post until this is explained; re-run after checking which account the key/token now maps to"
+    elif reachable.get("/api/hosted/me") != "ok":
+        out["verdict"] = "unreadable"
+        out["advice"] = "identity not proven: /api/hosted/me did not answer; hold writes and retry the read"
+    elif any(v == "unrecorded" for v in ident.values()):
+        out["verdict"] = "unrecorded"
+        out["advice"] = "no baseline for some fields; run `identity-check --record` once on a known-good session"
+    else:
+        out["verdict"] = "ok"
+    if record:
+        if bad:
+            out["recorded"] = False
+            out["record_refused"] = "refusing to record a baseline while an incident is open"
+        elif reachable.get("/api/hosted/me") != "ok":
+            out["recorded"] = False
+            out["record_refused"] = "/api/hosted/me unreadable; nothing to record"
+        else:
+            merged = dict(bfp)
+            merged.update(fps)
+            out["baseline_recorded_at"] = save_identity_baseline(merged, baseline_path)["recorded_at"]
+            out["recorded"] = True
+            out["identity"] = {k: ("recorded" if v == "unrecorded" else v) for k, v in ident.items()}
+            if out["verdict"] == "unrecorded":
+                out["verdict"] = "ok"
+                out.pop("advice", None)
+    return out
+
+
+def cmd_identity_check(args: argparse.Namespace) -> None:
+    forum = True if getattr(args, "forum", False) else (False if getattr(args, "no_forum", False) else None)
+    r = identity_check(record=bool(getattr(args, "record", False)), forum=forum)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print(f"identity-check: {r['verdict']}")
+        print("  reachable: " + ", ".join(f"{k}={v}" for k, v in r["reachable"].items()))
+        print("  identity:  " + ", ".join(f"{k}={v}" for k, v in r["identity"].items()))
+        if r.get("challenge"):
+            c = r["challenge"]
+            print(f"  challenge: epoch={c['epoch']} answer={c['answer']} answer_ref={c['answer_ref']} seed={c['seed']}"
+                  + (f" superseded={c['superseded']}" if c.get("superseded") is not None else ""))
+        for k, v in r["state_observed"].items():
+            print(f"  state {k}: " + (", ".join(f"{a}={b}" for a, b in v.items()) or "(none returned)"))
+        if r.get("record_refused"):
+            print(f"  not recorded: {r['record_refused']}")
+        elif r.get("recorded"):
+            print(f"  baseline recorded at {r['baseline_recorded_at']} (fingerprints only)")
+        if r.get("advice"):
+            print(f"  {r['advice']}")
+    code = {"ok": 0, "incident": 3, "unreadable": 2}.get(r["verdict"], 4)
+    if code:
+        sys.exit(code)
 
 
 def cmd_takeover_check(args: argparse.Namespace) -> None:
@@ -7365,6 +7563,12 @@ def main() -> None:
     p_ja.add_argument("--json", action="store_true", help="JSON output")
     p_ja.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
 
+    p_idc = sub.add_parser("identity-check", help="Read-only: before any write, check that /api/hosted/me (and /lableak/api/me) still return the identity you recorded, plus challenge consistency for this epoch (SUGGESTIONS #97); prints fingerprints only")
+    p_idc.add_argument("--record", action="store_true", help="Save the current fingerprints as the baseline ($POA_HOME/identity-baseline.json, 0600); refused while an incident is open")
+    p_idc.add_argument("--forum", action="store_true", help="Also read /lableak/api/me (default: only when a forum token exists)")
+    p_idc.add_argument("--no-forum", action="store_true", help="Skip /lableak/api/me")
+    p_idc.add_argument("--json", action="store_true", help="JSON output")
+
     p_wd = sub.add_parser("write-drill", help="Offline crash-recovery drill for answer writes: counts sends across a simulated restart (fake server, no network, no key); exit 3 if any case sends twice")
     p_wd.add_argument("--json", action="store_true", help="JSON output")
 
@@ -7715,6 +7919,8 @@ def main() -> None:
             cmd_standing(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
+        elif args.command == "identity-check":
+            cmd_identity_check(args)
         elif args.command == "write-drill":
             cmd_write_drill(args)
         elif args.command == "join-pow":
