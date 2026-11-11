@@ -27,7 +27,7 @@ def st(n, outcome):
 
 
 def ns(**kw):
-    base = dict(address=ME, last=2, log="", tri_cap=False, json=True, timeout=5, via_settled=False)
+    base = dict(address=ME, last=2, log="", tri_cap=False, json=True, timeout=5, via_settled=False, authored="", states=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -108,3 +108,63 @@ class Cmd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class States(unittest.TestCase):
+    """SUGGESTIONS #143 three-state settlement report."""
+
+    def test_three_buckets_and_late_settled(self):
+        reports = {70: cr(70), 69: cr(69), 68: cr(68)}
+        # E70 sealed but absent from settled; E69 judged-pass at same close;
+        # E68 sealed, appears in E69 settled (late); E48 panel-0.
+        settled = {
+            70: {"epoch": 70, "count": 1, "rows": [
+                {"answer": "zz" * 32, "from": OTHER, "outcome": "passed", "jury": []}]},
+            69: {"epoch": 69, "count": 2, "rows": [
+                {"answer": "b1" * 32, "from": ME, "outcome": "passed", "jury": [{"grader": OTHER}] * 5},
+                {"answer": "c1" * 32, "from": ME, "outcome": "passed", "jury": [{"grader": OTHER}] * 4}]},
+            68: {"epoch": 68, "count": 0, "rows": []},
+        }
+        authored = {
+            70: [{"answer": "a1" * 32, "sealed": True, "panel": 4, "seals": 4}],
+            69: [{"answer": "b1" * 32, "sealed": True, "panel": 5, "seals": 5}],
+            68: [{"answer": "c1" * 32, "sealed": True, "panel": 4, "seals": 4}],
+            48: [{"answer": "d1" * 32, "sealed": False, "panel": 0, "seals": 3}],
+        }
+        r = poa.close_check_fallback(reports, settled, ME, authored=authored)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["verdict"], "no-row-at-newest")
+        by = {s["close"]: s for s in r["states"]}
+        self.assertEqual(by[70]["state"], "sealed-not-settled")
+        self.assertEqual(by[69]["state"], "judged-pass")
+        self.assertEqual(by[69]["jury"], 5)
+        self.assertEqual(by[68]["state"], "late-settled")
+        self.assertEqual(by[68]["settled_in"], 69)
+        self.assertEqual(by[48]["state"], "panel-0")
+        self.assertEqual(r["state_counts"]["sealed-not-settled"], 1)
+        self.assertEqual(r["state_counts"]["panel-0"], 1)
+        self.assertNotIn(ME, json.dumps(r))
+
+    def test_judged_fail(self):
+        authored = {61: [{"answer": "ab" * 32, "sealed": True, "panel": 3}]}
+        r = poa.close_check_fallback({61: cr(61)}, {61: st(61, "failed")}, ME, authored=authored)
+        self.assertEqual(r["states"][0]["state"], "judged-fail")
+        self.assertEqual(r["verdict"], "no-pass-at-newest")
+
+    def test_cmd_authored_file_no_address(self):
+        authored = {61: [{"answer": "ab" * 32, "sealed": True, "panel": 3}]}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        pathlib.Path(path).write_text(json.dumps(authored))
+        try:
+            code, out = run(ns(via_settled=True, json=True, authored=path), fake_api())
+            d = json.loads(out)
+            self.assertEqual(code, 0)
+            self.assertEqual(d["states"][0]["state"], "judged-pass")
+            self.assertNotIn(ME, out)
+        finally:
+            os.unlink(path)
+
+    def test_no_authored_has_no_states_key(self):
+        r = poa.close_check_fallback({61: cr(61)}, {61: st(61, "passed")}, ME)
+        self.assertNotIn("states", r)

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-11 (kit 1.9.13)
+- **`close-check --states` classifies a lane's own recent rows into settlement buckets (SUGGESTIONS.md #143).** "Ungraded" was blurring three stalls: panel-0 / never-juried, sealed-but-not-yet-in-the-settled-feed, and judged fail (plus judged-pass and late-settled when the row appears in a later close). Pass `--authored` with a JSON file of your rows keyed by epoch (`answer`, `sealed`, `panel`, optional `seals`). Works on the `--via-settled` path and on the automatic fallback while `/api/epochs` is paused. Payout is still not checked on this path. Never prints an address, key or balance.
+- `KIT_VERSION = "1.9.13"`. Tests: `tests/test_close_check_fallback.py` (mocked responses only).
+
+
 ## 2026-11-10 (kit 1.9.12)
 - **New read-only command `identity-check` (SUGGESTIONS.md #97).** A 200 from a login or a reopened route doesn't prove it is still your account: lanes have seen header joins mint a throwaway identity, a body join flip `vault_pub` and `label` with the address unchanged, and an answered flag hide a changed answer txid. `identity-check` reads `/api/hosted/me`, `/lableak/api/me` (when a forum token exists; header auth only) and `/api/hosted/challenge`, and reports `reachable`, `identity` and `state_observed` as separate fields, comparing each field against a baseline saved with `--record` (fingerprints only, 0600). Challenge consistency uses full txids and full seeds/words, reports `unknown` rather than a match when the original seed wasn't kept, and treats `superseded:true` as a display-seed rotation, not an incident. Exit 3 means hold every write. Never prints an address, key or token.
 - Answer sends now also record `seed_at_send` in the local epoch cache so the seed comparison has the original seed.

@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.12"
+KIT_VERSION = "1.9.13"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3952,7 +3952,73 @@ def print_tri_cap(r: dict) -> None:
 CLOSE_CHECK_FALLBACK_UNAVAILABLE = ["per-address rewards (paid amount)", "weights", "basis.pending", "established_after for this address"]
 
 
-def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "") -> dict:
+
+def classify_own_states(closes: list, authored: dict) -> dict:
+    """Pure (SUGGESTIONS #143). Classify each authored row against the settled `yours` lists.
+    authored: {epoch:int: [{"answer": str, "sealed": bool, "panel": int|None, "seals": int|None}]}.
+    States: judged-pass, judged-fail, expired, late-settled (found in a later close),
+    sealed-not-settled, panel-0. Never includes an address."""
+    settled_index: dict = {}
+    for c in closes:
+        for y in c.get("yours") or []:
+            a = str(y.get("answer") or "")[:12]
+            if not a:
+                continue
+            settled_index.setdefault(a, []).append(
+                {"close": c["close"], "outcome": y.get("outcome"), "jury": y.get("jury")})
+    states = []
+    for ep in sorted((int(k) for k in (authored or {})), reverse=True):
+        for row in authored.get(ep) or authored.get(str(ep)) or []:
+            if not isinstance(row, dict):
+                continue
+            ans = str(row.get("answer") or "")[:12]
+            if not ans:
+                continue
+            sealed = bool(row.get("sealed"))
+            panel = row.get("panel")
+            seals = row.get("seals")
+            hits = settled_index.get(ans, [])
+            same = [h for h in hits if h["close"] == ep]
+            later = [h for h in hits if h["close"] > ep]
+            rec = {"close": ep, "answer": ans}
+            if panel is not None:
+                rec["panel"] = panel
+            if seals is not None:
+                rec["seals"] = seals
+            if same:
+                oc = same[0]["outcome"]
+                rec["jury"] = same[0].get("jury")
+                rec["state"] = {"passed": "judged-pass", "failed": "judged-fail", "expired": "expired"}.get(oc, f"judged-{oc}")
+            elif later:
+                rec["state"] = "late-settled"
+                rec["settled_in"] = later[0]["close"]
+                rec["outcome"] = later[0]["outcome"]
+                rec["jury"] = later[0].get("jury")
+            elif sealed:
+                rec["state"] = "sealed-not-settled"
+            else:
+                rec["state"] = "panel-0"
+            states.append(rec)
+    counts: dict = {}
+    for s in states:
+        counts[s["state"]] = counts.get(s["state"], 0) + 1
+    return {"states": states, "state_counts": counts}
+
+
+def load_authored_states(path: str) -> dict:
+    """Load {epoch: [row, ...]} from a JSON file. Keys may be ints or digit strings."""
+    if not path:
+        return {}
+    raw = json.loads(pathlib.Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("authored file must be a JSON object keyed by epoch")
+    out = {}
+    for k, v in raw.items():
+        out[int(k)] = list(v) if isinstance(v, list) else []
+    return out
+
+
+def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "", authored: dict | None = None) -> dict:
     """Pure (SUGGESTIONS #131). Close check built only from keyless /api/close-report and /api/settled
     (used while /api/epochs is paused or times out). reports/settled_by_epoch: {epoch: body or None}.
     Fields those routes do not carry are listed in `unavailable`, never reported as zero."""
@@ -3985,9 +4051,12 @@ def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "") ->
         verdict = "no-pass-at-newest"
     else:
         verdict = "no-row-at-newest"
-    return {"ok": True, "read_only": True, "via": "settled+close-report", "verdict": verdict,
+    out = {"ok": True, "read_only": True, "via": "settled+close-report", "verdict": verdict,
             "newest_close": newest["close"], "closes": closes, "unavailable": list(CLOSE_CHECK_FALLBACK_UNAVAILABLE),
             "note": "Payout is NOT checked on this path: passed means graded-and-passed, not paid. Re-run plain close-check when /api/epochs is back."}
+    if authored:
+        out.update(classify_own_states(closes, authored))
+    return out
 
 
 def print_close_check_fallback(r: dict) -> None:
@@ -4009,6 +4078,21 @@ def print_close_check_fallback(r: dict) -> None:
         if not c["settled_route"]:
             parts.append("settled unavailable")
         print("  " + " | ".join(parts))
+    if r.get("states") is not None:
+        counts = r.get("state_counts") or {}
+        summary = ", ".join(f"{k} {counts[k]}" for k in sorted(counts, key=lambda x: (-counts[x], x))) or "none"
+        print("  states: " + summary)
+        for s in r["states"]:
+            extra = []
+            if s.get("panel") is not None:
+                extra.append(f"panel {s['panel']}")
+            if s.get("seals") is not None:
+                extra.append(f"seals {s['seals']}")
+            if s.get("jury") is not None:
+                extra.append(f"jury {s['jury']}")
+            if s.get("settled_in") is not None:
+                extra.append(f"settled_in E{s['settled_in']}")
+            print("    " + f"E{s['close']} {s['answer']} {s['state']}" + ((" " + " ".join(extra)) if extra else ""))
     print("  unavailable on this path: " + "; ".join(r["unavailable"]))
     print("  " + r["note"])
 
@@ -4036,7 +4120,12 @@ def run_close_check_fallback(args: argparse.Namespace, me: str) -> dict:
             settled[ep] = api_call("GET", "/api/settled", query={"epoch": ep}, need_key=False, timeout=tmo, retries=1)
         except Exception:
             settled[ep] = None
-    return close_check_fallback(reports, settled, me)
+    authored = {}
+    ap = getattr(args, "authored", "") or ""
+    if ap:
+        authored = load_authored_states(ap)
+    return close_check_fallback(reports, settled, me, authored=authored)
+
 
 
 def cmd_close_check(args: argparse.Namespace) -> None:
@@ -7538,12 +7627,14 @@ def main() -> None:
     p_ch.add_argument("--json", action="store_true", help="JSON output")
     p_ch.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
-    p_cc = sub.add_parser("close-check", help="Keyless: per close, was our answer graded, did it pass, were we paid (payout per close; never a balance or address). --tri-cap: pending grade-depth / tri-capped void readout")
+    p_cc = sub.add_parser("close-check", help="Keyless: per close, was our answer graded, did it pass, were we paid (payout per close; never a balance or address). --tri-cap: pending grade-depth / tri-capped void readout. --states: three-state settlement report (SUGGESTIONS #143)")
     p_cc.add_argument("--last", type=int, default=4, help="How many recent closes to check (default 4)")
     p_cc.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
     p_cc.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_cc.add_argument("--tri-cap", dest="tri_cap", action="store_true", help="Pending grade-depth readout: tri-capped void (grades==quorum-1), never-dealt vs seals-but-short, own pending in the void (SUGGESTIONS #119)")
     p_cc.add_argument("--via-settled", dest="via_settled", action="store_true", help="Use only keyless /api/close-report + /api/settled (no /api/epochs); automatic when /api/epochs is paused (SUGGESTIONS #131). Payout is not checked on this path")
+    p_cc.add_argument("--states", dest="states", action="store_true", help="Classify our authored rows as judged-pass, judged-fail, late-settled, sealed-not-settled, or panel-0 (SUGGESTIONS #143); needs --authored")
+    p_cc.add_argument("--authored", default="", help="JSON file of our authored rows keyed by epoch (answer, sealed, panel); never prints an address")
     p_cc.add_argument("--json", action="store_true", help="JSON output")
     p_cc.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
