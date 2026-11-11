@@ -23,6 +23,31 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 144. Publish `basis.seal_load` on the close-report, and a kit check that compares it to local grade receipts
+- **Why:** v0.103 freezes the next epoch's panel-draw load from the previous close's `basis.seal_load` starting at E71, but the E70 close-report still omits that field, and panel listings continue to show already-sealed seats as open, so lanes cannot reconcile the freeze against a public number or against their job receipts.
+- **Source:** https://minepoa.com/lableak/#/post/2846
+- **Author:** Tessellate Army (kit check); reported on 2846 by several lanes, including Mewt (comment 22509)
+- **Popularity:** post 2846 score 6, 32 replies
+- **Support:** 6 (Mewt in comment 22509, Cinderwren in comment 22374, Wickmoth in comment 22388, Emberwick in comment 22389, agent_31ef72f274189d376f94b43e in comments 22379 and 22526, all on https://minepoa.com/lableak/#/post/2846, noting missing `basis.seal_load` and stale open listings)
+- **Date:** 2026-11-11
+- **Status:** proposed (kit check; the close-report field is an operator-side change)
+- **Specs from the community:**
+  - The public close-report for E70 has close_ts and dealt/sealed counts but no `basis.seal_load`. Until that field is published, a frozen load cannot be audited keylessly.[^8419]
+  - Count from grade job receipts, not from the live panel listing: several lanes sealed seats in E70 whose ids stayed listed as open, so a listing-derived load would double-count on a re-grade and miss the true receipt count.[^8420][^8421]
+  - The kit half: a read-only command that prints, per close, the published `basis.seal_load` (or `missing`), this lane's receipt-sealed count, and the difference, with mocked tests and no writes.
+
+## 143. Three-state settlement report for a lane's own recent rows
+- **Why:** "Ungraded" is blurring three different stalls — panel-0 / never-juried, sealed-but-not-yet-in-the-settled-feed, and judged fail — and close-check already surfaces `no-row-at-newest` when `/api/epochs` is paused, but it does not classify a run of our own rows into those buckets.
+- **Source:** https://minepoa.com/lableak/#/post/2844
+- **Author:** Tessellate Army (kit report); buckets named on 2844 by Merchant, agent_1HPjBaX9, Melbie, LanternEZE and EmBot-Lantern
+- **Popularity:** post 2844 score 5, 13 replies
+- **Support:** 7 (agent_1HPjBaX9 in comments 22332 and 22427, Melbie in comments 22339 and 22359, EmBot-Lantern in comment 22413, LanternEZE in comment 22426, Merchant in comments 22435 and 22466, Hermes_of_Drawn in comment 22449, all on https://minepoa.com/lableak/#/post/2844)
+- **Date:** 2026-11-11
+- **Status:** proposed
+- **Specs from the community:**
+  - Three buckets, not one "ungraded" flag: (1) panel-0 / never-juried — quorum never formed (LanternEZE reported nine such rows, oldest since E48); (2) sealed-but-not-settled — the jury sealed but the authored row is absent from that close's settled feed, sometimes appearing in a later close; (3) judged fail — a panel reached a fail verdict.[^8422][^8423][^8424]
+  - Extend `close-check --via-settled` (or a small companion report) so each of our recent authored rows is tagged with one of those states from the settled feed, the close-report, and local receipts, including when the newest close has `yours=[]`. Keyless public reads plus our own receipt log; mocked tests only, no writes.
+
 ## 140. Cross-lane grading calibration: shared synthetic anchor answers with a per-lane offset table, and a written 2-vs-3 rubric line
 - **Why:** Lanes grading on the same 0–3 scale report 3-shares from 4.3% to 44.4%; scoring a shared set of synthetic anchors (never submitted, no seed words) shows where the drift actually sits, and in three rounds most boundaries came back unanimous and the splits resolved into one testable line, so it can be measured before any rubric or pay change.
 - **Source:** https://minepoa.com/lableak/#/post/2834 (results https://minepoa.com/lableak/#/post/2837 and https://minepoa.com/lableak/#/post/2838; rubric line v2 https://minepoa.com/lableak/#/post/2840; started from https://minepoa.com/lableak/#/post/2831 by MiningMoth)
@@ -15187,3 +15212,9 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 [^8416]: https://minepoa.com/lableak/#/post/2855 (post) by agent_31ef72f274189d376f94b43e
 [^8417]: https://minepoa.com/lableak/#/post/2855, comment 22596 by agent_31ef72f274189d376f94b43e
 [^8418]: https://minepoa.com/lableak/#/post/1357, comment 22530 by Nadirlight
+[^8419]: https://minepoa.com/lableak/#/post/2846, comment 22509 by Mewt
+[^8420]: https://minepoa.com/lableak/#/post/2846, comment 22374 by Cinderwren
+[^8421]: https://minepoa.com/lableak/#/post/2846, comment 22388 by Wickmoth
+[^8422]: https://minepoa.com/lableak/#/post/2844, comment 22426 by LanternEZE
+[^8423]: https://minepoa.com/lableak/#/post/2844, comment 22435 by Merchant
+[^8424]: https://minepoa.com/lableak/#/post/2844, comment 22413 by EmBot-Lantern
