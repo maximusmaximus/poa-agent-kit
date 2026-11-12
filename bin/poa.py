@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.13"
+KIT_VERSION = "1.9.14"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -1198,38 +1198,437 @@ class _WriteLock:
         return False
 
 
-def hosted_write(send, sleep=time.sleep) -> dict:
+# ---------------------------------------------------------------------------
+# Single-writer lease (SUGGESTIONS.md #138). OPT-IN: set POA_SINGLE_WRITER=1 and POA_NODE=<name>.
+# Two nodes (e.g. a PC primary and a box backup) share one PoA key. The hosted API has no lease
+# or fencing route, so the kit keeps one in the shared handoff git repo:
+#   LEASE.json = {"holder", "token", "acquired_at", "expires_at", "ttl_s", "purpose", "pending_jobs"}
+# Acquire/renew/release build a commit on top of the remote branch tip WITHOUT touching the
+# working tree and push it to that exact tip, so git's fast-forward rule is the compare-and-swap:
+# if anything landed on the remote first (another node's lease, or any LOG.md push), the push is
+# rejected and we re-read and re-decide. `token` is a fencing token: it goes up by one every time
+# the lease changes hands, and before EVERY write the guard re-reads the remote lease and refuses
+# unless holder and token still match what this process acquired. On one machine the existing
+# write.lock flock serializes processes. Anything unreadable, stale or ambiguous => refuse the write
+# (kind "busy": not sent, safe to try on a later run) and say why. Never stores an address or key.
+# ---------------------------------------------------------------------------
+LEASE_FILE_NAME = os.environ.get("POA_LEASE_FILE", "LEASE.json")
+LEASE_TTL_S = float(os.environ.get("POA_LEASE_TTL_S", "900"))
+LEASE_MAX_TTL_S = float(os.environ.get("POA_LEASE_MAX_TTL_S", "3600"))
+LEASE_SKEW_S = float(os.environ.get("POA_LEASE_SKEW_S", "60"))
+LEASE_REMOTE = os.environ.get("POA_LEASE_REMOTE", "origin")
+LEASE_BRANCH = os.environ.get("POA_LEASE_BRANCH", "main")
+LEASE_PUSH_TRIES = 4
+LEASE_STATES_OK = ("free", "mine", "mine-expired", "expired")
+
+
+def single_writer_enabled() -> bool:
+    return os.environ.get("POA_SINGLE_WRITER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def lease_node() -> str:
+    return os.environ.get("POA_NODE", "").strip()
+
+
+def lease_repo() -> pathlib.Path:
+    d = os.environ.get("POA_HANDOFF_DIR", "").strip()
+    return pathlib.Path(d).expanduser() if d else HANDOFF_LOG.parent
+
+
+def _lease_local_path() -> pathlib.Path:
+    return POA_DIR / "lease-held.json"
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso_z(dt: datetime.datetime) -> str:
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso_utc(v):
+    if not isinstance(v, str) or not v.strip():
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else None
+
+
+def _lease_git(repo: pathlib.Path, *args, input_text: str = None, env: dict = None, timeout: float = 60):
+    e = dict(os.environ)
+    e.setdefault("GIT_TERMINAL_PROMPT", "0")
+    if env:
+        e.update(env)
+    return subprocess.run(["git", "-C", str(repo)] + list(args), input=input_text, capture_output=True,
+                          text=True, timeout=timeout, env=e)
+
+
+def lease_read_remote(repo: pathlib.Path = None) -> dict:
+    """Fetch the handoff branch and read LEASE.json at the remote tip (never the working tree).
+    Returns {"ok", "tip", "raw" (None when the file is absent), "err"}."""
+    repo = repo or lease_repo()
+    if not (repo / ".git").exists() and not repo.joinpath("HEAD").exists():
+        return {"ok": False, "err": f"handoff repo not found at {repo}"}
+    try:
+        f = _lease_git(repo, "fetch", "-q", LEASE_REMOTE, LEASE_BRANCH)
+        if f.returncode != 0:
+            return {"ok": False, "err": "fetch failed: " + redact(f.stderr.strip())[:200]}
+        r = _lease_git(repo, "rev-parse", f"refs/remotes/{LEASE_REMOTE}/{LEASE_BRANCH}")
+        if r.returncode != 0:
+            return {"ok": False, "err": "no remote branch: " + redact(r.stderr.strip())[:200]}
+        tip = r.stdout.strip()
+        s = _lease_git(repo, "show", f"{tip}:{LEASE_FILE_NAME}")
+        raw = s.stdout if s.returncode == 0 else None
+        return {"ok": True, "tip": tip, "raw": raw}
+    except Exception as ex:
+        return {"ok": False, "err": redact(str(ex))[:200]}
+
+
+def lease_evaluate(raw, me: str, now: datetime.datetime = None) -> dict:
+    """Classify the shared lease for node `me`.
+    free | mine | mine-expired | expired (other holder, cleanly past expiry: may be taken over) |
+    held (other holder, live) | stale (other holder expired but still lists pending 202 jobs) |
+    ambiguous (unparseable, missing fields, or times that don't make sense on this clock)."""
+    now = now or _utc_now()
+    if raw is None or not str(raw).strip():
+        return {"state": "free", "token": 0, "holder": None, "reason": "no lease recorded"}
+    try:
+        lease = json.loads(raw)
+    except ValueError:
+        return {"state": "ambiguous", "reason": f"{LEASE_FILE_NAME} is not valid JSON"}
+    if not isinstance(lease, dict):
+        return {"state": "ambiguous", "reason": f"{LEASE_FILE_NAME} is not an object"}
+    token = lease.get("token")
+    if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+        return {"state": "ambiguous", "reason": "lease has no valid fencing token"}
+    holder = lease.get("holder")
+    base = {"token": token, "holder": holder, "pending_jobs": lease.get("pending_jobs") or [],
+            "expires_at": lease.get("expires_at"), "purpose": lease.get("purpose")}
+    if holder in (None, ""):
+        return dict(base, state="free", holder=None, reason="lease released")
+    acq, exp = _parse_iso_utc(lease.get("acquired_at")), _parse_iso_utc(lease.get("expires_at"))
+    if acq is None or exp is None or exp < acq:
+        return dict(base, state="ambiguous", reason="lease times missing or unreadable")
+    skew = datetime.timedelta(seconds=LEASE_SKEW_S)
+    if acq > now + skew:
+        return dict(base, state="ambiguous", reason="lease acquired in the future on this clock (clock skew?)")
+    if exp > now + datetime.timedelta(seconds=LEASE_MAX_TTL_S) + skew:
+        return dict(base, state="ambiguous", reason=f"lease expiry is more than {LEASE_MAX_TTL_S:.0f}s ahead (bad TTL or clock skew)")
+    remaining = (exp - now).total_seconds()
+    base["remaining_s"] = round(remaining)
+    if holder == me:
+        if remaining > 0:
+            return dict(base, state="mine", reason="this node holds the lease")
+        return dict(base, state="mine-expired", reason="this node's lease expired")
+    if remaining + LEASE_SKEW_S > 0:
+        return dict(base, state="held", reason=f"lease held by {holder} for {max(0, round(remaining))}s more (token {token})")
+    if base["pending_jobs"]:
+        return dict(base, state="stale", reason=f"{holder}'s lease expired but lists {len(base['pending_jobs'])} unresolved 202 job(s); "
+                                                "the holder must resolve them (jobs --check) and release")
+    return dict(base, state="expired", reason=f"{holder}'s lease expired {round(-remaining)}s ago with no pending jobs")
+
+
+def lease_local() -> dict:
+    try:
+        d = json.loads(_lease_local_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _lease_local_for(me: str) -> dict:
+    """This machine's record of the lease it holds, only if it was taken under node name `me`."""
+    d = lease_local()
+    return d if d.get("holder") == me else {}
+
+
+def _lease_local_save(d: dict) -> None:
+    POA_DIR.mkdir(parents=True, exist_ok=True)
+    p = _lease_local_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    lock_file_permissions(tmp)
+    os.replace(tmp, p)
+
+
+def _lease_local_clear() -> None:
+    try:
+        _lease_local_path().unlink()
+    except OSError:
+        pass
+
+
+def _lease_cas_push(repo: pathlib.Path, tip: str, new_lease: dict, msg: str) -> dict:
+    """Commit LEASE.json on top of `tip` without touching the working tree, then push that commit to
+    the remote branch. Non-fast-forward => {"ok": False, "raced": True}."""
+    body = json.dumps(new_lease, indent=2, sort_keys=True) + "\n"
+    ident = {}
+    if not _lease_git(repo, "config", "user.email").stdout.strip():
+        ident = {"GIT_AUTHOR_NAME": "poa-lease", "GIT_AUTHOR_EMAIL": "poa-lease@localhost",
+                 "GIT_COMMITTER_NAME": "poa-lease", "GIT_COMMITTER_EMAIL": "poa-lease@localhost"}
+    blob = _lease_git(repo, "hash-object", "-w", "--stdin", input_text=body)
+    if blob.returncode != 0:
+        return {"ok": False, "err": "hash-object failed: " + blob.stderr.strip()[:200]}
+    idx = tempfile.NamedTemporaryFile(prefix="poa-lease-idx-", delete=False)
+    idx.close()
+    os.unlink(idx.name)
+    env = dict(ident, GIT_INDEX_FILE=idx.name)
+    try:
+        for step in (["read-tree", tip],
+                     ["update-index", "--add", "--cacheinfo", f"100644,{blob.stdout.strip()},{LEASE_FILE_NAME}"]):
+            r = _lease_git(repo, *step, env=env)
+            if r.returncode != 0:
+                return {"ok": False, "err": f"{step[0]} failed: " + r.stderr.strip()[:200]}
+        tree = _lease_git(repo, "write-tree", env=env)
+        if tree.returncode != 0:
+            return {"ok": False, "err": "write-tree failed: " + tree.stderr.strip()[:200]}
+    finally:
+        try:
+            os.unlink(idx.name)
+        except OSError:
+            pass
+    c = _lease_git(repo, "commit-tree", tree.stdout.strip(), "-p", tip, "-m", msg, env=ident)
+    if c.returncode != 0:
+        return {"ok": False, "err": "commit-tree failed: " + c.stderr.strip()[:200]}
+    commit = c.stdout.strip()
+    p = _lease_git(repo, "push", "-q", "--porcelain", LEASE_REMOTE, f"{commit}:refs/heads/{LEASE_BRANCH}")
+    if p.returncode == 0:
+        return {"ok": True, "commit": commit}
+    out = (p.stdout + p.stderr).lower()
+    raced = any(m in out for m in ("non-fast-forward", "fetch first", "rejected", "stale info"))
+    return {"ok": False, "raced": raced, "err": "push failed: " + redact(p.stderr.strip() or p.stdout.strip())[:200]}
+
+
+def _queued_job_masks() -> list:
+    return [mask_job_id(r.get("job_id")) for r in load_busy_jobs() if r.get("state") == "queued" and r.get("job_id")]
+
+
+def lease_acquire(me: str = None, ttl: float = None, purpose: str = "", force: bool = False, reason: str = "",
+                  repo: pathlib.Path = None, pending_jobs: list = None) -> dict:
+    """Take, renew or take over (clean expiry only) the shared lease. Refuses while another node's
+    lease is live, and on stale/ambiguous state unless force=True with a reason."""
+    me = (me or lease_node()).strip()
+    repo = repo or lease_repo()
+    ttl = float(ttl or LEASE_TTL_S)
+    if not me:
+        return {"ok": False, "state": "no-node", "reason": "set POA_NODE (or --node) to this node's name"}
+    if ttl <= 0 or ttl > LEASE_MAX_TTL_S:
+        return {"ok": False, "state": "bad-ttl", "reason": f"ttl must be between 1 and {LEASE_MAX_TTL_S:.0f}s"}
+    if force and not reason.strip():
+        return {"ok": False, "state": "force-needs-reason", "reason": "--force needs --reason"}
+    last = {}
+    for attempt in range(LEASE_PUSH_TRIES):
+        rd = lease_read_remote(repo)
+        if not rd.get("ok"):
+            return {"ok": False, "state": "unsynced", "reason": f"cannot read the shared lease ({rd.get('err')}); "
+                                                                "refusing because another holder can't be ruled out"}
+        now = _utc_now()
+        ev = lease_evaluate(rd["raw"], me, now)
+        last = ev
+        local = _lease_local_for(me)
+        st = ev["state"]
+        if st == "held" or (st in ("stale", "ambiguous") and not force):
+            return {"ok": False, "state": st, "reason": ev["reason"], "lease": ev}
+        if st == "mine" and local.get("token") != ev["token"] and not force:
+            return {"ok": False, "state": "fenced", "lease": ev,
+                    "reason": f"fencing token mismatch: shared lease names {me} with token {ev['token']} but this "
+                              f"machine holds token {local.get('token')}; another process may be using the same node name"}
+        old_tok = ev.get("token") or 0
+        renew = st == "mine"
+        token = old_tok if renew else old_tok + 1
+        pj = list(pending_jobs) if pending_jobs is not None else (ev.get("pending_jobs") if renew else [])
+        new = {"version": 1, "holder": me, "token": token, "acquired_at": _iso_z(now),
+               "expires_at": _iso_z(now + datetime.timedelta(seconds=ttl)), "ttl_s": int(ttl),
+               "purpose": (purpose or "")[:80], "pending_jobs": pj or []}
+        if st in ("expired", "stale", "ambiguous") and ev.get("holder"):
+            new["took_over_from"] = ev.get("holder")
+        if force:
+            new["forced"] = reason.strip()[:160]
+        op = "renew" if renew else ("takeover" if new.get("took_over_from") else "acquire")
+        push = _lease_cas_push(repo, rd["tip"], new, f"lease: {me} {op} token={token}")
+        if push.get("ok"):
+            _lease_local_save({"holder": me, "token": token, "expires_at": new["expires_at"], "repo": str(repo)})
+            return {"ok": True, "state": "mine", "op": op, "token": token, "expires_at": new["expires_at"],
+                    "previous": {"state": st, "holder": ev.get("holder"), "token": ev.get("token")}, "commit": push["commit"][:12]}
+        if not push.get("raced"):
+            return {"ok": False, "state": "push-failed", "reason": push.get("err")}
+    return {"ok": False, "state": "contended", "lease": last,
+            "reason": f"the handoff branch moved under us {LEASE_PUSH_TRIES} times; not sure who holds the lease"}
+
+
+def lease_release(me: str = None, force: bool = False, repo: pathlib.Path = None) -> dict:
+    me = (me or lease_node()).strip()
+    repo = repo or lease_repo()
+    if not me:
+        return {"ok": False, "state": "no-node", "reason": "set POA_NODE (or --node) to this node's name"}
+    pending = _queued_job_masks()
+    if pending and not force:
+        return {"ok": False, "state": "pending-jobs", "pending_jobs": pending,
+                "reason": "this node still has queued 202 jobs; run `jobs --check` until they resolve (or --force)"}
+    for attempt in range(LEASE_PUSH_TRIES):
+        rd = lease_read_remote(repo)
+        if not rd.get("ok"):
+            return {"ok": False, "state": "unsynced", "reason": f"cannot read the shared lease ({rd.get('err')})"}
+        ev = lease_evaluate(rd["raw"], me, _utc_now())
+        if ev["state"] == "free":
+            _lease_local_clear()
+            return {"ok": True, "op": "noop", "reason": "lease already free"}
+        if ev.get("holder") != me:
+            _lease_local_clear()
+            return {"ok": False, "state": "not-holder", "reason": f"lease is held by {ev.get('holder')}, not {me}"}
+        local = _lease_local_for(me)
+        if local.get("token") != ev.get("token") and not force:
+            return {"ok": False, "state": "fenced",
+                    "reason": f"fencing token mismatch (shared {ev.get('token')}, local {local.get('token')}); not releasing"}
+        new = {"version": 1, "holder": None, "token": ev["token"], "released_at": _iso_z(_utc_now()),
+               "released_by": me, "pending_jobs": []}
+        push = _lease_cas_push(repo, rd["tip"], new, f"lease: {me} release token={ev['token']}")
+        if push.get("ok"):
+            _lease_local_clear()
+            return {"ok": True, "op": "release", "token": ev["token"], "commit": push["commit"][:12]}
+        if not push.get("raced"):
+            return {"ok": False, "state": "push-failed", "reason": push.get("err")}
+    return {"ok": False, "state": "contended", "reason": "the handoff branch kept moving; release not recorded"}
+
+
+def lease_check(action: str = "write", me: str = None, repo: pathlib.Path = None) -> dict:
+    """Read-only: what the guard would do for `action` right now. Never writes the lease."""
+    me = (me or lease_node()).strip()
+    out = {"enabled": single_writer_enabled(), "node": me or None, "action": action, "repo": str(repo or lease_repo())}
+    if not me:
+        out.update(decision="refuse", reason="POA_NODE is not set")
+        return out
+    rd = lease_read_remote(repo)
+    if not rd.get("ok"):
+        out.update(decision="refuse", state="unsynced", reason=f"cannot read the shared lease ({rd.get('err')})")
+        return out
+    ev = lease_evaluate(rd["raw"], me)
+    local = _lease_local_for(me)
+    out["lease"] = ev
+    out["local_token"] = local.get("token")
+    st = ev["state"]
+    if st == "mine" and local.get("token") == ev.get("token"):
+        renew = ev.get("remaining_s", 0) < LEASE_TTL_S / 2
+        out.update(decision="write", reason="this node holds the lease" + ("; would renew first" if renew else ""))
+    elif st == "mine":
+        out.update(decision="refuse", state="fenced", reason="fencing token mismatch for this node name")
+    elif local.get("token") is not None and ev.get("token") != local.get("token") and st == "held":
+        out.update(decision="refuse", state="fenced",
+                   reason=f"fencing: our token {local.get('token')} was superseded by {ev.get('holder')} token {ev.get('token')}; " + ev["reason"])
+    elif st in ("free", "expired", "mine-expired"):
+        out.update(decision="acquire-then-write", reason=ev["reason"])
+    else:
+        out.update(decision="refuse", reason=ev["reason"])
+    return out
+
+
+def lease_guard(action: str = "write") -> dict:
+    """Called right before every write when POA_SINGLE_WRITER=1. Re-reads the remote lease (the
+    fencing check) and returns the token in force, auto-acquiring a free or cleanly expired lease.
+    Raises PoaHTTPError(kind="busy") when the write must not go out. No-op when disabled."""
+    if not single_writer_enabled():
+        return {}
+    chk = lease_check(action)
+    dec = chk.get("decision")
+    if dec == "write":
+        tok = chk["lease"]["token"]
+        if chk["lease"].get("remaining_s", 0) < LEASE_TTL_S / 2:
+            r = lease_acquire(purpose=action)
+            if not r.get("ok"):
+                raise PoaHTTPError("busy", f"single-writer lease: renew failed ({r.get('reason')}); not sending {action}")
+            tok = r["token"]
+        return {"token": tok, "action": action}
+    if dec == "acquire-then-write":
+        r = lease_acquire(purpose=action)
+        if r.get("ok"):
+            return {"token": r["token"], "action": action, "op": r.get("op")}
+        raise PoaHTTPError("busy", f"single-writer lease: {r.get('state')}: {r.get('reason')}; not sending {action}")
+    raise PoaHTTPError("busy", f"single-writer lease: {chk.get('state') or chk.get('lease', {}).get('state')}: "
+                               f"{chk.get('reason')}; not sending {action}")
+
+
+def lease_note_pending(job_id) -> dict:
+    """A write came back 202-queued: keep the lease tied to that job so the other node won't treat
+    a clean expiry as safe (#138 spec: tie the claim to the job, not the clock)."""
+    if not single_writer_enabled():
+        return {}
+    pj = sorted(set((lease_local().get("pending_jobs") or []) + _queued_job_masks() + ([mask_job_id(job_id)] if job_id else [])))
+    r = lease_acquire(purpose="pending-202", pending_jobs=pj)
+    if r.get("ok"):
+        d = lease_local()
+        d["pending_jobs"] = pj
+        _lease_local_save(d)
+    return r
+
+
+def lease_status(me: str = None) -> dict:
+    out = lease_check("status", me=me)
+    lk = POA_DIR / "cache" / "write.lock"
+    busy = None
+    if os.name != "nt" and lk.exists():
+        try:
+            import fcntl
+            with open(lk, "a+") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    busy = False
+                except OSError:
+                    busy = True
+        except Exception:
+            busy = None
+    out["local_write_lock_busy"] = busy
+    out["ttl_s"] = LEASE_TTL_S
+    out.pop("action", None)
+    return out
+
+def hosted_write(send, sleep=time.sleep, action: str = "write") -> dict:
     """Run one nonce-bearing hosted write `send()` under the nonce rules above.
     Returns the response dict with `_nonce` info added. Raises PoaHTTPError; kind "nonce-lag" or
-    "nonce" means NOT landed and safe to try again on a later run."""
+    "nonce" means NOT landed and safe to try again on a later run. With POA_SINGLE_WRITER=1 the
+    shared lease (#138) is checked first, under the same local write.lock."""
     with _WriteLock():
-        ok, before = wait_for_slot(_NONCE["adopted"], sleep=sleep)
-        if not ok:
-            raise PoaHTTPError("nonce-lag", f"server next_nonce {before} is behind our last adopted {_NONCE['adopted']} "
-                                            f"after {NONCE_SETTLE_S:.0f}s; not sending into a possibly taken slot")
-        retried = False
+        held = lease_guard(action)
+        try:
+            return _hosted_write_locked(send, sleep)
+        except PoaHTTPError as e:
+            if held and e.kind == "queued":
+                lease_note_pending(getattr(e, "job_id", None))
+            raise
+
+
+def _hosted_write_locked(send, sleep) -> dict:
+    """The nonce-disciplined send; caller holds write.lock (and the lease when enabled)."""
+    ok, before = wait_for_slot(_NONCE["adopted"], sleep=sleep)
+    if not ok:
+        raise PoaHTTPError("nonce-lag", f"server next_nonce {before} is behind our last adopted {_NONCE['adopted']} "
+                                        f"after {NONCE_SETTLE_S:.0f}s; not sending into a possibly taken slot")
+    retried = False
+    try:
+        res = send()
+    except PoaHTTPError as e:
+        if not is_nonce_error(e):
+            raise
+        ok2, after = wait_for_slot((before + 1) if before is not None else None, sleep=sleep)
+        if not ok2 or after is None or before is None or after <= before:
+            raise PoaHTTPError("nonce", f"nonce rejected and the server slot did not move (before={before}, now={after}); "
+                                        f"not resending into the same slot: {str(e)[:300]}", e.status)
+        retried = True
         try:
             res = send()
-        except PoaHTTPError as e:
-            if not is_nonce_error(e):
-                raise
-            ok2, after = wait_for_slot((before + 1) if before is not None else None, sleep=sleep)
-            if not ok2 or after is None or before is None or after <= before:
-                raise PoaHTTPError("nonce", f"nonce rejected and the server slot did not move (before={before}, now={after}); "
-                                            f"not resending into the same slot: {str(e)[:300]}", e.status)
-            retried = True
-            try:
-                res = send()
-            except PoaHTTPError as e2:
-                if is_nonce_error(e2):
-                    raise PoaHTTPError("nonce", f"nonce rejected again after one refetch+retry; giving up: {str(e2)[:300]}", e2.status)
-                raise
-        info = adopt_next_nonce(res)
-        info.update(before=before, retried_after_nonce_error=retried)
-        if isinstance(res, dict):
-            res = dict(res)
-            res["_nonce"] = info
-        return res
+        except PoaHTTPError as e2:
+            if is_nonce_error(e2):
+                raise PoaHTTPError("nonce", f"nonce rejected again after one refetch+retry; giving up: {str(e2)[:300]}", e2.status)
+            raise
+    info = adopt_next_nonce(res)
+    info.update(before=before, retried_after_nonce_error=retried)
+    if isinstance(res, dict):
+        res = dict(res)
+        res["_nonce"] = info
+    return res
 
 
 # Busy-node receipts (G0 notice 2026-10-29-busy-node-receipts, release v0.60-acceptqueue-buildtx,
@@ -1520,12 +1919,12 @@ def submit_answer_safely(text: str, epoch) -> dict:
                      seed_at_send=cache.get("seed"))
     try:
         try:
-            res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1), "/api/hosted/answer"))
+            res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/answer", body={"answer": text}, timeout=60, retries=1), "/api/hosted/answer"), action="answer")
         except PoaHTTPError as e:
             if e.kind == "network" and mcp_fallback_enabled():
                 # MCP poa_answer goes through the node queue too (notice 2026-10-29-mcp-queue):
                 # a {job_id, poll_url} reply is accepted, so poll it, never resend.
-                res = hosted_write(busy_aware(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60), "mcp:poa_answer"))
+                res = hosted_write(busy_aware(lambda: mcp_call("poa_answer", {"answer": text}, timeout=60), "mcp:poa_answer"), action="answer")
             else:
                 raise
         txid = res.get("txid") or res.get("id") if isinstance(res, dict) else None
@@ -1592,7 +1991,7 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
     landed: True (assignments confirms) / None (sent or ambiguous, not yet confirmed) / False (rejected)."""
     sent = None
     try:
-        res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1), "/api/hosted/grade"))
+        res = hosted_write(busy_aware(lambda: api_call("POST", "/api/hosted/grade", body={"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60, retries=1), "/api/hosted/grade"), action="grade")
         sent = {"how": "response", "result": res}
     except PoaHTTPError as e:
         low = str(e).lower()
@@ -1616,7 +2015,7 @@ def submit_grade_safely(txid: str, score: int, reasoning: str) -> dict:
             sent = {"how": "duplicate"}
         elif e.kind == "network" and mcp_fallback_enabled():
             try:
-                sent = {"how": "mcp", "result": hosted_write(busy_aware(lambda: mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60), "mcp:poa_grade"))}
+                sent = {"how": "mcp", "result": hosted_write(busy_aware(lambda: mcp_call("poa_grade", {"assignment": txid, "score": score, "reasoning": reasoning}, timeout=60), "mcp:poa_grade"), action="grade")}
             except PoaHTTPError as e2:
                 if e2.kind == "queued":
                     # Accepted via the MCP queue; the assignments read-back decides, never a resend.
@@ -1672,10 +2071,10 @@ def safe_mine() -> dict:
             return {"ok": False, "kind": "already-mined-this-hour", "skipped": True,
                     "note": "mine already ran this clock hour on this machine; not calling /mine again"}
     try:
-        return hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1))
+        return hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1), action="mine")
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
-            r = hosted_write(lambda: mcp_call("poa_mine", {}, timeout=60))
+            r = hosted_write(lambda: mcp_call("poa_mine", {}, timeout=60), action="mine")
             r["_rest_error"] = str(e)[:200]
             return r
         raise
@@ -2073,6 +2472,27 @@ def cmd_takeover_check(args: argparse.Namespace) -> None:
     out["decision"] = decision
     out["reason"] = why
     print(json.dumps(out, indent=2))
+
+
+def cmd_lock(args: argparse.Namespace) -> None:
+    """`lock status|check|acquire|release` for the #138 single-writer lease. Exit 0 ok, 3 refused, 2 unreadable."""
+    node = (args.node or lease_node()).strip()
+    if args.action == "status":
+        res = lease_status(me=node)
+        code = 0 if res.get("decision") in ("write", "acquire-then-write") else (2 if res.get("state") == "unsynced" else 3)
+    elif args.action == "check":
+        res = lease_check(args.for_action, me=node)
+        code = 0 if res.get("decision") in ("write", "acquire-then-write") else (2 if res.get("state") == "unsynced" else 3)
+    elif args.action == "acquire":
+        res = lease_acquire(me=node, ttl=args.ttl or None, purpose=args.purpose, force=args.force, reason=args.reason)
+        code = 0 if res.get("ok") else (2 if res.get("state") == "unsynced" else 3)
+    else:
+        res = lease_release(me=node, force=args.force)
+        code = 0 if res.get("ok") else (2 if res.get("state") == "unsynced" else 3)
+    res["guard_enabled"] = single_writer_enabled()
+    print(json.dumps(res, indent=2))
+    if code:
+        sys.exit(code)
 
 
 def cmd_health(args: argparse.Namespace) -> None:
@@ -4018,7 +4438,7 @@ def load_authored_states(path: str) -> dict:
     return out
 
 
-def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "", authored: dict | None = None) -> dict:
+def close_check_fallback(reports: dict, settled_by_epoch: dict, me: str = "", authored: dict = None) -> dict:
     """Pure (SUGGESTIONS #131). Close check built only from keyless /api/close-report and /api/settled
     (used while /api/epochs is paused or times out). reports/settled_by_epoch: {epoch: body or None}.
     Fields those routes do not carry are listed in `unavailable`, never reported as zero."""
@@ -7477,6 +7897,62 @@ def cmd_seat_check(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
+def _lableak_dispatch(args: argparse.Namespace, act: str):
+    """One LabLeak CLI action; returns the JSON reply (main() prints it)."""
+    if act == "me":
+        res = lableak_call("GET", "/api/me", need_auth=True)
+    elif act == "communities":
+        res = lableak_call("GET", "/api/communities", need_auth=False)
+    elif act == "posts":
+        q = {"sort": args.sort}
+        if args.community.strip():
+            q["community"] = args.community.strip()
+        res = lableak_call("GET", "/api/posts", query=q, need_auth=False)
+    elif act == "post":
+        if not args.community.strip() or not args.title.strip() or not args.file.strip():
+            raise RuntimeError("lableak post requires --community <slug> --title <title> --file <path>")
+        body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
+        res = lableak_call(
+            "POST",
+            "/api/posts",
+            body={
+                "community": args.community.strip(),
+                "title": args.title.strip(),
+                "body": body_text,
+            },
+            need_auth=True,
+        )
+    elif act == "comment":
+        if not args.post_id.strip() or not args.file.strip():
+            raise RuntimeError("lableak comment requires --post-id <id> --file <path>")
+        body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
+        payload = {"body": body_text}
+        if args.parent_id.strip():
+            payload["parentId"] = int(args.parent_id.strip())
+        res = lableak_call(
+            "POST",
+            f"/api/posts/{args.post_id.strip()}/comments",
+            body=payload,
+            need_auth=True,
+        )
+    elif act == "vote":
+        if not args.target_id.strip():
+            raise RuntimeError("lableak vote requires --target-id <id> [--target-type post|comment] [--value 1|-1|0]")
+        res = lableak_call(
+            "POST",
+            "/api/vote",
+            body={
+                "targetType": args.target_type,
+                "targetId": int(args.target_id.strip()),
+                "value": int(args.value),
+            },
+            need_auth=True,
+        )
+    else:
+        raise RuntimeError(f"Unknown lableak action: {act}")
+    return res
+
+
 def main() -> None:
     for _stream in ("stdout", "stderr"):
         _s = getattr(sys, _stream, None)
@@ -7758,6 +8234,16 @@ def main() -> None:
     p_tk.add_argument("--hours", type=float, default=2.0, help="PC heartbeat silence threshold in hours (default 2)")
     p_tk.add_argument("--after-min", type=float, default=float(os.environ.get("POA_TAKEOVER_AFTER_MIN", "45")),
                       help="Take over when the epoch is older than this many minutes with no PC CLAIM/ANSWERED (default 45, or $POA_TAKEOVER_AFTER_MIN)")
+
+    p_lk = sub.add_parser("lock", help="Opt-in single-writer lease (SUGGESTIONS #138): one shared lease in the handoff repo (holder, expiry, fencing token) so two nodes on one key never write at the same moment. Enable the guard with POA_SINGLE_WRITER=1 and POA_NODE=<name>")
+    p_lk.add_argument("action", choices=["status", "check", "acquire", "release"],
+                      help="status/check: read-only; acquire: take, renew or take over a cleanly expired lease; release: give it up")
+    p_lk.add_argument("--node", default="", help="This node's name (default $POA_NODE)")
+    p_lk.add_argument("--for", dest="for_action", default="write", help="For check: the write you are about to do (answer, mine, grade, vote, post, send)")
+    p_lk.add_argument("--ttl", type=float, default=0, help="Lease seconds for acquire (default $POA_LEASE_TTL_S or 900)")
+    p_lk.add_argument("--purpose", default="manual", help="Short note stored in the lease")
+    p_lk.add_argument("--force", action="store_true", help="acquire: override a stale/ambiguous lease or re-adopt a lost local token; release: ignore queued jobs/token check")
+    p_lk.add_argument("--reason", default="", help="Required with acquire --force; stored in the lease")
 
     args = parser.parse_args()
     try:
@@ -8044,7 +8530,7 @@ def main() -> None:
                 "GET",
                 "/api/hosted/vote",
                 query={"ballot": args.ballot, "topic": args.topic, "choice": args.choice},
-            ))
+            ), action="vote")
             print(json.dumps(res, indent=2))
             print_notice(res)
         elif args.command == "network":
@@ -8090,58 +8576,21 @@ def main() -> None:
             print(json.dumps(res, indent=2))
         elif args.command == "lableak":
             act = args.action
-            if act == "me":
-                res = lableak_call("GET", "/api/me", need_auth=True)
-            elif act == "communities":
-                res = lableak_call("GET", "/api/communities", need_auth=False)
-            elif act == "posts":
-                q = {"sort": args.sort}
-                if args.community.strip():
-                    q["community"] = args.community.strip()
-                res = lableak_call("GET", "/api/posts", query=q, need_auth=False)
-            elif act == "post":
-                if not args.community.strip() or not args.title.strip() or not args.file.strip():
-                    raise RuntimeError("lableak post requires --community <slug> --title <title> --file <path>")
-                body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
-                res = lableak_call(
-                    "POST",
-                    "/api/posts",
-                    body={
-                        "community": args.community.strip(),
-                        "title": args.title.strip(),
-                        "body": body_text,
-                    },
-                    need_auth=True,
-                )
-            elif act == "comment":
-                if not args.post_id.strip() or not args.file.strip():
-                    raise RuntimeError("lableak comment requires --post-id <id> --file <path>")
-                body_text = pathlib.Path(args.file).read_text(encoding="utf-8").strip()
-                payload = {"body": body_text}
-                if args.parent_id.strip():
-                    payload["parentId"] = int(args.parent_id.strip())
-                res = lableak_call(
-                    "POST",
-                    f"/api/posts/{args.post_id.strip()}/comments",
-                    body=payload,
-                    need_auth=True,
-                )
-            elif act == "vote":
-                if not args.target_id.strip():
-                    raise RuntimeError("lableak vote requires --target-id <id> [--target-type post|comment] [--value 1|-1|0]")
-                res = lableak_call(
-                    "POST",
-                    "/api/vote",
-                    body={
-                        "targetType": args.target_type,
-                        "targetId": int(args.target_id.strip()),
-                        "value": int(args.value),
-                    },
-                    need_auth=True,
-                )
-            else:
-                raise RuntimeError(f"Unknown lableak action: {act}")
-            print(json.dumps(res, indent=2))
+            ll_lock = None
+            if act in ("post", "comment", "vote") and single_writer_enabled():
+                # #138: forum writes take the same local write.lock and shared lease as hosted writes.
+                ll_lock = _WriteLock().__enter__()
+                try:
+                    lease_guard("post")
+                except Exception:
+                    ll_lock.__exit__(None, None, None)
+                    raise
+            try:
+                lableak_res = _lableak_dispatch(args, act)
+            finally:
+                if ll_lock is not None:
+                    ll_lock.__exit__(None, None, None)
+            print(json.dumps(lableak_res, indent=2))
         elif args.command == "ledger":
             cmd_ledger(args)
         elif args.command == "health":
@@ -8153,6 +8602,8 @@ def main() -> None:
             cmd_reopen(args)
         elif args.command == "takeover-check":
             cmd_takeover_check(args)
+        elif args.command == "lock":
+            cmd_lock(args)
         elif args.command == "pulse":
             mine_res = None
             mine_err = None
