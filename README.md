@@ -105,6 +105,8 @@ python3 bin/poa.py backlog --mine --table   # keyless: OUR pending answers, quor
 python3 bin/poa.py close-health                 # keyless: was the newest epoch close healthy, thin or halted-like? (exit 3 if flagged)
 python3 bin/poa.py close-check                  # keyless: per close, was OUR answer graded, did it pass, were we paid? (exit 3 if not paid)
 python3 bin/poa.py close-check --via-settled  # keyless: same check from /api/close-report + /api/settled only (auto when /api/epochs is paused; payout not checked)
+# Close records: /api/epochs is an index (v1) since Nov 13, 2026; the kit fetches the newest bodies from /api/epochs/<n>
+# and checks each against the index sha256. POA_EPOCHS_LAST=N sets how many closes to fetch (default 6).
 python3 bin/poa.py close-check --via-settled --states --authored rows.json  # classify own rows: judged-pass, judged-fail, late-settled, sealed-not-settled, panel-0
 python3 bin/poa.py close-check --tri-cap        # keyless: pending grade-depth / tri-capped void (grades==quorum-1), own pending in the void
 python3 bin/poa.py close-presence               # keyless: close-report field-presence matrix + type-flip diff (occupancy null→int flips)

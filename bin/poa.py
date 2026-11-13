@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.14"
+KIT_VERSION = "1.9.15"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -264,6 +264,68 @@ def http_request(method: str, url: str, data: bytes = None, headers: dict = None
             return resp.read()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+
+# ---------------------------------------------------------------------------
+# /api/epochs index (server v0.110-edge-epochs-1130, Nov 13 2026): GET /api/epochs now returns a
+# small index {chain_id, v, closed_through, count, epochs:[{n, sha256, bytes, close_ts, key}]}
+# instead of the close records. Each close body is at GET /api/epochs/<n>, and its raw bytes hash
+# to the index sha256. read_epochs() hides the difference: it returns {"epochs": [close records]}
+# for either shape, fetching only the newest `last` bodies and checking each hash (fail closed).
+# ---------------------------------------------------------------------------
+EPOCHS_LAST_DEFAULT = 6
+
+
+def is_epochs_index(res) -> bool:
+    """True when res is the v1 /api/epochs index (entries carry n + sha256, no close body fields)."""
+    if not isinstance(res, dict) or not isinstance(res.get("epochs"), list):
+        return False
+    ents = [e for e in res["epochs"] if isinstance(e, dict)]
+    if not ents:
+        return "closed_through" in res
+    return all("n" in e and "sha256" in e and "basis" not in e and "rewards" not in e for e in ents)
+
+
+def _epochs_last_default() -> int:
+    try:
+        return max(1, int(os.environ.get("POA_EPOCHS_LAST", "") or EPOCHS_LAST_DEFAULT))
+    except ValueError:
+        return EPOCHS_LAST_DEFAULT
+
+
+def fetch_epoch_body(n: int, sha256_hex: str = None, timeout: float = 60, fetch=None) -> dict:
+    """Keyless GET /api/epochs/<n> (no redirects). Raises ValueError on a hash or epoch mismatch."""
+    fetch = fetch or (lambda url: http_request("GET", url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                                               timeout=timeout, follow_redirects=False))
+    raw = fetch(f"{BASE_URL}/api/epochs/{int(n)}")
+    if sha256_hex:
+        got = hashlib.sha256(raw).hexdigest()
+        if got != str(sha256_hex).lower():
+            raise ValueError(f"/api/epochs/{n}: sha256 {got[:12]} does not match index {str(sha256_hex)[:12]}")
+    body = json.loads(raw.decode("utf-8"))
+    if not isinstance(body, dict) or int(body.get("epoch", -1)) != int(n):
+        raise ValueError(f"/api/epochs/{n}: body is not the close record for epoch {n}")
+    return body
+
+
+def expand_epochs_index(res, last: int = None, fetch=None, timeout: float = 60):
+    """Index -> {"epochs": [verified close records, oldest first], "_index": {...}}. Legacy shapes pass through."""
+    if not is_epochs_index(res):
+        return res
+    last = last or _epochs_last_default()
+    ents = sorted((e for e in res["epochs"] if isinstance(e, dict)), key=lambda e: int(e["n"]))
+    pick = ents[-int(last):] if last > 0 else ents
+    bodies = [fetch_epoch_body(int(e["n"]), e.get("sha256"), timeout=timeout, fetch=fetch) for e in pick]
+    return {"epochs": bodies,
+            "_index": {"v": res.get("v"), "chain_id": res.get("chain_id"), "closed_through": res.get("closed_through"),
+                       "count": res.get("count", len(ents)), "fetched": [int(e["n"]) for e in pick], "sha256_verified": True}}
+
+
+def read_epochs(timeout: int = None, retries: int = None, last: int = None) -> dict:
+    """GET /api/epochs and return close records for either response shape (see expand_epochs_index)."""
+    res = api_call("GET", "/api/epochs", need_key=False, timeout=timeout, retries=retries)
+    return expand_epochs_index(res, last=last, timeout=max(60, int(timeout or 0)))
 
 
 def mcp_fallback_enabled() -> bool:
@@ -630,7 +692,8 @@ def edge_read_epochs_summary(address: str = None, timeout: int = 25) -> dict:
     if not addr:
         return {}
     try:
-        eps = api_call("GET", "/api/epochs", need_key=False, timeout=timeout, retries=1)
+        eps = read_epochs(timeout=timeout, retries=1, last=int(os.environ.get("POA_EPOCHS_LAST", "0") or 0) or 24)
+        _ix = eps.get("_index") if isinstance(eps, dict) else None
         if isinstance(eps, dict):
             eps = eps.get("epochs") or eps.get("items") or []
         if not isinstance(eps, list) or not eps:
@@ -664,6 +727,8 @@ def edge_read_epochs_summary(address: str = None, timeout: int = 25) -> dict:
         return {
             "address": addr,
             "epochs_settled_count": len(eps),
+            # index-era reads fetch only the newest closes, so the cumulative total covers just those
+            "history_partial": bool(_ix) and len(_ix.get("fetched") or []) < int(_ix.get("count") or 0),
             "latest_closed_epoch": latest.get("epoch"),
             "cumulative_settled_balance": f"{total_settled:.6f}",
             "rewards_by_epoch": rewards_by_epoch,
@@ -2176,7 +2241,7 @@ def epoch_window(now=None, epochs_res=None, fetch_epochs: bool = True, current_e
     step = float(epoch_seconds or EPOCH_SECONDS)
     if epochs_res is None and fetch_epochs:
         try:
-            epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=15, retries=1)
+            epochs_res = read_epochs(timeout=15, retries=1, last=3)
         except Exception:
             epochs_res = None
     eps = _epoch_list(epochs_res) if epochs_res is not None else []
@@ -3456,7 +3521,7 @@ def cmd_backlog(args: argparse.Namespace) -> None:
         params = {}
     quorum = int(params.get("grade_quorum", 4) or 4)
     ttl = int(params.get("pending_ttl_epochs", 16) or 16)
-    epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    epochs_res = read_epochs(timeout=args.timeout, retries=2)
     close_n, pending = _latest_pending_basis(epochs_res)
 
     rows = []
@@ -3700,7 +3765,7 @@ def cmd_disposal(args: argparse.Namespace) -> None:
     if args.mine or not txids:
         me = (args.address or local_address()).strip()
         txids += [t for t in own_answer_candidates(me, pathlib.Path(args.log).expanduser() if args.log else None) if t not in txids]
-    epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+    epochs_res = read_epochs(timeout=args.timeout, retries=2)
     res = disposal_report(epochs_res, txids, ttl=ttl, cap=cap)
     if args.json or not res.get("ok"):
         print(json.dumps(res, indent=2))
@@ -3884,7 +3949,7 @@ def cmd_close_health(args: argparse.Namespace) -> None:
         except Exception:
             k = 5
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+        epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception as ex:
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-health: could not read /api/epochs: {redact(str(ex))}")
         sys.exit(2)
@@ -4562,7 +4627,7 @@ def cmd_close_check(args: argparse.Namespace) -> None:
             sys.exit(3)
         return
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+        epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception as ex:
         # /api/epochs paused or unreachable: fall back to the keyless per-epoch routes (SUGGESTIONS #131)
         r = run_close_check_fallback(args, me0) if not getattr(args, "tri_cap", False) else {"ok": False}
@@ -4890,7 +4955,7 @@ def print_roster(r: dict) -> None:
 
 def cmd_standing(args: argparse.Namespace) -> None:
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+        epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception as ex:
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"standing: could not read /api/epochs: {redact(str(ex))}")
         sys.exit(2)
@@ -5965,7 +6030,7 @@ def cmd_close_presence(args: argparse.Namespace) -> None:
     last = max(1, int(getattr(args, "last", 8) or 8))
     closes = []
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=getattr(args, "timeout", 90), retries=2)
+        epochs_res = read_epochs(timeout=getattr(args, "timeout", 90), retries=2)
         closes = [int(e["epoch"]) for e in _epoch_list(epochs_res)]
     except Exception as ex:
         msg = redact(str(ex))
@@ -6465,7 +6530,7 @@ def cmd_jobs(args: argparse.Namespace) -> None:
 
 def cmd_intake(args: argparse.Namespace) -> None:
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+        epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception as ex:
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"intake: could not read /api/epochs: {redact(str(ex))}")
         sys.exit(2)
@@ -6641,7 +6706,7 @@ def cmd_epoch_time(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"epoch-time: could not read /api/params: {redact(str(ex))}")
         sys.exit(2)
     try:
-        epochs_res = api_call("GET", "/api/epochs", need_key=False, timeout=args.timeout, retries=2)
+        epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception:
         epochs_res = None  # still print the nominal table
     r = epoch_time_table(params, epochs_res, now=time.time(), window=args.window)
@@ -6760,7 +6825,7 @@ def close_pull(address: str, followups=(300,), wait: bool = True, max_wait: int 
     follow-up offset (seconds after the close record). Network calls are injectable for tests."""
     fetch_status = fetch_status or _epochs_closed
     fetch_assignments = fetch_assignments or (lambda: _keyless_assignments(address))
-    fetch_epochs = fetch_epochs or (lambda: api_call("GET", "/api/epochs", need_key=False, timeout=90, retries=2))
+    fetch_epochs = fetch_epochs or (lambda: read_epochs(timeout=90, retries=2))
     interval = max(CLOSE_PULL_MIN_INTERVAL_S, int(interval))
     followups = sorted({int(f) for f in (followups or []) if int(f) > 0})[:CLOSE_PULL_MAX_FOLLOWUPS]
     polls = 0
@@ -7634,7 +7699,7 @@ def refresh_overlap_cache(top: int = 10, closes: int = 5, per_account: int = 6, 
     Written to $POA_HOME/overlap-cache.json (never into a repo). Addresses are stored only as short labels."""
     path = path or OVERLAP_CACHE
     me = local_address() if address is None else address
-    fetch_epochs = fetch_epochs or (lambda: api_call("GET", "/api/epochs", need_key=False, timeout=120, retries=2))
+    fetch_epochs = fetch_epochs or (lambda: read_epochs(timeout=120, retries=2))
     fetch_answers = fetch_answers or (lambda a: recent_public_answers(a, per_account))
     eps = _epoch_list(fetch_epochs())
     accounts = top_accounts_from_epochs(eps, top=top, closes=closes, exclude=me)

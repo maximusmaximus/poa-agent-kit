@@ -86,8 +86,8 @@ class ExplorerUnknownTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_and_user_agent(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.14")
-        self.assertEqual(poa.USER_AGENT, "poa-agent-kit/1.9.14")
+        self.assertEqual(poa.KIT_VERSION, "1.9.15")
+        self.assertEqual(poa.USER_AGENT, "poa-agent-kit/1.9.15")
 
 
 if __name__ == "__main__":
