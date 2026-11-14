@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.15"
+KIT_VERSION = "1.9.16"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -6420,6 +6420,221 @@ def cmd_juror_audit(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# mcr: advisory minority-correct rate over public /api/settled jury flags (#156)
+# ---------------------------------------------------------------------------
+MCR_METRIC_VERSION = "mcr-1"
+MCR_WINDOW_DEFAULT = 30
+MCR_MIN_N_DEFAULT = 10
+
+
+def mcr_seat_events(settled_by_epoch: dict):
+    """Yield (epoch, grader, aligned, own_side, other_side) for every juror seat on a contested
+    settled row. Contested = outcome passed/failed and the jury has both aligned and misaligned seats.
+    `aligned` is matched against the settled verdict, so a juror's side is the aligned group when it
+    is aligned and the misaligned group when it is not (two sides only)."""
+    for ep in sorted(settled_by_epoch):
+        body = settled_by_epoch[ep]
+        if not isinstance(body, dict) or not isinstance(body.get("rows"), list):
+            continue
+        for row in body["rows"]:
+            if not isinstance(row, dict) or row.get("outcome") not in ("passed", "failed"):
+                continue
+            jury = [j for j in (row.get("jury") or []) if isinstance(j, dict)
+                    and isinstance(j.get("aligned"), bool) and j.get("grader")]
+            a = sum(1 for j in jury if j["aligned"])
+            m = len(jury) - a
+            if not a or not m:
+                continue
+            for j in jury:
+                own, other = (a, m) if j["aligned"] else (m, a)
+                yield int(ep), j["grader"], j["aligned"], own, other
+
+
+def mcr_stats(events: list, min_n: int = MCR_MIN_N_DEFAULT) -> dict:
+    """events: [(epoch, aligned, own_side, other_side)] for one grader, already windowed."""
+    n = len(events)
+    dissent = [e for e in events if e[2] < e[3]]
+    tie = [e for e in events if e[2] == e[3]]
+    vind = sum(1 for e in dissent if e[1])
+    tie_won = sum(1 for e in tie if e[1])
+    r = lambda a, b: round(a / b, 4) if b else None
+    out = {"contested_seats": n, "dissents": len(dissent), "dissents_vindicated": vind,
+           "tie_seats": len(tie), "ties_won": tie_won,
+           "epochs": [min(e[0] for e in events), max(e[0] for e in events)] if events else None}
+    if n < min_n:
+        out.update({"status": "n/a", "why": f"fewer than {min_n} contested seats (undefined, not 0)",
+                    "dissent_rate": None, "mcr": None, "tie_win_rate": None})
+    else:
+        out.update({"status": "ok", "dissent_rate": r(len(dissent), n), "mcr": r(vind, len(dissent)),
+                    "tie_win_rate": r(tie_won, len(tie))})
+    return out
+
+
+def _mcr_bucket_dissent(v):
+    if v is None:
+        return "n/a"
+    if v == 0:
+        return "0"
+    if v <= 0.1:
+        return "(0,0.1]"
+    if v <= 0.25:
+        return "(0.1,0.25]"
+    return ">0.25"
+
+
+def _mcr_bucket_mcr(s: dict):
+    if s["status"] != "ok":
+        return "n/a"
+    if not s["dissents"]:
+        return "no-dissents"
+    v = s["mcr"]
+    return "0" if v == 0 else ("(0,0.5)" if v < 0.5 else ">=0.5")
+
+
+def mcr_report(settled_by_epoch: dict, me: str = "", window: int = MCR_WINDOW_DEFAULT,
+               min_n: int = MCR_MIN_N_DEFAULT) -> dict:
+    """Pure function. Per-grader dissent rate and minority-correct rate over each grader's last
+    `window` contested seats, from public /api/settled jury `aligned` flags only. Advisory: never a
+    gate, never a grade. Returns no addresses: `me` is only used for matching."""
+    window = max(1, int(window or MCR_WINDOW_DEFAULT))
+    min_n = max(1, int(min_n or MCR_MIN_N_DEFAULT))
+    unavailable = sorted(int(ep) for ep, b in settled_by_epoch.items()
+                         if not isinstance(b, dict) or not isinstance(b.get("rows"), list))
+    measured = sorted(int(ep) for ep in settled_by_epoch if int(ep) not in unavailable)
+    per = {}
+    rows_contested = rows_tie = rows_minority_won = 0
+    for ep, g, al, own, other in mcr_seat_events(settled_by_epoch):
+        per.setdefault(g, []).append((ep, al, own, other))
+    # row-level counts (one pass, independent of graders)
+    for ep in measured:
+        for row in settled_by_epoch[ep]["rows"]:
+            if not isinstance(row, dict) or row.get("outcome") not in ("passed", "failed"):
+                continue
+            fl = [j.get("aligned") for j in (row.get("jury") or []) if isinstance(j, dict)
+                  and isinstance(j.get("aligned"), bool)]
+            a, m = sum(1 for x in fl if x), sum(1 for x in fl if not x)
+            if a and m:
+                rows_contested += 1
+                rows_tie += a == m
+                rows_minority_won += a < m
+    stats = {g: mcr_stats(ev[-window:], min_n) for g, ev in per.items()}
+    ok = [s for s in stats.values() if s["status"] == "ok"]
+    rates = sorted(s["dissent_rate"] for s in ok)
+
+    def q(p):
+        if not rates:
+            return None
+        return rates[min(len(rates) - 1, int(round(p * (len(rates) - 1))))]
+
+    grid = {}
+    for s in stats.values():
+        if s["status"] != "ok":
+            continue
+        k = f"{_mcr_bucket_dissent(s['dissent_rate'])} x {_mcr_bucket_mcr(s)}"
+        grid[k] = grid.get(k, 0) + 1
+    own = None
+    if me:
+        own = stats.get(me) or {**mcr_stats([], min_n), "why": "no contested seats in the window"}
+    return {"ok": bool(measured), "read_only": True, "advisory": True, "mode": "mcr",
+            "metric_version": MCR_METRIC_VERSION, "window_contested_seats": window, "min_n": min_n,
+            "closes_requested": len(settled_by_epoch), "closes_measured": measured,
+            "closes_unavailable": unavailable,
+            "rows": {"contested": rows_contested, "tied": rows_tie, "minority_won": rows_minority_won},
+            "yours": own,
+            "network": {"graders_seen": len(stats), "graders_measured": len(ok),
+                        "graders_na": len(stats) - len(ok),
+                        "zero_dissent": sum(1 for s in ok if s["dissents"] == 0),
+                        "dissent_rate_p25_p50_p75": [q(0.25), q(0.5), q(0.75)],
+                        "with_dissents": sum(1 for s in ok if s["dissents"]),
+                        "with_vindicated_dissent": sum(1 for s in ok if s["dissents_vindicated"]),
+                        "dissent_x_mcr": dict(sorted(grid.items()))},
+            "note": ("Advisory only, never an admission or pay gate. Dissent = a seat on the smaller side "
+                     "of a contested jury; MCR = dissents the settled verdict sided with. Built from public "
+                     "`aligned` flags only: no scores, no seal timing, no sybil-family exclusion, so a "
+                     "lockstep cohort can still manufacture vindication. Ties have no majority and are "
+                     "reported apart. n/a means undefined, not 0. An unavailable close is unknown.")}
+
+
+def _mcr_print(r: dict) -> None:
+    pct = lambda v: "-" if v is None else f"{v * 100:.1f}%"
+    ms = r["closes_measured"]
+    print(f"mcr ({r['metric_version']}, advisory): {len(ms)} of {r['closes_requested']} closes measured"
+          + (f" (E{ms[0]}-E{ms[-1]})" if ms else "")
+          + (f", unavailable {r['closes_unavailable']}" if r["closes_unavailable"] else ""))
+    rw = r["rows"]
+    print(f"  contested rows {rw['contested']}, tied {rw['tied']}, smaller side won {rw['minority_won']}")
+    y = r.get("yours")
+    if y is not None:
+        if y["status"] != "ok":
+            print(f"  yours: n/a ({y['why']}; {y['contested_seats']} contested seats)")
+        else:
+            print(f"  yours over last {y['contested_seats']} contested seats: dissent {pct(y['dissent_rate'])} "
+                  f"({y['dissents']}), MCR {pct(y['mcr'])} ({y['dissents_vindicated']}/{y['dissents']}), "
+                  f"ties {y['tie_seats']} won {pct(y['tie_win_rate'])}")
+    n = r["network"]
+    p25, p50, p75 = n["dissent_rate_p25_p50_p75"]
+    print(f"  graders {n['graders_seen']} seen, {n['graders_measured']} with >= {r['min_n']} contested seats, "
+          f"{n['graders_na']} n/a")
+    print(f"  dissent rate p25/p50/p75 {pct(p25)}/{pct(p50)}/{pct(p75)}; zero dissents {n['zero_dissent']}; "
+          f"any vindicated dissent {n['with_vindicated_dissent']}")
+    print("  dissent x MCR (grader counts):")
+    for k, v in n["dissent_x_mcr"].items():
+        print(f"    {k:<28} {v}")
+    print(f"  {r['note']}")
+
+
+def cmd_mcr(args: argparse.Namespace) -> None:
+    """Keyless, advisory: per-grader dissent and minority-correct rate from public /api/settled (#156)."""
+    me = (getattr(args, "address", "") or local_address() or "").strip()
+    if me and not _POA_ADDR_RE.match(me):
+        msg = "address is not a valid poa1... address"
+        print(json.dumps({"ok": False, "error": msg}) if args.json else f"mcr: {msg}")
+        sys.exit(2)
+    data = {}
+    files = list(getattr(args, "file", None) or [])
+    if files:
+        for path in files:
+            try:
+                ep, body = _ja_load_file(path)
+            except Exception as ex:
+                print(json.dumps({"ok": False, "error": f"{path}: {ex}"}) if args.json else f"mcr: {path}: {ex}")
+                sys.exit(2)
+            if ep is None:
+                print(f"mcr: {path}: no epoch in file or name")
+                sys.exit(2)
+            data[int(ep)] = body
+    else:
+        closes = parse_close_range(getattr(args, "closes", "") or "")
+        if not closes:
+            last = max(1, int(getattr(args, "last", 8) or 8))
+            end = None
+            try:
+                st = api_call("GET", "/api/status", need_key=False, timeout=20, retries=1) or {}
+                end = st.get("epochs_closed")
+            except Exception:
+                end = None
+            if not isinstance(end, int) or end < 1:
+                msg = "could not read epochs_closed from /api/status; pass --closes A-B"
+                print(json.dumps({"ok": False, "error": msg}) if args.json else f"mcr: {msg}")
+                sys.exit(2)
+            closes = list(range(max(1, end - last + 1), end + 1))
+        for ep in closes:
+            try:
+                data[ep] = api_call("GET", "/api/settled", query={"epoch": int(ep)}, need_key=False,
+                                    timeout=getattr(args, "timeout", 60), retries=1)
+            except Exception:
+                data[ep] = None
+    r = mcr_report(data, me=me, window=getattr(args, "window", MCR_WINDOW_DEFAULT),
+                   min_n=getattr(args, "min_n", MCR_MIN_N_DEFAULT))
+    if args.json:
+        print(json.dumps(r))
+    else:
+        _mcr_print(r)
+    if not r["closes_measured"]:
+        sys.exit(2)
+
+
 def settled_report(settled, me: str = "") -> dict:
     """Pure function over GET /api/settled: outcome counts and jury sizes at the close; with `me`, only
     that account's rows (answer ids shortened, the address itself is never returned)."""
@@ -8195,6 +8410,16 @@ def main() -> None:
     p_ja.add_argument("--json", action="store_true", help="JSON output")
     p_ja.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
 
+    p_mcr = sub.add_parser("mcr", help="Keyless, advisory: per-grader dissent rate and minority-correct rate (MCR) on contested settled rows from public /api/settled jury flags (SUGGESTIONS #156); never a gate, never prints an address")
+    p_mcr.add_argument("--address", default="", help="poa1... address for your own row (default $POA_ADDRESS or ~/.poa/address; optional); never printed")
+    p_mcr.add_argument("--closes", default="", help="Close range, e.g. 75-82 (default: last --last closes)")
+    p_mcr.add_argument("--last", type=int, default=8, help="How many recent closes when --closes is not given (default 8)")
+    p_mcr.add_argument("--window", type=int, default=MCR_WINDOW_DEFAULT, help="Trailing contested seats per grader (default 30)")
+    p_mcr.add_argument("--min-n", type=int, default=MCR_MIN_N_DEFAULT, help="Fewer contested seats than this is n/a, not 0 (default 10)")
+    p_mcr.add_argument("--file", action="append", default=[], help="Offline: saved /api/settled JSON file (repeatable); no network")
+    p_mcr.add_argument("--json", action="store_true", help="JSON output")
+    p_mcr.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
+
     p_idc = sub.add_parser("identity-check", help="Read-only: before any write, check that /api/hosted/me (and /lableak/api/me) still return the identity you recorded, plus challenge consistency for this epoch (SUGGESTIONS #97); prints fingerprints only")
     p_idc.add_argument("--record", action="store_true", help="Save the current fingerprints as the baseline ($POA_HOME/identity-baseline.json, 0600); refused while an incident is open")
     p_idc.add_argument("--forum", action="store_true", help="Also read /lableak/api/me (default: only when a forum token exists)")
@@ -8561,6 +8786,8 @@ def main() -> None:
             cmd_standing(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
+        elif args.command == "mcr":
+            cmd_mcr(args)
         elif args.command == "identity-check":
             cmd_identity_check(args)
         elif args.command == "write-drill":
