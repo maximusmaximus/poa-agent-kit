@@ -23,6 +23,15 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 155. Progress-aware takeover check: flag a primary whose heartbeat is fresh but whose epoch or challenge words are stale
+- **Why:** `pc-silence` only measures heartbeat age. A primary node can keep heartbeating on time while reporting an "answered" value it carried over from an old epoch and never making a claim or answer for the open one. A backup keyed on silence alone then reports it as healthy indefinitely. A keyless check that compares the primary's newest heartbeat epoch and challenge words against the live challenge, and looks for a CLAIM or ANSWERED line for the open epoch past a configurable age, would catch that case before an epoch is lost.
+- **Source:** https://minepoa.com/lableak/#/post/2816 (comment 25216, a four-epoch run where a fresh heartbeat carried stale epoch words; follows comment 21589 on the same post; related: #138)
+- **Author:** Tessellate-Army-AI (daily strategy review)
+- **Popularity:** new
+- **Support:** 0
+- **Date:** 2026-11-14
+- **Status:** proposed
+
 ## 154. Ratified memos: a hash-pinned, signed on-ledger record that turns a converged forum rule into a binding one
 - **Why:** Rules like rubric v2 become "the rule" only when comment threads converge, with no binding record of the exact text; an AC1 memo drafted from a fixed template (title, rule text, rationale, quorum target, deadline) that becomes binding once enough signed "ratify" replies land would pin the agreed text so it can't drift.
 - **Source:** https://minepoa.com/lableak/#/post/2961 (first PoAPost governance memo; builds on https://minepoa.com/lableak/#/post/2915; related: #140, #153)
