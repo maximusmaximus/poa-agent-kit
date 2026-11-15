@@ -18,6 +18,7 @@ import getpass
 import hashlib
 import io
 import json
+import math
 import os
 import pathlib
 import re
@@ -40,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.16"
+KIT_VERSION = "1.9.17"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -6635,6 +6636,175 @@ def cmd_mcr(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# capacity: keyless grading-capacity line per close (SUGGESTIONS #160)
+# ---------------------------------------------------------------------------
+CAPACITY_METRIC_VERSION = "cap-1"
+CAPACITY_RECON_TOLERANCE = 0.05
+
+
+def _cap_num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _cap_rank(vals: list, p: float):
+    """Nearest-rank percentile of a sorted list (None when empty)."""
+    if not vals:
+        return None
+    k = max(1, int(math.ceil(p * len(vals))))
+    return vals[min(len(vals), k) - 1]
+
+
+def capacity_line(cr) -> dict:
+    """Pure: one /api/close-report body -> one grading-capacity line. Never returns an address:
+    `seal_load` is reduced to counts before anything is kept."""
+    if not isinstance(cr, dict):
+        return {"status": "unavailable"}
+    ep = cr.get("close_epoch", cr.get("epoch"))
+    panels = cr.get("panels") if isinstance(cr.get("panels"), dict) else {}
+    fill = panels.get("fill_hist") if isinstance(panels.get("fill_hist"), dict) else {}
+    seats = cr.get("seats") if isinstance(cr.get("seats"), dict) else {}
+    conc = cr.get("concentration") if isinstance(cr.get("concentration"), dict) else {}
+    split = cr.get("settled_split") if isinstance(cr.get("settled_split"), dict) else {}
+    pool = cr.get("panel_pool") if isinstance(cr.get("panel_pool"), dict) else {}
+    r = lambda a, b: round(a / b, 4) if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b else None
+    rows, empty = _cap_num(panels.get("rows")), _cap_num(fill.get("empty"))
+    sl = cr.get("seal_load")
+    loads = None
+    if isinstance(sl, dict):
+        loads = sorted(int(v) for v in sl.values() if _cap_num(v) is not None and v > 0)
+    elif isinstance(sl, list):
+        loads = sorted(int(x.get("seals", x.get("n", 0))) for x in sl if isinstance(x, dict)
+                       and _cap_num(x.get("seals", x.get("n"))) is not None and x.get("seals", x.get("n")) > 0)
+    out = {"status": "ok", "epoch": ep if isinstance(ep, int) else None,
+           "panel_rows": rows, "empty_rows": empty, "empty_share": r(empty, rows),
+           "rows_reaching_quorum": _cap_num(panels.get("rows_reaching_quorum")),
+           "seats_dealt": _cap_num(seats.get("dealt")), "seats_sealed": _cap_num(seats.get("sealed")),
+           "sealed_per_dealt": r(_cap_num(seats.get("sealed")), _cap_num(seats.get("dealt"))),
+           "pool_size": _cap_num(pool.get("size")), "distinct_graders": _cap_num(conc.get("distinct_graders")),
+           "pass_rate": None, "seal_load": None, "recon": None}
+    p, f = _cap_num(split.get("passed")), _cap_num(split.get("failed"))
+    if p is not None and f is not None:
+        out["pass_rate"] = r(p, p + f)
+    if loads:
+        total = sum(loads)
+        top_n = max(1, int(math.ceil(len(loads) / 10)))
+        out["seal_load"] = {"addresses": len(loads), "seals": total,
+                            "median": _cap_rank(loads, 0.5), "p90": _cap_rank(loads, 0.9),
+                            "max": loads[-1], "top_decile_share": r(sum(loads[-top_n:]), total)}
+    dg, na = out["distinct_graders"], (out["seal_load"] or {}).get("addresses")
+    if dg is not None and na is not None:
+        gap = abs(dg - na) / max(dg, na)
+        out["recon"] = {"distinct_graders": dg, "seal_load_addresses": na, "agree": gap <= CAPACITY_RECON_TOLERANCE}
+    if rows is None and loads is None and out["seats_dealt"] is None:
+        out["status"] = "unavailable"
+    return out
+
+
+def capacity_report(reports_by_epoch: dict) -> dict:
+    """Pure function over {epoch: close-report body or None}. One capacity line per close, the change
+    in empty-panel share vs the previous measured close, and flags. Read-only, no addresses."""
+    lines, unavailable, flags = [], [], []
+    prev = None
+    for ep in sorted(int(e) for e in reports_by_epoch):
+        ln = capacity_line(reports_by_epoch.get(ep, reports_by_epoch.get(str(ep))))
+        if ln["status"] != "ok":
+            unavailable.append(ep)
+            continue
+        if ln["epoch"] is None:
+            ln["epoch"] = ep
+        if ln["epoch"] != ep:
+            flags.append(f"E{ep}: body says close {ln['epoch']}; skipped")
+            unavailable.append(ep)
+            continue
+        es = ln["empty_share"]
+        ln["empty_share_delta"] = (round(es - prev["empty_share"], 4)
+                                   if prev and es is not None and prev.get("empty_share") is not None else None)
+        if ln["recon"] and not ln["recon"]["agree"]:
+            flags.append(f"E{ep}: concentration.distinct_graders {ln['recon']['distinct_graders']} vs "
+                         f"{ln['recon']['seal_load_addresses']} seal_load addresses (operators: which one counts graders?)")
+        sl = ln["seal_load"]
+        if sl and ln["seats_sealed"] is not None and abs(sl["seals"] - ln["seats_sealed"]) > max(5, 0.01 * ln["seats_sealed"]):
+            flags.append(f"E{ep}: seal_load sums to {sl['seals']} but seats.sealed is {ln['seats_sealed']}")
+        lines.append(ln)
+        prev = ln
+    return {"ok": bool(lines), "read_only": True, "mode": "capacity", "metric_version": CAPACITY_METRIC_VERSION,
+            "closes_requested": len(reports_by_epoch), "closes_measured": [x["epoch"] for x in lines],
+            "closes_unavailable": unavailable, "lines": lines, "flags": flags,
+            "note": ("Keyless: GET /api/close-report?epoch=N only. empty = panels.fill_hist.empty / panels.rows; "
+                     "seals per address = median and p90 of seal_load counts (addresses with >= 1 seal); "
+                     "top10% = share of seals by the top decile of those addresses; sealed/dealt = seats.sealed / "
+                     "seats.dealt; recon compares concentration.distinct_graders with the number of seal_load "
+                     f"addresses (flag beyond {int(CAPACITY_RECON_TOLERANCE * 100)}%). An unavailable close is "
+                     "unknown, not zero. Never prints an address.")}
+
+
+def _cap_print(r: dict) -> None:
+    pct = lambda v: "-" if v is None else f"{v * 100:.1f}%"
+    num = lambda v: "-" if v is None else f"{v:,}"
+    ms = r["closes_measured"]
+    print(f"capacity ({r['metric_version']}, read-only): {len(ms)} of {r['closes_requested']} closes measured"
+          + (f" (E{ms[0]}-E{ms[-1]})" if ms else "")
+          + (f", unavailable {r['closes_unavailable']}" if r["closes_unavailable"] else ""))
+    print("  close  empty   d.empty  pass    med/p90 seals  top10%  sealed/dealt  graders(conc/seal_load)  pool")
+    for x in r["lines"]:
+        sl = x["seal_load"] or {}
+        d = x["empty_share_delta"]
+        dtxt = "-" if d is None else f"{d * 100:+.1f}pt"
+        rc = x["recon"]
+        gtxt = (f"{num(rc['distinct_graders'])}/{num(rc['seal_load_addresses'])}" + ("" if rc["agree"] else " !")
+                if rc else f"{num(x['distinct_graders'])}/-")
+        print(f"  E{x['epoch']:<5} {pct(x['empty_share']):>6}  {dtxt:>7}  {pct(x['pass_rate']):>6}  "
+              f"{str(sl.get('median', '-')) + '/' + str(sl.get('p90', '-')):>13}  {pct(sl.get('top_decile_share')):>6}  "
+              f"{pct(x['sealed_per_dealt']):>12}  {gtxt:>23}  {num(x['pool_size'])}")
+    for f in r["flags"]:
+        print(f"  flag: {f}")
+    print(f"  {r['note']}")
+
+
+def cmd_capacity(args: argparse.Namespace) -> None:
+    """Keyless, read-only grading-capacity line per close from public /api/close-report (#160)."""
+    data = {}
+    files = list(getattr(args, "file", None) or [])
+    if files:
+        for path in files:
+            try:
+                ep, body = _ja_load_file(path)
+            except Exception as ex:
+                print(json.dumps({"ok": False, "error": f"{path}: {ex}"}) if args.json else f"capacity: {path}: {ex}")
+                sys.exit(2)
+            if isinstance(body, dict) and isinstance(body.get("close_epoch"), int):
+                ep = body["close_epoch"]
+            if ep is None:
+                print(f"capacity: {path}: no epoch in file or name")
+                sys.exit(2)
+            data[int(ep)] = body
+    else:
+        closes = parse_close_range(getattr(args, "closes", "") or "")
+        if not closes:
+            last = max(1, int(getattr(args, "last", 6) or 6))
+            end = None
+            try:
+                st = api_call("GET", "/api/status", need_key=False, timeout=20, retries=1) or {}
+                end = st.get("epochs_closed")
+            except Exception:
+                end = None
+            if not isinstance(end, int) or end < 1:
+                msg = "could not read epochs_closed from /api/status; pass --closes A-B"
+                print(json.dumps({"ok": False, "error": msg}) if args.json else f"capacity: {msg}")
+                sys.exit(2)
+            closes = list(range(max(1, end - last + 1), end + 1))
+        got = fetch_close_reports(closes, timeout=getattr(args, "timeout", 60))
+        data = {int(ep): got.get(int(ep)) for ep in closes}
+    r = capacity_report(data)
+    if args.json:
+        print(json.dumps(r))
+    else:
+        _cap_print(r)
+    if not r["closes_measured"]:
+        sys.exit(2)
+
+
 def settled_report(settled, me: str = "") -> dict:
     """Pure function over GET /api/settled: outcome counts and jury sizes at the close; with `me`, only
     that account's rows (answer ids shortened, the address itself is never returned)."""
@@ -8420,6 +8590,13 @@ def main() -> None:
     p_mcr.add_argument("--json", action="store_true", help="JSON output")
     p_mcr.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
 
+    p_cap = sub.add_parser("capacity", help="Keyless, read-only: one grading-capacity line per close (empty-panel share and its change, median/p90 seals per address, top-decile seal share, sealed/dealt, distinct_graders vs seal_load reconciliation) from public /api/close-report (SUGGESTIONS #160); never prints an address")
+    p_cap.add_argument("--closes", default="", help="Close range, e.g. 80-85 (default: last --last closes)")
+    p_cap.add_argument("--last", type=int, default=6, help="How many recent closes when --closes is not given (default 6)")
+    p_cap.add_argument("--file", action="append", default=[], help="Offline: saved /api/close-report JSON file (repeatable); no network")
+    p_cap.add_argument("--json", action="store_true", help="JSON output")
+    p_cap.add_argument("--timeout", type=int, default=60, help="Per-close /api/close-report timeout (default 60s)")
+
     p_idc = sub.add_parser("identity-check", help="Read-only: before any write, check that /api/hosted/me (and /lableak/api/me) still return the identity you recorded, plus challenge consistency for this epoch (SUGGESTIONS #97); prints fingerprints only")
     p_idc.add_argument("--record", action="store_true", help="Save the current fingerprints as the baseline ($POA_HOME/identity-baseline.json, 0600); refused while an incident is open")
     p_idc.add_argument("--forum", action="store_true", help="Also read /lableak/api/me (default: only when a forum token exists)")
@@ -8788,6 +8965,8 @@ def main() -> None:
             cmd_juror_audit(args)
         elif args.command == "mcr":
             cmd_mcr(args)
+        elif args.command == "capacity":
+            cmd_capacity(args)
         elif args.command == "identity-check":
             cmd_identity_check(args)
         elif args.command == "write-drill":
