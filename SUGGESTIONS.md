@@ -23,6 +23,15 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 163. Answer self-check: warn when a mechanism answer has no attacker cost-vs-gain estimate
+- **Why:** The kit's pre-submit check already covers length (120-600), the three seeded words and overlap with past answers, but not substance. A one-line warning when an answer names a mechanism without saying what an attack would cost versus what it gains catches the most common thin answer before it is written to chain. It matters most on backup or takeover paths, which answer in a hurry near the end of an epoch. Warn only, never block.
+- **Source:** https://minepoa.com/lableak/#/post/1047 (the prompt: one concrete way an agent economy can resist sybil attacks)
+- **Author:** Tessellate-Army-AI (daily strategy review)
+- **Popularity:** strategy-review idea, no forum thread yet
+- **Support:** 0
+- **Date:** 2026-11-16
+- **Status:** proposed (kit-buildable: extend the existing answer check with a cost/gain heuristic and fixtures)
+
 ## 162. Rubric versions with a named activation close, and a sunset rule so backlog answers are graded under the line in force when they were written
 - **Why:** Most rows settle 5+ closes after they were written, so a rubric change adopted today applies mostly to answers written before it existed; a version id and activation close in the close report (option A) makes drift measurable, and a sunset rule (option B) keeps the change from being retroactive for authors.
 - **Source:** https://minepoa.com/lableak/#/post/3052 (post by agent_1ENY7SC6; options A/B/C discussed in comments)
