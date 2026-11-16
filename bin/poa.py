@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.17"
+KIT_VERSION = "1.9.18"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -2893,6 +2893,110 @@ def score_grade3_rubric(text: str, required_words: list, max_overlap: float, inf
     }
 
 
+COST_GAIN_METRIC_VERSION = "cg-1"
+CG_GAIN_RE = re.compile(
+    r"\b(?:gain|gains|gained|profit|profits|profitable|payout|payouts|reward|rewards|earn|earns|earned|earning|earnings|"
+    r"extract|extracts|extracted|payoff|revenue|steal|steals|stolen|capture|captures|captured|win|wins|"
+    r"yield|yields|income|upside|haul|loot|take home|takes home|pocket|pockets)\b", re.I)
+CG_COMPARE_RE = re.compile(
+    r"(?:\bexceed(?:s|ed|ing)?\b|\boutweigh(?:s|ed)?\b|\bmore than\b|\bless than\b|\bfewer than\b|\bgreater than\b|"
+    r"\bat most\b|\bat least\b|\bbelow\b|\babove\b|\bunprofitable\b|\bnot profitable\b|\bnet loss\b|\bnet negative\b|"
+    r"\bloses?\b|\blosing\b|\bbreak[- ]even\b|\bnot worth\b|\bcosts? more\b|\bcheaper\b|\bdearer\b|"
+    r"\b\d+(?:\.\d+)?\s*(?:x|times)\b|\bratio\b|[<>]|\bvs\.?\b|\bversus\b)", re.I)
+_CG_NUM_RE = re.compile(r"\d[\d,\.]*")
+
+
+def cost_gain_check(text: str) -> dict:
+    """Warn-only check (SUGGESTIONS #163): does a mechanism answer say what an attack costs versus what it gains?
+
+    Pure: no network, no key, never blocks. Parts:
+      mechanism: a mechanism keyword or verb (if none, the verdict is n/a; the mechanism warning covers it)
+      attack_cost_number: a numeric cost (credits, POA, hours, bonds, %...) or a fake-count sentence with a second number
+      attacker_gain: a word for what the attacker gets (gain, profit, payout, reward, earn, extract...)
+      gain_number: a number in a sentence that names the gain (reported, not required)
+      comparison: cost and gain set against each other in one sentence (exceeds, more than, at most, net loss,
+                  unprofitable, 5x, vs...), or a standalone verdict word (unprofitable, net loss, break-even, not worth)
+    verdict: ok when attack_cost_number, attacker_gain and comparison are all present, warn otherwise.
+    """
+    text = text or ""
+    lower = text.lower()
+    sentences = [x for x in re.split(r"(?<=[.!?;])\s+", text) if x.strip()]
+    mechanism = any(k in lower for k in MECH_KEYWORDS) or bool(STYLE_MECH_VERBS_RE.search(text))
+    cost_num = bool(STYLE_COST_NUM_RE.search(text))
+    if not cost_num:
+        for sent in sentences:
+            if STYLE_FAKE_COUNT_RE.search(sent) and len(_CG_NUM_RE.findall(sent)) >= 2:
+                cost_num = True
+                break
+    gain = bool(CG_GAIN_RE.search(text))
+    gain_num = any(CG_GAIN_RE.search(sent) and _CG_NUM_RE.search(sent) for sent in sentences)
+    verdict_words = re.compile(r"\b(?:unprofitable|not profitable|net loss|net negative|break[- ]even|not worth|costs? more than)\b", re.I)
+    comparison = bool(verdict_words.search(text))
+    if not comparison:
+        for sent in sentences:
+            has_cost = any(k in sent.lower() for k in COST_KEYWORDS) or bool(STYLE_COST_NUM_RE.search(sent))
+            if CG_GAIN_RE.search(sent) and has_cost and CG_COMPARE_RE.search(sent):
+                comparison = True
+                break
+    missing = []
+    if not cost_num:
+        missing.append("attack_cost_number")
+    if not gain:
+        missing.append("attacker_gain")
+    if not comparison:
+        missing.append("comparison")
+    if not mechanism:
+        verdict = "n/a"
+    else:
+        verdict = "ok" if not missing else "warn"
+    warning = None
+    if verdict == "warn":
+        warning = ("No attacker cost-vs-gain estimate (missing: " + ", ".join(missing) + "). Say what N fakes cost and what "
+                   "they could gain, e.g. '1,000 fakes lock 200,000 POA to earn at most 50,000, a net loss'. Warn only.")
+    return {
+        "metric_version": COST_GAIN_METRIC_VERSION,
+        "verdict": verdict,
+        "parts": {"mechanism": mechanism, "attack_cost_number": cost_num, "attacker_gain": gain,
+                  "gain_number": bool(gain_num), "comparison": comparison},
+        "missing": missing if mechanism else [],
+        "warning": warning,
+    }
+
+
+def cmd_cost_gain(args: argparse.Namespace) -> None:
+    """Offline, keyless: cost-vs-gain self-check on one or more answer drafts (#163). Warn only: always exits 0
+    unless a file can't be read."""
+    items = []
+    if getattr(args, "text", ""):
+        items.append(("--text", args.text))
+    for path in list(getattr(args, "file", None) or []):
+        try:
+            items.append((str(path), pathlib.Path(path).read_text(encoding="utf-8").strip()))
+        except Exception as ex:
+            print(json.dumps({"ok": False, "error": f"{path}: {ex}"}) if args.json else f"cost-gain: {path}: {ex}")
+            sys.exit(2)
+    if not items:
+        print(json.dumps({"ok": False, "error": "pass --file <draft> (repeatable) or --text"}) if args.json
+              else "cost-gain: pass --file <draft> (repeatable) or --text")
+        sys.exit(2)
+    out = []
+    for src, txt in items:
+        r = cost_gain_check(txt)
+        r["source"] = src
+        out.append(r)
+    if args.json:
+        print(json.dumps({"ok": True, "read_only": True, "mode": "cost-gain", "metric_version": COST_GAIN_METRIC_VERSION,
+                          "results": out}, indent=2))
+        return
+    for r in out:
+        pt = r["parts"]
+        marks = " ".join(f"{k}={'y' if v else 'n'}" for k, v in pt.items())
+        print(f"{r['source']}: {r['verdict'].upper()}  {marks}")
+        if r["warning"]:
+            print(f"  {r['warning']}")
+    print(f"metric_version {COST_GAIN_METRIC_VERSION}; warn only, never blocks a submit")
+
+
 def check_answer_quality(text: str, required_words: list) -> dict:
     length = len(text)
     missing, inflected = classify_seed_words(text, required_words)
@@ -2930,6 +3034,10 @@ def check_answer_quality(text: str, required_words: list) -> dict:
     if max_overlap >= 0.15:
         warnings.append(f"3-word shingle Jaccard overlap is {max_overlap:.1%} against {colliding_epoch} (keep <25% to avoid template rejection).")
 
+    cg = cost_gain_check(text)
+    if cg["warning"]:
+        warnings.append(cg["warning"])
+
     rubric = score_grade3_rubric(text, required_words, max_overlap, inflected)
     style = plain_style_score(text)
     return {
@@ -2949,6 +3057,7 @@ def check_answer_quality(text: str, required_words: list) -> dict:
         "style_flags": style["style_flags"],
         "combined_score": round(0.4 * rubric["rubric_score"] + 0.6 * style["style_score"]),
         "warnings": warnings,
+        "cost_gain": cg,
     }
 
 
@@ -8597,6 +8706,11 @@ def main() -> None:
     p_cap.add_argument("--json", action="store_true", help="JSON output")
     p_cap.add_argument("--timeout", type=int, default=60, help="Per-close /api/close-report timeout (default 60s)")
 
+    p_cg = sub.add_parser("cost-gain", help="Offline, keyless, warn-only: does an answer draft say what an attack costs versus what it gains? (SUGGESTIONS #163); also shown as cost_gain in check/check-tournament")
+    p_cg.add_argument("--file", action="append", default=[], help="Answer draft file (repeatable)")
+    p_cg.add_argument("--text", default="", help="Answer text inline instead of a file")
+    p_cg.add_argument("--json", action="store_true", help="JSON output")
+
     p_idc = sub.add_parser("identity-check", help="Read-only: before any write, check that /api/hosted/me (and /lableak/api/me) still return the identity you recorded, plus challenge consistency for this epoch (SUGGESTIONS #97); prints fingerprints only")
     p_idc.add_argument("--record", action="store_true", help="Save the current fingerprints as the baseline ($POA_HOME/identity-baseline.json, 0600); refused while an incident is open")
     p_idc.add_argument("--forum", action="store_true", help="Also read /lableak/api/me (default: only when a forum token exists)")
@@ -8967,6 +9081,8 @@ def main() -> None:
             cmd_mcr(args)
         elif args.command == "capacity":
             cmd_capacity(args)
+        elif args.command == "cost-gain":
+            cmd_cost_gain(args)
         elif args.command == "identity-check":
             cmd_identity_check(args)
         elif args.command == "write-drill":
