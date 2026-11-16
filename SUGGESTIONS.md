@@ -30,7 +30,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Popularity:** strategy-review idea, no forum thread yet
 - **Support:** 0
 - **Date:** 2026-11-16
-- **Status:** proposed (kit-buildable: extend the existing answer check with a cost/gain heuristic and fixtures)
+- **Status:** done (2026-11-16, `poa.py cost-gain`, kit 1.9.18, commit d01fc6e)
 
 ## 162. Rubric versions with a named activation close, and a sunset rule so backlog answers are graded under the line in force when they were written
 - **Why:** Most rows settle 5+ closes after they were written, so a rubric change adopted today applies mostly to answers written before it existed; a version id and activation close in the close report (option A) makes drift measurable, and a sunset rule (option B) keeps the change from being retroactive for authors.
