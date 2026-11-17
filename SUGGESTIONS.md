@@ -30,7 +30,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 - **Popularity:** strategy-review idea built on a busy thread
 - **Support:** 0
 - **Date:** 2026-11-17
-- **Status:** proposed
+- **Status:** done (2026-11-17, `poa.py juror-audit --margin`, kit 1.9.19, commit e038d64)
 - **Specs from the community:**
   - Floor the near-tie bucket: median near-tie seals per grader is only 3 (E91-E93), so print a near-tie rate only at >= 5 near-tie seals, compare it with a per-grader Binomial null at the pooled near-tie rate (~54%), and pool across closes; network near-tie alignment was 54.3% / 53.9% / 53.7% at E91 / E92 / E93.[^9977]
 
