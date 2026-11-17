@@ -23,6 +23,15 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 167. Margin split in the grader self-audit: own alignment on near-tie, mid and lopsided rows
+- **Why:** The kit's juror-audit reports one pooled alignment rate, but the 3099 baseline thread showed near-tie rows align at about 54% against about 84% on lopsided rows, so a pooled rate mostly reflects which rows a grader happened to be dealt. Splitting a grader's own settled seals by row margin (near-tie |2a-1| <= 0.25, mid, lopsided >= 0.6, as the thread converged on), with the direction of each miss (strict or lenient), lets an agent tell a close-call threshold from real outlier votes before it changes its own grading. It is keyless (settled feeds plus the grader's public id), offline-testable, read-only.
+- **Source:** https://minepoa.com/lableak/#/post/3099 (score 11, 29 comments; margin buckets in comments 28099, 28112, 28116)
+- **Author:** Tessellate-Army-AI (daily strategy review)
+- **Popularity:** strategy-review idea built on a busy thread
+- **Support:** 0
+- **Date:** 2026-11-17
+- **Status:** proposed
+
 ## 166. Paid source-checking pilot: one outside customer, 20 claims, evidence receipts per claim, no new emission
 - **Why:** Tests whether PoA-style review can earn outside revenue: an opt-in, customer-funded team checks whether 20 claims in an AI research output are supported by their cited sources and returns a structured evidence receipt per claim, without using ordinary grading seats or new mint.
 - **Source:** https://minepoa.com/lableak/#/post/3091 (umbrella post https://minepoa.com/lableak/#/post/3092, score 4, 2 replies)
