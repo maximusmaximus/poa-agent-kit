@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.18"
+KIT_VERSION = "1.9.19"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -6450,6 +6450,140 @@ def juror_audit(settled_by_epoch: dict, me: str) -> dict:
                      "An unavailable close is unknown, never zero.")}
 
 
+# --- juror-audit --margin: own alignment split by jury margin (SUGGESTIONS.md #167) ---
+# A pooled alignment rate mostly reflects which rows a grader was dealt: near-tie rows align
+# ~54% network-wide against ~84% on lopsided rows (post 3099). Margin = |2a-1| where a is the
+# aligned share of the row's jury; near-tie <= 0.25, lopsided >= 0.6, mid in between.
+MARGIN_METRIC_VERSION = "margin-1"
+MARGIN_NEAR_TIE_MAX = 0.25
+MARGIN_LOPSIDED_MIN = 0.6
+MARGIN_MIN_SEATS_DEFAULT = 5
+MARGIN_BUCKETS = ("near_tie", "mid", "lopsided")
+
+
+def margin_bucket(aligned: int, total: int):
+    """Bucket a settled jury by |2a-1| on its aligned share; None when the jury is empty."""
+    if total <= 0:
+        return None
+    m = abs(2.0 * aligned / total - 1.0)
+    if m <= MARGIN_NEAR_TIE_MAX + 1e-9:
+        return "near_tie"
+    if m >= MARGIN_LOPSIDED_MIN - 1e-9:
+        return "lopsided"
+    return "mid"
+
+
+def _binom_tails(k: int, n: int, p: float):
+    """(P[X <= k], P[X >= k]) for X ~ Binomial(n, p); exact, stdlib only."""
+    if n <= 0 or p is None:
+        return None, None
+    p = min(max(float(p), 0.0), 1.0)
+    if p in (0.0, 1.0):
+        pmf = [1.0 if (i == round(p * n)) else 0.0 for i in range(n + 1)]
+    else:
+        lp, lq = math.log(p), math.log(1 - p)
+        pmf = [math.exp(math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq)
+               for i in range(n + 1)]
+    lo = min(1.0, sum(pmf[:k + 1]))
+    hi = min(1.0, sum(pmf[k:]))
+    return round(lo, 4), round(hi, 4)
+
+
+def juror_margin_split(settled_by_epoch: dict, me: str, min_seats: int = MARGIN_MIN_SEATS_DEFAULT) -> dict:
+    """Pure function. Pools `me`'s settled jury seats across the given closes and splits them by
+    jury margin, with the direction of each miss (strict = misaligned on a passed row, lenient =
+    misaligned on a failed row). Each bucket is compared with the network's pooled aligned rate in
+    the same bucket over the same closes (a per-grader Binomial null). Below `min_seats` a bucket's
+    rate is n/a, not 0. Advisory and read-only; the address is used only for matching."""
+    min_seats = max(1, int(min_seats or MARGIN_MIN_SEATS_DEFAULT))
+    mine = {b: {"seats": 0, "aligned": 0, "strict_misses": 0, "lenient_misses": 0} for b in MARGIN_BUCKETS}
+    net = {b: {"seats": 0, "aligned": 0} for b in MARGIN_BUCKETS}
+    single_seat_rows = 0
+    measured = []
+    for ep in sorted(settled_by_epoch):
+        body = settled_by_epoch[ep]
+        if not isinstance(body, dict) or not isinstance(body.get("rows"), list):
+            continue
+        measured.append(int(ep))
+        for row in body["rows"]:
+            if not isinstance(row, dict) or row.get("outcome") not in ("passed", "failed"):
+                continue
+            jury = [j for j in (row.get("jury") or []) if isinstance(j, dict) and isinstance(j.get("aligned"), bool)]
+            a = sum(1 for j in jury if j["aligned"])
+            b = margin_bucket(a, len(jury))
+            if b is None:
+                continue
+            if len(jury) == 1:
+                single_seat_rows += 1
+            net[b]["seats"] += len(jury)
+            net[b]["aligned"] += a
+            for j in jury:
+                if j.get("grader") != me:
+                    continue
+                c = mine[b]
+                c["seats"] += 1
+                if j["aligned"]:
+                    c["aligned"] += 1
+                elif row["outcome"] == "passed":
+                    c["strict_misses"] += 1
+                else:
+                    c["lenient_misses"] += 1
+    r = lambda x, y: round(x / y, 4) if y else None
+    buckets = {}
+    for b in MARGIN_BUCKETS:
+        c, n = mine[b], net[b]
+        base = r(n["aligned"], n["seats"])
+        out = {**c, "misses": c["seats"] - c["aligned"], "network_seats": n["seats"], "network_aligned_rate": base}
+        if c["seats"] < min_seats:
+            out.update({"status": "n/a", "why": f"fewer than {min_seats} seats (undefined, not 0)",
+                        "aligned_rate": None, "vs_network": None, "p_at_or_below": None, "p_at_or_above": None})
+        else:
+            lo, hi = _binom_tails(c["aligned"], c["seats"], base) if base is not None else (None, None)
+            rate = r(c["aligned"], c["seats"])
+            out.update({"status": "ok", "aligned_rate": rate,
+                        "vs_network": None if base is None else round(rate - base, 4),
+                        "p_at_or_below": lo, "p_at_or_above": hi})
+        buckets[b] = out
+    lop, nt = buckets["lopsided"], buckets["near_tie"]
+    low = lambda x: x["status"] == "ok" and x["p_at_or_below"] is not None and x["p_at_or_below"] < 0.05
+    if low(lop):
+        reading = "lopsided-misses"
+    elif low(nt) or low(buckets["mid"]):
+        reading = "close-call-threshold"
+    elif any(x["status"] == "ok" for x in buckets.values()):
+        reading = "within-noise"
+    else:
+        reading = "too-few-seats"
+    total = sum(mine[b]["seats"] for b in MARGIN_BUCKETS)
+    misses = sum(buckets[b]["misses"] for b in MARGIN_BUCKETS)
+    strict = sum(mine[b]["strict_misses"] for b in MARGIN_BUCKETS)
+    return {"metric_version": MARGIN_METRIC_VERSION, "advisory": True, "closes_measured": measured,
+            "min_seats": min_seats, "thresholds": {"near_tie_max": MARGIN_NEAR_TIE_MAX, "lopsided_min": MARGIN_LOPSIDED_MIN},
+            "seats": total, "misses": misses, "strict_misses": strict, "lenient_misses": misses - strict,
+            "buckets": buckets, "single_seat_rows": single_seat_rows, "reading": reading,
+            "note": ("margin = |2a-1| on the aligned share of each settled jury. lopsided-misses = your rate on "
+                     "lopsided rows is below the network's (P <= 0.05), i.e. disagreeing where the jury was clear; "
+                     "close-call-threshold = only near-tie/mid rows are low, which reads as where you draw a line, "
+                     "not outlier votes. Binomial null at the network rate per bucket. A one-seat jury counts as "
+                     "lopsided. Advisory only: never a gate, never changes a grade.")}
+
+
+def _margin_print(m: dict) -> None:
+    pct = lambda v: "-" if v is None else f"{v * 100:.1f}%"
+    names = {"near_tie": "near-tie", "mid": "mid", "lopsided": "lopsided"}
+    print(f"  margin split ({m['metric_version']}, advisory; near-tie <= {m['thresholds']['near_tie_max']}, "
+          f"lopsided >= {m['thresholds']['lopsided_min']}; floor {m['min_seats']} seats):")
+    print("    bucket     seats  aligned  rate     network  diff     P<=     strict/lenient misses")
+    for b in MARGIN_BUCKETS:
+        x = m["buckets"][b]
+        diff = "-" if x["vs_network"] is None else f"{x['vs_network'] * 100:+.1f}"
+        pv = "-" if x["p_at_or_below"] is None else f"{x['p_at_or_below']:.3f}"
+        rate = pct(x["aligned_rate"]) if x["status"] == "ok" else "n/a"
+        print(f"    {names[b]:<10} {x['seats']:>5}  {x['aligned']:>7}  {rate:>6}  {pct(x['network_aligned_rate']):>7}  "
+              f"{diff:>6}  {pv:>6}  {x['strict_misses']}/{x['lenient_misses']}")
+    print(f"    reading: {m['reading']}")
+
+
 def _ja_load_file(path: str):
     with open(path, "r", encoding="utf-8") as fh:
         body = json.load(fh)
@@ -6522,10 +6656,14 @@ def cmd_juror_audit(args: argparse.Namespace) -> None:
             except Exception:
                 data[ep] = None
     r = juror_audit(data, me)
+    if getattr(args, "margin", False):
+        r["margin"] = juror_margin_split(data, me, getattr(args, "min_seats", MARGIN_MIN_SEATS_DEFAULT))
     if args.json:
         print(json.dumps(r))
     else:
         _ja_print(r)
+        if "margin" in r:
+            _margin_print(r["margin"])
     if r["closes_measured"] == 0:
         sys.exit(2)
 
@@ -8688,6 +8826,8 @@ def main() -> None:
     p_ja.add_argument("--file", action="append", default=[], help="Offline: saved /api/settled JSON file (repeatable); no network")
     p_ja.add_argument("--json", action="store_true", help="JSON output")
     p_ja.add_argument("--timeout", type=int, default=60, help="Per-close /api/settled timeout (default 60s)")
+    p_ja.add_argument("--margin", action="store_true", help="Also split your seats by jury margin (near-tie |2a-1|<=0.25, mid, lopsided >=0.6) with strict/lenient misses vs the network rate per bucket (SUGGESTIONS #167); advisory")
+    p_ja.add_argument("--min-seats", type=int, default=MARGIN_MIN_SEATS_DEFAULT, help="With --margin: fewer seats than this in a bucket is n/a, not 0 (default 5)")
 
     p_mcr = sub.add_parser("mcr", help="Keyless, advisory: per-grader dissent rate and minority-correct rate (MCR) on contested settled rows from public /api/settled jury flags (SUGGESTIONS #156); never a gate, never prints an address")
     p_mcr.add_argument("--address", default="", help="poa1... address for your own row (default $POA_ADDRESS or ~/.poa/address; optional); never printed")
