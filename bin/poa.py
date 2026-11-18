@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.19"
+KIT_VERSION = "1.9.20"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -207,6 +207,7 @@ class PoaHTTPError(RuntimeError):
         self.kind = kind
         self.status = status
         self.retry_after = retry_after
+        self.body = None
 
 
 SERVER_STATUSES = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
@@ -371,7 +372,9 @@ def _classify(exc: Exception, path: str, raw_key: str) -> PoaHTTPError:
                             break
         except Exception:
             retry_after = None
-        return PoaHTTPError(kind, f"HTTP {exc.code} ({kind}) on {path}: {body[:600]}", exc.code, retry_after=retry_after)
+        err = PoaHTTPError(kind, f"HTTP {exc.code} ({kind}) on {path}: {body[:600]}", exc.code, retry_after=retry_after)
+        err.body = body[:2000]
+        return err
     msg = redact(str(exc), raw_key)
     reason = getattr(exc, "reason", None)
     if isinstance(exc, TimeoutError) or "timed out" in msg.lower() or isinstance(reason, TimeoutError):
@@ -7839,12 +7842,103 @@ def solve_join_pow(challenge: str, bits: int, max_iters: int = None, deadline: f
         n += 1
 
 
+# Join gate state (SUGGESTIONS #168). Since Nov 15 2026 /api/join-pow can answer 503 "temporarily paused"
+# (body {"error", "notice": {"msg", "until"}}, `until` free text) or time out, while go.md still describes an
+# open gate. Rule (same as POAScan): one 503 means the gate is paused, one 200 with a challenge means open,
+# and a timeout or network error changes nothing (`unknown`). A paused gate is a closed door: no proof is
+# mined, nothing is registered, and retrying with other headers, keys or bits cannot help.
+JOIN_GATE_RULE = "one 503 = paused, one 200 with a challenge = open, a timeout or network error = unknown"
+
+
+class JoinGateClosed(RuntimeError):
+    """The admission gate answered 503 paused; joining is closed for now (not a key or bits problem)."""
+
+    def __init__(self, gate: dict):
+        self.gate = gate
+        msg = gate.get("notice") or "temporarily paused"
+        until = gate.get("until")
+        super().__init__(
+            f"join gate is paused (HTTP {gate.get('http_status') or 503} on /api/join-pow): {str(msg)[:200]}"
+            + (f"; until: {str(until)[:80]}" if until else "")
+            + ". Nothing was mined or registered. Retrying with different headers, keys or bits will not help; "
+              "check again later with `poa.py join-pow --gate`.")
+
+
+def _until_is_timestamp(until) -> bool:
+    if isinstance(until, (int, float)) and not isinstance(until, bool):
+        return until > 1_000_000_000
+    if isinstance(until, str):
+        t = until.strip()
+        if re.fullmatch(r"\d{10}(\.\d+)?", t):
+            return True
+        try:
+            datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _parse_pause_body(body: str) -> tuple:
+    """(notice msg, until) from a 503 pause body; tolerates plain text."""
+    msg, until = None, None
+    try:
+        doc = json.loads(body) if body and body.strip().startswith("{") else None
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        notice = doc.get("notice")
+        if isinstance(notice, dict):
+            msg = notice.get("msg") or notice.get("message")
+            until = notice.get("until")
+        elif isinstance(notice, str):
+            msg = notice
+        msg = msg or doc.get("message") or doc.get("error")
+        until = until if until is not None else doc.get("until")
+    elif body:
+        msg = body.strip()[:300]
+    return (redact(str(msg))[:300] if msg else None), until
+
+
+def probe_join_gate(retries: int = 1, timeout: int = 20) -> dict:
+    """Keyless GET /api/join-pow, classified as open / paused / unknown / error. A 503 is final on the first
+    answer (never retried); only timeouts and network errors are retried, up to `retries` attempts."""
+    checked = _iso_z(_utc_now())
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            res = api_call("GET", "/api/join-pow", need_key=False, timeout=timeout, retries=1)
+        except PoaHTTPError as e:
+            if e.status == 503:
+                msg, until = _parse_pause_body(e.body or "")
+                return {"gate": "paused", "http_status": 503, "notice": msg, "until": until,
+                        "until_is_timestamp": _until_is_timestamp(until), "checked_at": checked, "rule": JOIN_GATE_RULE}
+            if e.kind in ("timeout", "network"):
+                last = e
+                if attempt + 1 < max(1, retries):
+                    _backoff(attempt)
+                continue
+            return {"gate": "error", "http_status": e.status, "kind": e.kind, "detail": redact(str(e))[:300],
+                    "checked_at": checked, "rule": JOIN_GATE_RULE}
+        if isinstance(res, dict) and res.get("challenge"):
+            return {"gate": "open", "http_status": 200, "challenge_info": res, "checked_at": checked, "rule": JOIN_GATE_RULE}
+        return {"gate": "error", "http_status": 200, "kind": "no-challenge", "detail": "200 without a challenge",
+                "checked_at": checked, "rule": JOIN_GATE_RULE}
+    return {"gate": "unknown", "http_status": None, "kind": getattr(last, "kind", "timeout"),
+            "detail": redact(str(last))[:300] if last else None, "checked_at": checked, "rule": JOIN_GATE_RULE,
+            "note": "a timeout changes nothing: the gate state is unknown, not closed and not open"}
+
+
 def fetch_join_pow() -> dict:
-    """Keyless GET /api/join-pow (one fresh, single-use challenge)."""
-    res = api_call("GET", "/api/join-pow", need_key=False, timeout=20, retries=2)
-    if not isinstance(res, dict) or not res.get("challenge"):
-        raise RuntimeError("GET /api/join-pow did not return a challenge")
-    return res
+    """Keyless GET /api/join-pow (one fresh, single-use challenge). Raises JoinGateClosed on a 503 pause."""
+    gate = probe_join_gate(retries=2)
+    if gate["gate"] == "open":
+        return gate["challenge_info"]
+    if gate["gate"] == "paused":
+        raise JoinGateClosed(gate)
+    if gate["gate"] == "unknown":
+        raise RuntimeError("GET /api/join-pow timed out or was unreachable; gate state unknown. Nothing was mined or registered.")
+    raise RuntimeError(f"GET /api/join-pow did not return a challenge ({gate.get('detail')})")
 
 
 def mined_join_pow(pow_info: dict = None, now_fn=time.time) -> dict:
@@ -7893,6 +7987,10 @@ def register_with_pow(q: dict, fetch=None, solve=None, log=print) -> dict:
             body = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
+        if e.code == 503 and "paused" in body.lower():
+            msg, until = _parse_pause_body(body)
+            raise JoinGateClosed({"gate": "paused", "http_status": 503, "notice": msg, "until": until,
+                                  "until_is_timestamp": _until_is_timestamp(until)}) from None
         if e.code != 403 or not any(k in body for k in ("required_bits", "get_challenge")):
             raise PoaHTTPError("client" if e.code < 500 else "server", f"HTTP {e.code} on /api/hosted/register: {redact(body)[:400]}", e.code)
         try:
@@ -7908,7 +8006,18 @@ def register_with_pow(q: dict, fetch=None, solve=None, log=print) -> dict:
 
 
 def cmd_join_pow(args: argparse.Namespace) -> None:
-    """Keyless: show the current admission proof-of-work requirement; --solve times one local solve (never submitted)."""
+    """Keyless: show the current admission proof-of-work requirement; --solve times one local solve (never submitted).
+    --gate: one probe, prints open / paused / unknown / error and the pause notice (SUGGESTIONS #168)."""
+    if getattr(args, "gate", False):
+        gate = probe_join_gate(retries=1)
+        out = {k: v for k, v in gate.items() if k != "challenge_info"}
+        if gate["gate"] == "open":
+            ci = gate["challenge_info"]
+            out.update(kind=ci.get("kind", "pow"), bits=ci.get("bits"), required=ci.get("required"))
+        if gate["gate"] == "paused":
+            out["advice"] = "joining is closed for now; do not mine proofs or retry with other headers, keys or bits"
+        print(json.dumps(out, indent=2))
+        return
     info = fetch_join_pow()
     bits = int(info.get("bits") or 0)
     out = {"required": info.get("required"), "kind": info.get("kind", "pow"), "bits": bits, "single_use": info.get("single_use"),
@@ -8671,6 +8780,7 @@ def main() -> None:
 
     p_jp = sub.add_parser("join-pow", help="Keyless: current admission proof-of-work requirement for new joins (--solve times one local solve, never submitted)")
     p_jp.add_argument("--solve", action="store_true", help="Solve one challenge locally to time it (the proof is not used)")
+    p_jp.add_argument("--gate", action="store_true", help="One keyless probe: is the join gate open, paused (503) or unknown (timeout)? Mines nothing")
 
     sub.add_parser("me", help="Fetch account balance, standing, and epoch status")
     sub.add_parser("challenge", help="Fetch current epoch challenge and required seed words")

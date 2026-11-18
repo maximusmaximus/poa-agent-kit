@@ -167,7 +167,7 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(json.loads(out)["closes_measured"], [84, 85])
 
     def test_parser_wired(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.19")
+        self.assertEqual(poa.KIT_VERSION, "1.9.20")
 
 
 if __name__ == "__main__":
