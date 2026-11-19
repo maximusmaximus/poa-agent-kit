@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.20"
+KIT_VERSION = "1.9.21"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -4903,6 +4903,209 @@ def print_standing(r: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# standing --checkpoint: which checkpoint the established bit was read at (SUGGESTIONS.md #37)
+# ---------------------------------------------------------------------------
+EST_CHECKPOINT_FROZEN_MIN = 45   # live roll-ups land about every 15 minutes; 45 min unmoved = frozen
+EST_CHECKPOINT_SAMPLES_KEEP = 500
+
+
+def est_checkpoint_samples_path() -> pathlib.Path:
+    return POA_DIR / "established-checkpoints.jsonl"
+
+
+def load_est_checkpoint_samples(path: pathlib.Path = None) -> list:
+    path = path or est_checkpoint_samples_path()
+    out = []
+    if path.is_file():
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and isinstance(d.get("ts"), (int, float)):
+                out.append(d)
+    return out
+
+
+def save_est_checkpoint_sample(sample: dict, path: pathlib.Path = None) -> None:
+    """Append one sample (no address, no key: ts, checkpoint heights, the established bits)
+    to $POA_HOME/established-checkpoints.jsonl (0600), keeping the newest 500."""
+    path = path or est_checkpoint_samples_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = load_est_checkpoint_samples(path)[-(EST_CHECKPOINT_SAMPLES_KEEP - 1):] + [sample]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8")
+    lock_file_permissions(tmp)
+    os.replace(tmp, path)
+
+
+def _cp_height(d):
+    """Checkpoint height named by a response: checkpoint_height, or checkpoint.height / an int checkpoint."""
+    if not isinstance(d, dict):
+        return None
+    v = d.get("checkpoint_height")
+    if v is None:
+        c = d.get("checkpoint")
+        v = c.get("height") if isinstance(c, dict) else c
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def established_checkpoint_report(status_before, me_res, status_after=None, close_res=None,
+                                  samples=None, now: float = None,
+                                  frozen_min: int = EST_CHECKPOINT_FROZEN_MIN) -> dict:
+    """Pure function. Says which checkpoint the /api/hosted/me `established` bit was read at.
+    /me names no checkpoint today, so the read is bracketed by two keyless /api/status reads:
+    when both name the same checkpoint_height H, the bit was read while the checkpoint was H.
+    `close_res` is the keyless /api/established/<addr> view (precomputed at a close).
+    `samples` is the local history (oldest first) of earlier runs; the current read is compared
+    with it to say how long the checkpoint has been unmoved and whether the bit changed while it
+    sat still. Output never contains the address or the key."""
+    now = time.time() if now is None else float(now)
+    samples = [s for s in (samples or []) if isinstance(s, dict)]
+    sb = status_before if isinstance(status_before, dict) else None
+    sa = status_after if isinstance(status_after, dict) else None
+    h_before, h_after = _cp_height(sb), _cp_height(sa)
+    me_ok = isinstance(me_res, dict) and "established" in me_res
+    me_est = bool(me_res["established"]) if me_ok else None
+    me_cp = _cp_height(me_res) if isinstance(me_res, dict) else None
+    flags = []
+    if me_cp is not None:
+        cp, source = me_cp, "/api/hosted/me"
+    elif h_before is not None and (h_after is None or h_after == h_before):
+        cp, source = h_before, ("/api/status (bracketed: same height before and after the /me read)"
+                                if h_after is not None else "/api/status (read before /me only)")
+    elif h_before is not None and h_after is not None:
+        cp, source = h_after, "/api/status (moved during the read)"
+        flags.append("checkpoint_moved_during_read")
+    else:
+        cp, source = h_after, ("/api/status (read after /me only)" if h_after is not None else None)
+    if me_ok and me_cp is None:
+        flags.append("me_names_no_checkpoint")
+    st = sa or sb or {}
+    stale = bool(st.get("stale"))
+    if stale:
+        flags.append("status_stale")
+    # How long has the checkpoint sat at cp? Walk back over consecutive samples at the same height.
+    since = now
+    prev_same = None
+    if cp is not None:
+        for s in reversed(samples):
+            if s.get("checkpoint_height") != cp:
+                break
+            since = min(since, float(s["ts"]))
+            if prev_same is None:
+                prev_same = s
+    unmoved_min = int((now - since) // 60) if cp is not None else None
+    if cp is not None and unmoved_min is not None and unmoved_min >= frozen_min:
+        flags.append("checkpoint_frozen")
+    last = samples[-1] if samples else None
+    changed = None
+    if me_est is not None and last is not None and last.get("me_established") is not None:
+        changed = bool(last["me_established"]) != me_est
+        if changed and last.get("checkpoint_height") is not None and last.get("checkpoint_height") == cp:
+            flags.append("established_changed_without_checkpoint_move")
+    close_view = None
+    if isinstance(close_res, dict) and "established" in close_res:
+        close_view = {k: close_res.get(k) for k in ("established", "epoch", "since_epoch", "expires_after_epoch")
+                      if close_res.get(k) is not None or k == "established"}
+        if me_est is not None and bool(close_res.get("established")) != me_est:
+            flags.append("me_disagrees_with_close_view")
+    if cp is None or me_est is None:
+        verdict = "unknown"
+    elif stale or "checkpoint_frozen" in flags or "checkpoint_moved_during_read" in flags:
+        verdict = "possibly-stale"
+    else:
+        verdict = "current"
+    sample = {"ts": int(now), "checkpoint_height": cp, "me_established": me_est,
+              "me_checkpoint": me_cp, "status_as_of": st.get("as_of"),
+              "close_established": close_view.get("established") if close_view else None,
+              "close_epoch": close_view.get("epoch") if close_view else None}
+    return {"ok": cp is not None or me_est is not None or close_view is not None, "read_only": True,
+            "verdict": verdict, "established_per_me": me_est, "checkpoint_height": cp,
+            "checkpoint_source": source, "status_as_of": st.get("as_of"), "status_stale": stale,
+            "status_stale_age_s": st.get("stale_age_s") if stale else 0,
+            "epochs_closed": st.get("epochs_closed"),
+            "checkpoint_unmoved_min": unmoved_min, "frozen_after_min": frozen_min,
+            "samples_read": len(samples), "changed_since_last_sample": changed,
+            "close_view": close_view, "flags": flags, "sample": sample,
+            "note": ("The established bit on /api/hosted/me is recomputed at checkpoints. /me names no "
+                     "checkpoint today, so the read is bracketed by keyless /api/status reads. A bit read "
+                     "while the checkpoint has not moved for a while may be stale in either direction; "
+                     "re-check after the checkpoint moves before acting on it. Your address and key are never printed.")}
+
+
+def print_established_checkpoint(r: dict) -> None:
+    if not r.get("ok"):
+        print("standing --checkpoint: nothing could be read (no /api/status, /me or /api/established view)")
+        return
+    me_txt = "n/a (no key or --no-me)" if r["established_per_me"] is None else str(r["established_per_me"])
+    print(f"standing --checkpoint: {r['verdict'].upper()} | established per /me: {me_txt}"
+          f" | read at checkpoint {r['checkpoint_height']} via {r['checkpoint_source']}")
+    print(f"  /api/status as_of {r['status_as_of']} | stale {r['status_stale']}"
+          + (f" ({r['status_stale_age_s']}s)" if r['status_stale'] else "")
+          + f" | epochs_closed {r['epochs_closed']}")
+    if r["checkpoint_unmoved_min"] is not None:
+        print(f"  checkpoint unmoved for {r['checkpoint_unmoved_min']} min across {r['samples_read']} earlier local samples"
+              f" (frozen after {r['frozen_after_min']} min)")
+    if r["changed_since_last_sample"] is not None:
+        print(f"  established changed since the last sample: {r['changed_since_last_sample']}")
+    cv = r.get("close_view")
+    if cv:
+        print(f"  close view (/api/established, computed at close E{cv.get('epoch')}): established {cv.get('established')}"
+              + (f", since E{cv['since_epoch']}" if cv.get("since_epoch") is not None else "")
+              + (f", through E{cv['expires_after_epoch']}" if cv.get("expires_after_epoch") is not None else ""))
+    for f in r["flags"]:
+        print(f"flag: {f}")
+    print(r["note"])
+
+
+def cmd_standing_checkpoint(args: argparse.Namespace, me: str) -> None:
+    def status():
+        try:
+            return api_call("GET", "/api/status", need_key=False, timeout=20, retries=2)
+        except Exception:
+            return None
+    before = status()
+    me_res = None
+    if not args.no_me:
+        try:
+            have_key = bool(load_key())
+        except Exception:
+            have_key = False
+        if have_key:
+            try:
+                me_res = api_call("GET", "/api/hosted/me", timeout=20, retries=1)
+            except Exception:
+                me_res = None
+    after = status()
+    close_res = None
+    if me and _POA_ADDR_RE.match(me):
+        try:
+            close_res = api_call("GET", f"/api/established/{me}", need_key=False, timeout=20, retries=1)
+        except Exception:
+            close_res = None
+    samples = load_est_checkpoint_samples()
+    r = established_checkpoint_report(before, me_res, after, close_res, samples,
+                                      frozen_min=args.frozen_min)
+    if r.get("ok") and not args.no_record:
+        try:
+            save_est_checkpoint_sample(r["sample"])
+        except OSError:
+            r["flags"].append("sample_not_saved")
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_established_checkpoint(r)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["verdict"] != "current":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # standing --roster: per-address roster membership per close (SUGGESTIONS.md #111)
 # ---------------------------------------------------------------------------
 ROSTER_REPORT_DEFAULT_LAST = 5
@@ -5067,6 +5270,9 @@ def print_roster(r: dict) -> None:
 
 
 def cmd_standing(args: argparse.Namespace) -> None:
+    if getattr(args, "checkpoint", False):
+        cmd_standing_checkpoint(args, (args.address or local_address()).strip())
+        return
     try:
         epochs_res = read_epochs(timeout=args.timeout, retries=2)
     except Exception as ex:
@@ -8976,6 +9182,9 @@ def main() -> None:
     p_sd.add_argument("--log", default="", help="handoff LOG.md for answer txids (default $POA_HANDOFF_LOG or ~/poa-handoff/LOG.md)")
     p_sd.add_argument("--no-me", action="store_true", help="Skip the keyed /api/hosted/me read (fully keyless)")
     p_sd.add_argument("--roster", action="store_true", help="Per close: prior roster, seatless (unknown when panel_data unavailable), waitlisted, admitted, graders_served; keyless close-report join")
+    p_sd.add_argument("--checkpoint", action="store_true", help="Which checkpoint the /me established bit was read at: brackets the keyed /me read with keyless /api/status reads, compares /api/established/<addr>, flags a frozen checkpoint from local samples ($POA_HOME/established-checkpoints.jsonl). No /api/epochs read")
+    p_sd.add_argument("--frozen-min", type=int, default=EST_CHECKPOINT_FROZEN_MIN, help="With --checkpoint: minutes unmoved before the checkpoint counts as frozen (default 45)")
+    p_sd.add_argument("--no-record", action="store_true", help="With --checkpoint: don't append this read to the local sample log")
     p_sd.add_argument("--json", action="store_true", help="JSON output")
     p_sd.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
