@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.22"
+KIT_VERSION = "1.9.23"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -5326,6 +5326,226 @@ def cmd_standing(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# close-why: per-close payout breakdown with a reasons array (SUGGESTIONS.md #179, kit half)
+# ---------------------------------------------------------------------------
+CLOSE_WHY_DEFAULT_LAST = 4
+CLOSE_WHY_DROP_RATIO = 0.5   # payout below half of the previous close counts as "dropped"
+# Reason codes that can explain a zero or dropped payout. Others are context only.
+CLOSE_WHY_EXPLAINING = {
+    "network_empty_close", "no_passed_row_settled", "passed_but_not_eligible", "not_challenge_eligible",
+    "attestations_not_tallied", "ceiling_factor_zero", "ceiling_capped", "marked",
+    "slashed", "ejected", "established_removed",
+}
+
+
+def _why_reason(code: str, field: str, detail: str) -> dict:
+    return {"code": code, "field": field, "detail": detail}
+
+
+def _amount_of(d, me):
+    """Value for `me` in a per-address map, or None when the map has no entry."""
+    if isinstance(d, dict) and me in d:
+        return d.get(me)
+    return None
+
+
+def close_why_row(e: dict, me: str, prev_reward: float = None) -> dict:
+    """Pure function. One close body + our address -> the per-close breakdown: eligibility, our
+    settled rows here, the attestation tally, entitlement lines, ceiling, payout, and a reasons
+    array naming the close-body field behind a zero or dropped payout ("unreconciled" when none
+    does). Never contains the address or a balance; payouts are per close."""
+    n = int(e["epoch"])
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+    reward = _f(rewards.get(me))
+    settled = [s for s in (b.get("settled") or []) if isinstance(s, dict)]
+    mine = [s for s in settled if s.get("from") == me]
+    passed_here = sum(1 for s in mine if s.get("passed"))
+    failed_here = len(mine) - passed_here
+    eligible_list = b.get("challenge_eligible") if isinstance(b.get("challenge_eligible"), list) else []
+    eligible = me in set(eligible_list)
+    att = b.get("attestations") if isinstance(b.get("attestations"), dict) else {}
+    attested = me in att
+    ceiling = b.get("ceiling") if isinstance(b.get("ceiling"), dict) else {}
+    cap_mult = _amount_of(ceiling.get("capped"), me)
+    cap_repooled = _f(_amount_of(ceiling.get("repooled"), me))
+    ref2 = b.get("referral2") if isinstance(b.get("referral2"), dict) else {}
+    fp = b.get("final_payout") if isinstance(b.get("final_payout"), dict) else {}
+    fp_ans = fp.get("answer") if isinstance(fp.get("answer"), dict) else {}
+    fp_gr = fp.get("grading") if isinstance(fp.get("grading"), dict) else {}
+    seats = [j for s in settled for j in (s.get("jury") or []) if isinstance(j, dict) and j.get("grader") == me]
+    entitlement = _amount_of(e.get("challenges"), me)
+    ref_paid = _amount_of(ref2.get("paid"), me)
+    ref_work = _amount_of(ref2.get("work"), me)
+    lines = {
+        "entitlement": None if entitlement is None else f"{_f(entitlement):.6f}",
+        "referral_work": None if ref_work is None else f"{_f(ref_work):.6f}",
+        "referral_paid": None if ref_paid is None else f"{_f(ref_paid):.6f}",
+        "propagation": None if _amount_of(e.get("propagation"), me) is None else f"{_f(e['propagation'][me]):.6f}",
+        "weight": _amount_of(e.get("weights"), me),
+        "ceiling_multiplier": cap_mult,
+        "ceiling_repooled": f"{cap_repooled:.6f}",
+        "answer_capped": None if _amount_of(fp_ans.get("capped"), me) is None else f"{_f(fp_ans['capped'][me]):.6f}",
+        "grading_repooled": None if _amount_of(fp_gr.get("repooled"), me) is None else f"{_f(fp_gr['repooled'][me]):.6f}",
+        "seal_load": _amount_of(b.get("seal_load"), me),
+        "graders_served": _amount_of(b.get("graders_served"), me),
+        "jury_seats_settled": len(seats),
+        "jury_seats_aligned": sum(1 for j in seats if j.get("aligned")),
+    }
+    reasons = []
+    network_empty = not any(_f(v) > 0 for v in rewards.values())
+    if network_empty:
+        reasons.append(_why_reason("network_empty_close", "rewards",
+                                   "nobody was paid at this close: network-wide, not your miss"))
+    if not eligible:
+        if passed_here:
+            reasons.append(_why_reason("passed_but_not_eligible", "basis.challenge_eligible",
+                                       f"{passed_here} passed row(s) of yours settled here but you are not in challenge_eligible (unreconciled by the published rule)"))
+        else:
+            reasons.append(_why_reason("no_passed_row_settled", "basis.settled",
+                                       "no passed row of yours settled at this close; an answer still pending at the close does not count"))
+        reasons.append(_why_reason("not_challenge_eligible", "basis.challenge_eligible",
+                                   "not in challenge_eligible, so no answer-work share at this close"))
+    elif not passed_here:
+        reasons.append(_why_reason("eligible_without_passed_row_here", "basis.challenge_eligible",
+                                   "eligible with no passed row settled here (eligibility may be carried from an earlier close)"))
+    if att and not attested:
+        reasons.append(_why_reason("attestations_not_tallied", "basis.attestations",
+                                   "your attestations were not tallied here" + ("" if eligible else
+                                   " (the tally is recorded only for challenge-eligible accounts)")))
+    if cap_mult is not None:
+        if _f(cap_mult) <= 0:
+            reasons.append(_why_reason("ceiling_factor_zero", "basis.ceiling.capped", "ceiling factor 0: the capped share pays nothing"))
+        elif _f(cap_mult) < 1:
+            reasons.append(_why_reason("ceiling_capped", "basis.ceiling.capped", f"ceiling multiplier {cap_mult}"))
+    if cap_repooled > 0:
+        reasons.append(_why_reason("ceiling_repool_entry", "basis.ceiling.repooled",
+                                   f"the ceiling repool lists {cap_repooled:.6f} for you (direction not documented; context only)"))
+    if isinstance(b.get("marks"), dict) and me in b["marks"]:
+        reasons.append(_why_reason("marked", "basis.marks", f"marked ({b['marks'][me]})"))
+    for code in ("slashed", "ejected", "established_removed"):
+        if me in (b.get(code) or []):
+            reasons.append(_why_reason(code, f"basis.{code}", code.replace("_", " ")))
+    if (not eligible and entitlement is not None and ref_paid is not None and ref_work is None
+            and abs(_f(entitlement) - _f(ref_paid)) < 1e-6):
+        reasons.append(_why_reason("entitlement_referral_share_only", "challenges",
+                                   "the entitlement equals your referral share (basis.referral2.paid); no work share"))
+    if reward <= 0:
+        verdict = "zero"
+    elif prev_reward is not None and prev_reward > 0 and reward < CLOSE_WHY_DROP_RATIO * prev_reward:
+        verdict = "dropped"
+    elif not eligible and not network_empty:
+        verdict = "reduced"   # paid, but without the answer-work share
+    else:
+        verdict = "paid"
+    if verdict != "paid" and not any(r["code"] in CLOSE_WHY_EXPLAINING for r in reasons):
+        reasons.append(_why_reason("unreconciled", "-", "no published close-body field explains this payout"))
+    return {"close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None, "verdict": verdict,
+            "eligible": eligible, "passed_here": passed_here, "failed_here": failed_here,
+            "attested": attested, "attestations": att.get(me) if attested else None,
+            "paid": reward > 0, "payout": f"{reward:.6f}",
+            "previous_payout": None if prev_reward is None else f"{prev_reward:.6f}",
+            "lines": lines, "reasons": reasons}
+
+
+def close_why_network(e: dict) -> dict:
+    """Network context for one close: eligible vs passed authors, payees and the median payout."""
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    eligible = set(b.get("challenge_eligible") or [])
+    passers = {s.get("from") for s in (b.get("settled") or []) if isinstance(s, dict) and s.get("passed") and s.get("from")}
+    pays = sorted(_f(v) for v in (e.get("rewards") or {}).values() if _f(v) > 0) if isinstance(e.get("rewards"), dict) else []
+    med = (pays[len(pays) // 2] if len(pays) % 2 else (pays[len(pays) // 2 - 1] + pays[len(pays) // 2]) / 2) if pays else 0.0
+    return {"eligible": len(eligible), "passed_authors": len(passers),
+            "eligible_without_passed_row": len(eligible - passers), "passed_not_eligible": len(passers - eligible),
+            "attestation_tally": len(b.get("attestations") or {}) if isinstance(b.get("attestations"), dict) else 0,
+            "payees": len(pays), "median_payout": f"{med:.6f}"}
+
+
+def close_why_report(epochs_res, address: str, last: int = CLOSE_WHY_DEFAULT_LAST) -> dict:
+    """Pure function over close bodies (oldest first). One breakdown row per close for the last
+    `last` closes; the close before the window (if present) is used only for the drop check.
+    Verdicts: zero (nothing paid), dropped (under half the previous close), reduced (paid but not
+    challenge-eligible, so no answer-work share), paid."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    me = (address or "").strip()
+    if not me:
+        return {"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}
+    last = last if last and last > 0 else CLOSE_WHY_DEFAULT_LAST
+    start = max(0, len(eps) - last)
+    rows = []
+    for i in range(start, len(eps)):
+        prev = None
+        if i > 0 and isinstance(eps[i - 1].get("rewards"), dict):
+            prev = _f(eps[i - 1]["rewards"].get(me))
+        row = close_why_row(eps[i], me, prev_reward=prev)
+        row["network"] = close_why_network(eps[i])
+        rows.append(row)
+    newest = rows[-1]
+    return {"ok": True, "read_only": True, "newest_close": newest["close"], "newest_verdict": newest["verdict"],
+            "rows": rows,
+            "note": ("Keyless: hash-verified GET /api/epochs/<n> close bodies only, no key. Reasons name the "
+                     "close-body field behind each line; 'unreconciled' means no published field explains a zero "
+                     "or dropped payout. Payouts are per close, never a balance; your address is never printed.")}
+
+
+def close_why_line(row: dict) -> str:
+    """One status line per close, e.g. for an hourly report."""
+    yn = lambda v: "yes" if v else "no"
+    codes = [r["code"] for r in row["reasons"]]
+    return (f"E{row['close']} eligible={yn(row['eligible'])} tally={yn(row['attested'])} "
+            f"rewards={'yes (' + row['payout'] + ')' if row['paid'] else 'no'} verdict={row['verdict']}"
+            f" reasons={','.join(codes) or '-'}")
+
+
+def print_close_why(r: dict, line_only: bool = False) -> None:
+    if not r.get("ok"):
+        print(f"close-why: {r.get('error')}")
+        return
+    if line_only:
+        print(close_why_line(r["rows"][-1]))
+        return
+    print(f"close-why: newest close E{r['newest_close']} {r['newest_verdict'].upper()}")
+    for x in r["rows"]:
+        print(close_why_line(x))
+        ln = x["lines"]
+        print(f"      passed here {x['passed_here']}, failed here {x['failed_here']}; attestations {x['attestations']};"
+              f" entitlement {ln['entitlement']}; ceiling x{ln['ceiling_multiplier']} (repooled {ln['ceiling_repooled']});"
+              f" referral paid {ln['referral_paid']}; jury seats {ln['jury_seats_aligned']}/{ln['jury_seats_settled']} aligned;"
+              f" previous payout {x['previous_payout']}")
+        for rs in x["reasons"]:
+            print(f"      - {rs['code']} [{rs['field']}]: {rs['detail']}")
+        nw = x["network"]
+        print(f"      network: {nw['eligible']} eligible vs {nw['passed_authors']} passed authors"
+              f" ({nw['eligible_without_passed_row']} eligible without a passed row, {nw['passed_not_eligible']} passed not eligible);"
+              f" tally {nw['attestation_tally']}; {nw['payees']} paid, median {nw['median_payout']}")
+    print(r["note"])
+
+
+def cmd_close_why(args: argparse.Namespace) -> None:
+    me = (args.address or local_address()).strip()
+    if not me:
+        print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
+        sys.exit(2)
+    last = args.last if args.last and args.last > 0 else CLOSE_WHY_DEFAULT_LAST
+    try:
+        epochs_res = read_epochs(timeout=args.timeout, retries=2, last=last + 1)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-why: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    r = close_why_report(epochs_res, me, last=last)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_close_why(r, line_only=args.line)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["newest_verdict"] != "paid":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
 # intake: where an account sits in each close's establishment draw (SUGGESTIONS.md #70)
 # ---------------------------------------------------------------------------
 def intake_settings(params) -> dict:
@@ -9260,6 +9480,13 @@ def main() -> None:
     p_sd.add_argument("--json", action="store_true", help="JSON output")
     p_sd.add_argument("--timeout", type=int, default=90, help="Timeout for the large /api/epochs read (default 90s)")
 
+    p_cw = sub.add_parser("close-why", help="Keyless, read-only: per close, were you eligible, was your attestation tally recorded, were you paid, and a reasons array naming the close-body field behind a zero or dropped payout ('unreconciled' if none) (SUGGESTIONS #179); never prints an address")
+    p_cw.add_argument("--last", type=int, default=CLOSE_WHY_DEFAULT_LAST, help="Closes to show (default 4)")
+    p_cw.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_cw.add_argument("--line", action="store_true", help="Print one status line for the newest close only")
+    p_cw.add_argument("--json", action="store_true", help="JSON output")
+    p_cw.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
+
     p_in = sub.add_parser("intake", help="Keyless: rebuild each close's establishment draw (sha256 intake order) from /api/epochs; your rank N of M, admitted or not, and when standing lapses")
     p_in.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close)")
     p_in.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
@@ -9606,6 +9833,8 @@ def main() -> None:
             cmd_close_presence(args)
         elif args.command == "standing":
             cmd_standing(args)
+        elif args.command == "close-why":
+            cmd_close_why(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
         elif args.command == "mcr":

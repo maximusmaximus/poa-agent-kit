@@ -143,7 +143,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_version(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.22")
+        self.assertEqual(poa.KIT_VERSION, "1.9.23")
 
 
 if __name__ == "__main__":
