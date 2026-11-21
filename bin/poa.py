@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.21"
+KIT_VERSION = "1.9.22"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -5689,6 +5689,64 @@ CLOSE_ECON_SETTINGS = (
 )
 
 
+def escrow_backfill_sha(offers) -> str:
+    """Same hash as the engine's escrowBackfillSha (poa.mjs 39ea914d, v0.124): sha256 of
+    'poa-escrow-fill-seen-v1|' + JSON.stringify of the offer ids as strings, sorted."""
+    ids = sorted(str(x) for x in (offers or []))
+    return hashlib.sha256(("poa-escrow-fill-seen-v1|" + json.dumps(ids, separators=(",", ":"), ensure_ascii=False)).encode("utf-8")).hexdigest()
+
+
+def _int_param(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def gated_rules_report(params, now_ts=None) -> dict:
+    """Pure function. The three rules the engine in release v0.124 (poa.mjs 39ea914d) switches on from
+    /api/params, each reported as served or not, with the value, whether its boundary is reached
+    (time rules only; epoch rules give the epoch) and the engine default for any unset companion key.
+    - att_distinct_verifier_from_ts (#974): from that time, escrow-release attestation gates count
+      distinct verifiers instead of attestation records, and an attest-batch that repeats a txid
+      inside itself is rejected as a whole.
+    - escrow_autorefund_from_epoch (#1007): from that close on, open escrow offers expired by more than
+      escrow_autorefund_grace_s (default 86400 s) with no receipt and no recorded fill are refunded at
+      the close, at most escrow_autorefund_per_close (default 25) per close. The escrow_fill_seen_backfill
+      table must hash to its own sha256 or the engine rejects the ledger; this checks the same hash.
+    - close_ts_derived_from_epoch (#1419): from that close on, the close timestamp is no longer the wall
+      clock but max(previous close ts + 1, newest closing tx ts + 1), capped at previous close ts +
+      auto_epoch_seconds + close_ts_max_late_s (default 3600).
+    Read-only; never prints an address."""
+    params = params if isinstance(params, dict) else {}
+    now_ts = time.time() if now_ts is None else now_ts
+    out = {}
+    adv = _int_param(params.get("att_distinct_verifier_from_ts"))
+    out["att_distinct_verifier"] = ({"served": True, "from_ts": adv, "from_utc": _iso(adv), "active": now_ts >= adv,
+                                     "effect": "escrow-release gates count distinct verifiers; an attest-batch repeating a txid is rejected"}
+                                    if adv is not None else {"served": False, "effect": "off (gates count attestation records)"})
+    ar = _int_param(params.get("escrow_autorefund_from_epoch"))
+    if ar is None:
+        out["escrow_autorefund"] = {"served": False, "effect": "off (expired escrows wait for a manual refund)"}
+    else:
+        cap = params.get("escrow_autorefund_per_close", 25)
+        grace = params.get("escrow_autorefund_grace_s", 86400)
+        bf = params.get("escrow_fill_seen_backfill")
+        bf_ok = (isinstance(bf, dict) and isinstance(bf.get("offers"), list) and _int_param(bf.get("through_ts")) is not None
+                 and escrow_backfill_sha(bf.get("offers")) == bf.get("sha256"))
+        out["escrow_autorefund"] = {"served": True, "from_epoch": ar, "per_close": cap,
+                                    "per_close_served": "escrow_autorefund_per_close" in params,
+                                    "grace_s": grace, "grace_served": "escrow_autorefund_grace_s" in params,
+                                    "backfill_offers": len(bf["offers"]) if isinstance(bf, dict) and isinstance(bf.get("offers"), list) else None,
+                                    "backfill_through_utc": _iso(bf["through_ts"]) if isinstance(bf, dict) and _int_param(bf.get("through_ts")) is not None else None,
+                                    "backfill_table_ok": bool(bf_ok),
+                                    "effect": f"from close E{ar}: offers expired more than {grace} s with no receipt or fill are refunded, at most {cap} per close"}
+    ct = _int_param(params.get("close_ts_derived_from_epoch"))
+    late = params.get("close_ts_max_late_s", 3600)
+    out["close_ts_derived"] = ({"served": True, "from_epoch": ct, "max_late_s": late, "max_late_served": "close_ts_max_late_s" in params,
+                                "effect": f"from close E{ct}: close ts = max(prev close ts + 1, newest closing tx ts + 1), "
+                                          f"capped at prev close ts + auto_epoch_seconds + {late} s (not the wall clock)"}
+                               if ct is not None else {"served": False, "effect": "off (close ts is the wall clock)"})
+    return out
+
+
 def release_report(release_res, params=None) -> dict:
     """Pure function. Reads a GET /api/release response and a GET /api/params response.
     Returns the current signed release (version, signing time, txid, changelog_ref), which hashes
@@ -5738,6 +5796,9 @@ def release_report(release_res, params=None) -> dict:
                                "is added to the next pool; any excess is burned")
     else:
         res["carry_effect"] = f"unclear (carry_cap_pools served as {cap!r})"
+    res["gated_rules"] = gated_rules_report(params)
+    if res["gated_rules"]["escrow_autorefund"].get("served") and not res["gated_rules"]["escrow_autorefund"]["backfill_table_ok"]:
+        res["flags"].append("escrow_backfill_table_mismatch")
     res["carry_correction"] = carry_correction_report(params)
     if res["carry_correction"]["served"] and not res["carry_correction"].get("table_ok"):
         res["flags"].append("carry_correction_table_mismatch")
@@ -5825,6 +5886,17 @@ def print_release(r: dict) -> None:
               f"pinned total {cc['pinned_total']} POA, table hash {'ok' if cc['table_ok'] else 'MISMATCH'}")
     elif cc:
         print(f"carry correction: {cc['effect']}")
+    g = r.get("gated_rules") or {}
+    if g:
+        print("gated rules in /api/params (engine v0.124):")
+        for name in ("att_distinct_verifier", "escrow_autorefund", "close_ts_derived"):
+            x = g.get(name) or {}
+            extra = ""
+            if name == "att_distinct_verifier" and x.get("served"):
+                extra = f" [from {x['from_utc']}, {'active' if x['active'] else 'not yet'}]"
+            if name == "escrow_autorefund" and x.get("served"):
+                extra = f" [backfill {x['backfill_offers']} offers, table hash {'ok' if x['backfill_table_ok'] else 'MISMATCH'}]"
+            print(f"  {name:<22} {x.get('effect', '-')}{extra}")
     for f in r["flags"]:
         print(f"flag: {f}")
     print(r["note"])
