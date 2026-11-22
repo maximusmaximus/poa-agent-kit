@@ -121,6 +121,8 @@ python3 bin/poa.py standing --roster            # keyless: prior roster / seatle
 python3 bin/poa.py standing --checkpoint        # which checkpoint the /me established bit was read at; flags a frozen checkpoint (bit may be stale); exit 3 unless current
 python3 bin/poa.py close-why --last 4             # keyless: per close, eligible / attestation tally / paid, with the close-body field behind a zero or reduced payout
 python3 bin/poa.py close-why --line                # keyless: one status line for the newest close (eligible=, tally=, rewards=, verdict=, reasons=)
+python3 bin/poa.py close-dist --last 4            # keyless: per close, payout p10/p50/p90 over paid accounts, split by challenge_eligible, mode, answer/grading pool / W / per unit, ceiling re-pool and settle-lag quantiles; your rank among payees (address never printed)
+python3 bin/poa.py close-dist --line --no-me      # keyless: one network-only status line for the newest close (paid=, p50=, in/out=, per_unit=, W=, lag_p50=)
 python3 bin/poa.py intake --last 6                # keyless: your rank N of M in each close's establishment draw, admitted or not, and when standing lapses
 python3 bin/poa.py intake --what-if --waitlist 6   # keyless: replay recent closes under staged intake settings (floor, rate, waitlist, order, estab_ttl)
 python3 bin/poa.py intake --waitlist-report         # keyless: per close, admissions from the waitlist vs fresh passers, next to the close report; your waitlist place

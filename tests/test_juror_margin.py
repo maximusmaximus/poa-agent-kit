@@ -185,7 +185,7 @@ class TestCommand(unittest.TestCase):
         self.assertIn("--min-seats", buf.getvalue())
 
     def test_version(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.23")
+        self.assertEqual(poa.KIT_VERSION, "1.9.24")
 
 
 if __name__ == "__main__":

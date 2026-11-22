@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.23"
+KIT_VERSION = "1.9.24"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -321,7 +321,8 @@ def expand_epochs_index(res, last: int = None, fetch=None, timeout: float = 60):
     bodies = [fetch_epoch_body(int(e["n"]), e.get("sha256"), timeout=timeout, fetch=fetch) for e in pick]
     return {"epochs": bodies,
             "_index": {"v": res.get("v"), "chain_id": res.get("chain_id"), "closed_through": res.get("closed_through"),
-                       "count": res.get("count", len(ents)), "fetched": [int(e["n"]) for e in pick], "sha256_verified": True}}
+                       "count": res.get("count", len(ents)), "fetched": [int(e["n"]) for e in pick], "sha256_verified": True,
+                       "sha256": {str(int(e["n"])): e.get("sha256") for e in pick}}}
 
 
 def read_epochs(timeout: int = None, retries: int = None, last: int = None) -> dict:
@@ -5546,6 +5547,227 @@ def cmd_close_why(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# close-dist: per-close payout distribution, eligible split, per-unit price and settle lag
+# (SUGGESTIONS.md #182, kit half)
+# ---------------------------------------------------------------------------
+CLOSE_DIST_DEFAULT_LAST = 4
+CLOSE_DIST_QUANTILES = (10, 50, 90)
+CLOSE_DIST_TOP_N = 10   # repool concentration: share of the re-pooled amount going to the top N recipients
+
+
+def nearest_rank(sorted_vals: list, p: float):
+    """Nearest-rank percentile of an ascending list (p in 0..100). None for an empty list. Pure."""
+    if not sorted_vals:
+        return None
+    k = max(1, -(-int(round(p * len(sorted_vals) * 1000)) // 100000))
+    return sorted_vals[min(len(sorted_vals), k) - 1]
+
+
+def _qline(vals: list, digits: int = 2) -> dict:
+    s = sorted(vals)
+    out = {"n": len(s)}
+    for p in CLOSE_DIST_QUANTILES:
+        v = nearest_rank(s, p)
+        out[f"p{p}"] = None if v is None else (round(v, digits) if digits else v)
+    return out
+
+
+def close_dist_channel(ch) -> dict:
+    """One final_payout channel (answer / grading): pool E, weight W, per-unit E/W, capped count,
+    re-pooled total, recipients and how concentrated the re-pool is. Pure; no addresses kept."""
+    ch = ch if isinstance(ch, dict) else {}
+    pool = _f(ch.get("E"))
+    w = ch.get("W")
+    w_ok = isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0
+    capped = ch.get("capped") if isinstance(ch.get("capped"), dict) else {}
+    rep = sorted((_f(v) for v in (ch.get("repooled") or {}).values() if _f(v) > 0), reverse=True) \
+        if isinstance(ch.get("repooled"), dict) else []
+    rep_total = sum(rep)
+    top = sum(rep[:CLOSE_DIST_TOP_N])
+    return {"present": bool(ch), "E": round(pool, 2), "W": w if w_ok else None,
+            "per_unit": round(pool / w, 2) if w_ok else None,
+            "capped_accounts": len(capped), "repooled_total": round(rep_total, 2),
+            "repool_recipients": len(rep),
+            "repool_top_share": round(top / rep_total, 4) if rep_total > 0 else None,
+            "repool_recipient_quantiles": _qline(rep)}
+
+
+def close_dist_lag(e: dict, prev: dict = None) -> dict:
+    """Settle lag (close epoch minus the row's `since` in the previous close's pending book) for
+    every row settled at close `e`. Without the previous body the lag is unknown. Pure."""
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    settled = [s for s in (b.get("settled") or []) if isinstance(s, dict)]
+    n = int(e["epoch"])
+    if not isinstance(prev, dict):
+        return {"known": False, "settled_rows": len(settled), "note": "previous close not read; lag unknown"}
+    pb = prev.get("basis") if isinstance(prev.get("basis"), dict) else {}
+    book = pb.get("pending") if isinstance(pb.get("pending"), dict) else {}
+    all_l, pass_l, unmatched = [], [], 0
+    for s in settled:
+        row = book.get(s.get("answer"))
+        since = row.get("since") if isinstance(row, dict) else None
+        if not isinstance(since, int) or isinstance(since, bool):
+            unmatched += 1
+            continue
+        lag = n - since
+        all_l.append(lag)
+        if s.get("passed"):
+            pass_l.append(lag)
+    fast_all = sum(1 for x in all_l if x <= 1)
+    fast_pass = sum(1 for x in pass_l if x <= 1)
+    return {"known": True, "settled_rows": len(settled), "matched": len(all_l), "unmatched": unmatched,
+            "all": _qline(all_l, digits=0), "passed": _qline(pass_l, digits=0),
+            "fast_path": {"all": fast_all, "passed": fast_pass,
+                          "share_all": round(fast_all / len(all_l), 4) if all_l else None}}
+
+
+def close_dist_row(e: dict, prev: dict = None, me: str = "", sha: str = None) -> dict:
+    """Pure function. One close body -> payout quantiles over accounts paid > 0 (nearest rank),
+    the same split by basis.challenge_eligible, the modal payout, zero entries, per-channel
+    pool / W / per-unit with the ceiling re-pool, and settle-lag quantiles. If `me` is given,
+    only your own payout and its rank among payees are added; no address is ever returned."""
+    n = int(e["epoch"])
+    b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+    rewards = e.get("rewards") if isinstance(e.get("rewards"), dict) else {}
+    elig = set(b.get("challenge_eligible") or []) if isinstance(b.get("challenge_eligible"), list) else set()
+    paid = {a: _f(v) for a, v in rewards.items() if _f(v) > 0}
+    vals = sorted(paid.values())
+    mode_counts = {}
+    for v in vals:
+        k = f"{v:.2f}"
+        mode_counts[k] = mode_counts.get(k, 0) + 1
+    mode = max(mode_counts.items(), key=lambda kv: (kv[1], -float(kv[0]))) if mode_counts else None
+    fp = b.get("final_payout") if isinstance(b.get("final_payout"), dict) else {}
+    row = {
+        "close": n, "closed_at": _iso(e["ts"]) if e.get("ts") else None, "sha256": sha,
+        "listed": len(rewards), "zero_entries": len(rewards) - len(paid),
+        "paid": _qline(vals),
+        "in_eligible": _qline([v for a, v in paid.items() if a in elig]),
+        "out_of_eligible": _qline([v for a, v in paid.items() if a not in elig]),
+        "mode": None if not mode or mode[1] < 2 else {"value": float(mode[0]), "accounts": mode[1]},
+        "total_paid": round(sum(vals), 2),
+        "channels": {"answer": close_dist_channel(fp.get("answer")), "grading": close_dist_channel(fp.get("grading")),
+                     "referral_E": None if not isinstance(fp.get("referral"), dict) else round(_f(fp["referral"].get("E")), 2)},
+        "settle_lag": close_dist_lag(e, prev),
+    }
+    m50 = row["in_eligible"]["p50"], row["out_of_eligible"]["p50"]
+    row["eligible_median_ratio"] = round(m50[0] / m50[1], 2) if m50[0] and m50[1] else None
+    if me:
+        mine = paid.get(me, 0.0)
+        below = sum(1 for v in vals if v < mine)
+        row["you"] = {"paid": round(mine, 6), "eligible": me in elig,
+                      "rank_pct": round(100.0 * below / len(vals), 1) if mine > 0 and vals else None}
+    return row
+
+
+def close_dist_report(epochs_res, last: int = CLOSE_DIST_DEFAULT_LAST, me: str = "") -> dict:
+    """Pure function over close bodies (oldest first). One row per close for the last `last`
+    closes; the body before the window (if present) is used only for the settle-lag join."""
+    eps = _epoch_list(epochs_res)
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    shas = {}
+    if isinstance(epochs_res, dict) and isinstance(epochs_res.get("_index"), dict):
+        shas = epochs_res["_index"].get("sha256") or {}
+    last = last if last and last > 0 else CLOSE_DIST_DEFAULT_LAST
+    start = max(0, len(eps) - last)
+    rows = []
+    for i in range(start, len(eps)):
+        prev = eps[i - 1] if i > 0 and int(eps[i - 1]["epoch"]) == int(eps[i]["epoch"]) - 1 else None
+        rows.append(close_dist_row(eps[i], prev, me=(me or "").strip(), sha=shas.get(str(eps[i]["epoch"]))))
+    pu = [r["channels"]["answer"]["per_unit"] for r in rows if r["channels"]["answer"]["per_unit"]]
+    return {"ok": True, "read_only": True, "newest_close": rows[-1]["close"], "rows": rows,
+            "answer_per_unit_range": round(max(pu) / min(pu), 2) if len(pu) > 1 and min(pu) > 0 else None,
+            "note": ("Keyless: hash-verified GET /api/epochs/<n> close bodies only. Quantiles are nearest-rank over "
+                     "accounts paid > 0 and are TOTAL POA per address per close (answer, grading and referral pay "
+                     "mixed; the body has no per-address channel split). Eligible = basis.challenge_eligible. "
+                     "Settle lag = close minus the row's `since` in the previous close's pending book. "
+                     "No address is printed.")}
+
+
+def _k(v) -> str:
+    if v is None:
+        return "-"
+    v = float(v)
+    if abs(v) >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if abs(v) >= 1e3:
+        return f"{v / 1e3:.1f}K"
+    return f"{v:.2f}"
+
+
+def _qtxt(q: dict) -> str:
+    return f"p10/p50/p90 {_k(q['p10'])}/{_k(q['p50'])}/{_k(q['p90'])} (n {q['n']})"
+
+
+def close_dist_line(r: dict) -> str:
+    """One status line per close, e.g. for an hourly report."""
+    a = r["channels"]["answer"]
+    lag = r["settle_lag"]
+    lag_txt = f"lag_p50={lag['all']['p50']}" if lag.get("known") else "lag=?"
+    you = r.get("you")
+    you_txt = "" if not you else (f" you=p{you['rank_pct']:.0f}" if you["rank_pct"] is not None else " you=unpaid")
+    return (f"E{r['close']} paid={r['paid']['n']} p50={_k(r['paid']['p50'])} in/out={_k(r['in_eligible']['p50'])}/"
+            f"{_k(r['out_of_eligible']['p50'])} per_unit={_k(a['per_unit'])} W={a['W']} {lag_txt}{you_txt}")
+
+
+def print_close_dist(rep: dict, line_only: bool = False) -> None:
+    if not rep.get("ok"):
+        print(f"close-dist: {rep.get('error')}")
+        return
+    if line_only:
+        print(close_dist_line(rep["rows"][-1]))
+        return
+    print(f"close-dist: payout distribution, newest close E{rep['newest_close']}")
+    for r in rep["rows"]:
+        print(close_dist_line(r))
+        print(f"      paid {_qtxt(r['paid'])}; {r['zero_entries']} zero entries; total {_k(r['total_paid'])}")
+        if r["mode"]:
+            print(f"      mode {_k(r['mode']['value'])} paid to {r['mode']['accounts']} accounts")
+        print(f"      challenge_eligible {_qtxt(r['in_eligible'])}; not eligible {_qtxt(r['out_of_eligible'])}"
+              f"; median ratio {r['eligible_median_ratio']}")
+        for name in ("answer", "grading"):
+            c = r["channels"][name]
+            if c["present"]:
+                top = "-" if c["repool_top_share"] is None else f"{100 * c['repool_top_share']:.1f}%"
+                print(f"      {name}: E {_k(c['E'])} / W {c['W']} = {_k(c['per_unit'])} per unit; {c['capped_accounts']} capped;"
+                      f" re-pooled {_k(c['repooled_total'])} to {c['repool_recipients']} (top {CLOSE_DIST_TOP_N}: {top})")
+        lag = r["settle_lag"]
+        if lag.get("known"):
+            print(f"      settle lag all p10/p50/p90 {lag['all']['p10']}/{lag['all']['p50']}/{lag['all']['p90']}"
+                  f" (n {lag['matched']}, unmatched {lag['unmatched']}); passed p50 {lag['passed']['p50']};"
+                  f" fast path (lag 1) {lag['fast_path']['all']} rows ({lag['fast_path']['passed']} passed)")
+        else:
+            print(f"      settle lag: {lag['note']}")
+        if r.get("you"):
+            y = r["you"]
+            print(f"      you: paid {y['paid']:.6f}, {'in' if y['eligible'] else 'not in'} challenge_eligible"
+                  + ("" if y["rank_pct"] is None else f", above {y['rank_pct']}% of payees"))
+        if r.get("sha256"):
+            print(f"      body sha256 {r['sha256']}")
+    if rep.get("answer_per_unit_range"):
+        print(f"answer per-unit range across these closes: {rep['answer_per_unit_range']}x")
+    print(rep["note"])
+
+
+def cmd_close_dist(args: argparse.Namespace) -> None:
+    me = "" if args.no_me else (args.address or local_address()).strip()
+    last = args.last if args.last and args.last > 0 else CLOSE_DIST_DEFAULT_LAST
+    try:
+        epochs_res = read_epochs(timeout=args.timeout, retries=2, last=last + 1)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-dist: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    rep = close_dist_report(epochs_res, last=last, me=me)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print_close_dist(rep, line_only=args.line)
+    if not rep.get("ok"):
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
 # intake: where an account sits in each close's establishment draw (SUGGESTIONS.md #70)
 # ---------------------------------------------------------------------------
 def intake_settings(params) -> dict:
@@ -9487,6 +9709,14 @@ def main() -> None:
     p_cw.add_argument("--json", action="store_true", help="JSON output")
     p_cw.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
 
+    p_cd = sub.add_parser("close-dist", help="Keyless, read-only: per close, payout p10/p50/p90 over accounts paid > 0, split by challenge_eligible, modal payout, answer/grading pool / W / per-unit with the ceiling re-pool, and settle-lag quantiles (SUGGESTIONS #182); never prints an address")
+    p_cd.add_argument("--last", type=int, default=CLOSE_DIST_DEFAULT_LAST, help="Closes to show (default 4)")
+    p_cd.add_argument("--address", default="", help="poa1... address for your own rank line (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_cd.add_argument("--no-me", action="store_true", help="Network figures only, no own rank line")
+    p_cd.add_argument("--line", action="store_true", help="Print one status line for the newest close only")
+    p_cd.add_argument("--json", action="store_true", help="JSON output")
+    p_cd.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
+
     p_in = sub.add_parser("intake", help="Keyless: rebuild each close's establishment draw (sha256 intake order) from /api/epochs; your rank N of M, admitted or not, and when standing lapses")
     p_in.add_argument("--last", type=int, default=0, help="Only the last N closes (default: every close)")
     p_in.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
@@ -9835,6 +10065,8 @@ def main() -> None:
             cmd_standing(args)
         elif args.command == "close-why":
             cmd_close_why(args)
+        elif args.command == "close-dist":
+            cmd_close_dist(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
         elif args.command == "mcr":
