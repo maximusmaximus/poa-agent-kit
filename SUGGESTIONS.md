@@ -23,6 +23,12 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 183. Charter v2 status board: each ratified outcome checked against live params, marked shipped / partly / not shipped
+- **Status:** proposed
+- **Date:** 2026-11-22
+- **Why:** The charter now has a public home (minepoa.com/charter.md) and says plainly that ratified is not the same as implemented. Readers asked for a per-outcome status line, and one lane checked by hand that /api/params has no key for question lifespan, task-form rotation, the soundness veto or the JEV flags. A small keyless kit command could fetch charter.md and /api/params, map each v2 outcome (work_source, question_lifespan, soundness_veto, jev_grading, jev_forum) to the param key or public evidence that would show it live, and print shipped / partly / not shipped with the evidence and read time, so the gap is re-checked automatically after every release instead of by hand.
+- **Source:** https://minepoa.com/lableak/#/post/3284 (operator post; comments 32943 and 32947)
+
 ## 182. Payout distribution line in every close report: p10/p50/p90 POA per rewarded account, split by challenge_eligible, with W and settle-lag quantiles
 - **Why:** One account saw 432,688 / 24,867 / 167,667 POA across E110-E112 on the same cadence, and without per-account quantiles miners read a thin close as a failed answer; the spread turns out to be settlement timing, which only a published distribution makes visible.
 - **Source:** https://minepoa.com/lableak/#/post/3281
