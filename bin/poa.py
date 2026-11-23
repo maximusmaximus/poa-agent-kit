@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.24"
+KIT_VERSION = "1.9.25"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -2124,7 +2124,9 @@ def safe_mine() -> dict:
     Hourly lock: at most one mine per local clock hour per machine. An empty lock file
     $POA_HOME/mine-locks/mined-YYYYMMDDHH (default ~/.poa) enforces it; a second call in the
     same hour returns kind=already-mined-this-hour with no network call. The filename holds
-    only the hour (no address or key). Set POA_MINE_HOURLY_LOCK=0 to disable."""
+    only the hour (no address or key). Set POA_MINE_HOURLY_LOCK=0 to disable.
+    Each call that returns an `attested` count also appends {ts, attested} to the local
+    att-reconcile tally ($POA_HOME/att-tally.jsonl; POA_ATT_TALLY=0 turns that off)."""
     if os.environ.get("POA_MINE_HOURLY_LOCK", "1") != "0":
         import time as _t
         lockdir = POA_DIR / "mine-locks"
@@ -2141,13 +2143,15 @@ def safe_mine() -> dict:
             return {"ok": False, "kind": "already-mined-this-hour", "skipped": True,
                     "note": "mine already ran this clock hour on this machine; not calling /mine again"}
     try:
-        return hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1), action="mine")
+        r = hosted_write(lambda: api_call("GET", "/api/hosted/mine", timeout=60, retries=1), action="mine")
     except PoaHTTPError as e:
         if e.kind in ("server", "timeout", "network") and mcp_fallback_enabled():
             r = hosted_write(lambda: mcp_call("poa_mine", {}, timeout=60), action="mine")
             r["_rest_error"] = str(e)[:200]
-            return r
-        raise
+        else:
+            raise
+    record_mine_attested(r)   # local per-call tally for att-reconcile (SUGGESTIONS #187); never raises
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -5504,12 +5508,18 @@ def print_close_why(r: dict, line_only: bool = False) -> None:
     if not r.get("ok"):
         print(f"close-why: {r.get('error')}")
         return
+    def _att(row):
+        a = row.get("att_reconcile")
+        if not a:
+            return ""
+        diff = "-" if a["diff"] is None else f"{a['diff']:+d}"
+        return f" att={a['status']} (ours {a['ours']}, body {'-' if a['body'] is None else a['body']}, diff {diff})"
     if line_only:
-        print(close_why_line(r["rows"][-1]))
+        print(close_why_line(r["rows"][-1]) + _att(r["rows"][-1]))
         return
     print(f"close-why: newest close E{r['newest_close']} {r['newest_verdict'].upper()}")
     for x in r["rows"]:
-        print(close_why_line(x))
+        print(close_why_line(x) + _att(x))
         ln = x["lines"]
         print(f"      passed here {x['passed_here']}, failed here {x['failed_here']}; attestations {x['attestations']};"
               f" entitlement {ln['entitlement']}; ceiling x{ln['ceiling_multiplier']} (repooled {ln['ceiling_repooled']});"
@@ -5536,6 +5546,16 @@ def cmd_close_why(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"close-why: could not read /api/epochs: {redact(str(ex))}")
         sys.exit(2)
     r = close_why_report(epochs_res, me, last=last)
+    records = load_att_tally()
+    if r.get("ok") and records:
+        # att-reconcile next to close-why (SUGGESTIONS #187): only when a local mine tally exists
+        ar = att_reconcile_report(epochs_res, me, records, last=last)
+        if ar.get("ok"):
+            by_close = {x["close"]: x for x in ar["rows"]}
+            for row in r["rows"]:
+                x = by_close.get(row["close"])
+                if x:
+                    row["att_reconcile"] = {k: x[k] for k in ("calls", "ours", "body", "diff", "status", "partial_window")}
     if args.json:
         print(json.dumps(r, indent=2))
     else:
@@ -5543,6 +5563,212 @@ def cmd_close_why(args: argparse.Namespace) -> None:
     if not r.get("ok"):
         sys.exit(2)
     if r["newest_verdict"] != "paid":
+        sys.exit(3)
+
+
+# ---------------------------------------------------------------------------
+# att-reconcile: our own per-call `attested` tally vs the close body's attestations value
+# (SUGGESTIONS.md #187)
+# ---------------------------------------------------------------------------
+ATT_TALLY_LOG = POA_DIR / "att-tally.jsonl"
+ATT_RECONCILE_DEFAULT_LAST = 4
+ATT_RECONCILE_BAD = ("undercount", "absent")
+
+
+def _mine_attested_value(res):
+    """The `attested` count from one /api/hosted/mine (or MCP poa_mine) response, or None when
+    the call was skipped (hourly lock), queued, or carried no count."""
+    if not isinstance(res, dict) or res.get("skipped"):
+        return None
+    v = res.get("attested")
+    if v is None and isinstance(res.get("result"), dict):
+        v = res["result"].get("attested")
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def record_mine_attested(res, path: pathlib.Path = None, now: float = None, node: str = None):
+    """Append one {ts, attested[, node]} line to the local tally ($POA_HOME/att-tally.jsonl, 0600)
+    for a mine call that returned an `attested` count. Holds no address, key or txid. Never
+    raises: a tally write must not change what a mine call returns. POA_ATT_TALLY=0 turns it off."""
+    if os.environ.get("POA_ATT_TALLY", "1") == "0":
+        return None
+    n = _mine_attested_value(res)
+    if n is None:
+        return None
+    import time as _t
+    rec = {"ts": int(now if now is not None else _t.time()), "attested": n}
+    node = node if node is not None else os.environ.get("POA_NODE", "")
+    if node:
+        rec["node"] = re.sub(r"[^A-Za-z0-9_.-]", "", str(node))[:40]
+    try:
+        p = pathlib.Path(path) if path else ATT_TALLY_LOG
+        p.parent.mkdir(parents=True, exist_ok=True)
+        new = not p.exists()
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        if new:
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+            lock_file_permissions(p)
+    except Exception:
+        return None
+    return rec
+
+
+def load_att_tally(paths=None) -> list:
+    """Records from one or more tally files (the local one by default), deduplicated, oldest
+    first. Bad lines are skipped. Pass the copies from other machines on the same key to merge."""
+    paths = [pathlib.Path(p).expanduser() for p in (paths or [ATT_TALLY_LOG])]
+    seen, out = set(), []
+    for p in paths:
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+                ts, n = int(r["ts"]), int(r["attested"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if n < 0:
+                continue
+            key = (ts, n, str(r.get("node") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"ts": ts, "attested": n, "node": key[2]})
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def att_reconcile_status(ours: int, calls: int, in_map: bool, body_value, map_present: bool) -> str:
+    if not map_present:
+        return "no-map"
+    if calls == 0:
+        return "no-local-tally"
+    if not in_map:
+        return "absent" if ours > 0 else "match"
+    bv = int(_f(body_value))
+    if bv == ours:
+        return "match"
+    return "undercount" if bv < ours else "over"
+
+
+def att_reconcile_report(epochs_res, address: str, records: list, last: int = ATT_RECONCILE_DEFAULT_LAST,
+                         now: float = None) -> dict:
+    """Pure function over close bodies (oldest first) and our tally records. Each mine call is
+    assigned to the close whose window holds it (after the previous close's ts, up to and
+    including this close's ts); calls after the newest close count toward the open epoch.
+    Per close: our summed `attested`, the close body's basis.attestations value for us, the
+    difference (body - ours) and match / undercount / absent / over / no-local-tally / no-map.
+    The close before the window is read only for its ts. Never contains the address."""
+    eps = [e for e in _epoch_list(epochs_res) if isinstance(e.get("ts"), (int, float))]
+    if not eps:
+        return {"ok": False, "error": "no close records in /api/epochs response"}
+    me = (address or "").strip()
+    if not me:
+        return {"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}
+    last = last if last and last > 0 else ATT_RECONCILE_DEFAULT_LAST
+    recs = sorted((r for r in (records or []) if isinstance(r, dict)), key=lambda r: int(r["ts"]))
+    first_ts = recs[0]["ts"] if recs else None
+    start = max(0, len(eps) - last)
+    rows = []
+    for i in range(start, len(eps)):
+        e = eps[i]
+        b = e.get("basis") if isinstance(e.get("basis"), dict) else {}
+        hi = int(e["ts"])
+        lo = int(eps[i - 1]["ts"]) if i > 0 else None
+        mine = [r for r in recs if r["ts"] <= hi and (lo is None or r["ts"] > lo)]
+        ours = sum(int(r["attested"]) for r in mine)
+        att = b.get("attestations")
+        map_present = isinstance(att, dict)
+        in_map = map_present and me in att
+        body_value = int(_f(att.get(me))) if in_map else None
+        status = att_reconcile_status(ours, len(mine), in_map, body_value, map_present)
+        partial = bool(mine) and (lo is None or first_ts > lo)
+        paid = {k for k, v in (e.get("rewards") or {}).items() if _f(v) > 0} if isinstance(e.get("rewards"), dict) else set()
+        rows.append({
+            "close": int(e["epoch"]), "closed_at": _iso(hi),
+            "window_start": _iso(lo) if lo is not None else None,
+            "calls": len(mine), "ours": ours, "body": body_value,
+            "diff": (body_value if body_value is not None else 0) - ours if mine else None,
+            "status": status,
+            "partial_window": partial,
+            "nodes": sorted({r["node"] for r in mine if r.get("node")}),
+            "att_log_in_body": "att_log" in b or "att_log" in e,
+            "network": {"map_keys": len(att) if map_present else 0, "paid_accounts": len(paid),
+                        "paid_without_entry": len(paid - set(att)) if map_present else None},
+        })
+    newest_ts = int(eps[-1]["ts"])
+    open_recs = [r for r in recs if r["ts"] > newest_ts]
+    newest = rows[-1]
+    return {"ok": True, "read_only": True, "newest_close": newest["close"], "newest_status": newest["status"],
+            "rows": rows,
+            "open_epoch": {"epoch": int(eps[-1]["epoch"]) + 1, "calls": len(open_recs),
+                           "ours": sum(int(r["attested"]) for r in open_recs)},
+            "tally_records": len(recs),
+            "note": ("Keyless: hash-verified GET /api/epochs/<n> close bodies plus the local mine tally "
+                     "($POA_HOME/att-tally.jsonl, written by every mine call that returns `attested`). "
+                     "diff = body - ours. 'over' can mean another machine mined on the same key (merge its "
+                     "tally with --tally) or attestations the per-call count didn't show; 'partial_window' means "
+                     "the tally started inside that close's window. Your address is never printed.")}
+
+
+def att_reconcile_line(row: dict) -> str:
+    body = "-" if row["body"] is None else str(row["body"])
+    diff = "-" if row["diff"] is None else f"{row['diff']:+d}"
+    return (f"E{row['close']} att ours={row['ours']} ({row['calls']} calls) body={body} diff={diff} "
+            f"status={row['status']}" + (" partial" if row["partial_window"] else ""))
+
+
+def print_att_reconcile(r: dict, line_only: bool = False) -> None:
+    if not r.get("ok"):
+        print(f"att-reconcile: {r.get('error')}")
+        return
+    if line_only:
+        print(att_reconcile_line(r["rows"][-1]))
+        return
+    print(f"att-reconcile: newest close E{r['newest_close']} {r['newest_status'].upper()} ({r['tally_records']} tally records)")
+    for x in r["rows"]:
+        print(att_reconcile_line(x))
+        nw = x["network"]
+        print(f"      window {x['window_start'] or '?'} -> {x['closed_at']}; nodes {','.join(x['nodes']) or '-'};"
+              f" att_log in body: {'yes' if x['att_log_in_body'] else 'no'}; map keys {nw['map_keys']},"
+              f" paid accounts {nw['paid_accounts']} ({nw['paid_without_entry']} paid with no entry)")
+    op = r["open_epoch"]
+    print(f"open E{op['epoch']}: ours={op['ours']} ({op['calls']} calls) so far")
+    print(r["note"])
+
+
+def cmd_att_reconcile(args: argparse.Namespace) -> None:
+    me = (args.address or local_address()).strip()
+    if not me:
+        print(json.dumps({"ok": False, "error": "no address configured (POA_ADDRESS or ~/.poa/address)"}))
+        sys.exit(2)
+    last = args.last if args.last and args.last > 0 else ATT_RECONCILE_DEFAULT_LAST
+    records = load_att_tally([ATT_TALLY_LOG] + list(args.tally or []))
+    try:
+        epochs_res = read_epochs(timeout=args.timeout, retries=2, last=last + 1)
+    except Exception as ex:
+        print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"att-reconcile: could not read /api/epochs: {redact(str(ex))}")
+        sys.exit(2)
+    r = att_reconcile_report(epochs_res, me, records, last=last)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print_att_reconcile(r, line_only=args.line)
+    if not r.get("ok"):
+        sys.exit(2)
+    if r["newest_status"] in ATT_RECONCILE_BAD:
         sys.exit(3)
 
 
@@ -9709,6 +9935,14 @@ def main() -> None:
     p_cw.add_argument("--json", action="store_true", help="JSON output")
     p_cw.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
 
+    p_ar = sub.add_parser("att-reconcile", help="Keyless, read-only: per close, our own summed per-call `attested` counts from mine (local tally) vs the close body's basis.attestations value, the difference, and match / undercount / absent / over (SUGGESTIONS #187); never prints an address")
+    p_ar.add_argument("--last", type=int, default=ATT_RECONCILE_DEFAULT_LAST, help="Closes to show (default 4)")
+    p_ar.add_argument("--address", default="", help="poa1... address (default $POA_ADDRESS or ~/.poa/address); never printed")
+    p_ar.add_argument("--tally", action="append", default=[], help="Extra tally file to merge (e.g. a copy of another machine's att-tally.jsonl on the same key); repeatable")
+    p_ar.add_argument("--line", action="store_true", help="Print one status line for the newest close only")
+    p_ar.add_argument("--json", action="store_true", help="JSON output")
+    p_ar.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
+
     p_cd = sub.add_parser("close-dist", help="Keyless, read-only: per close, payout p10/p50/p90 over accounts paid > 0, split by challenge_eligible, modal payout, answer/grading pool / W / per-unit with the ceiling re-pool, and settle-lag quantiles (SUGGESTIONS #182); never prints an address")
     p_cd.add_argument("--last", type=int, default=CLOSE_DIST_DEFAULT_LAST, help="Closes to show (default 4)")
     p_cd.add_argument("--address", default="", help="poa1... address for your own rank line (default $POA_ADDRESS or ~/.poa/address); never printed")
@@ -10067,6 +10301,8 @@ def main() -> None:
             cmd_close_why(args)
         elif args.command == "close-dist":
             cmd_close_dist(args)
+        elif args.command == "att-reconcile":
+            cmd_att_reconcile(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
         elif args.command == "mcr":
