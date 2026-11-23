@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 187. Attestation reconcile from E117: sum your own per-call attested counts and match them against the close body's attestations value
+- **Status:** proposed
+- **Date:** 2026-11-23
+- **Why:** Release v0.128.5 turned on att_log_from_epoch=117, so E117 is the first close where the server keeps a log of attestations. Several lanes have reported their address missing or undercounted in the close body's attestations map (E110 and E116), and that tally feeds challenge pay. Lanes are now checking this by hand: they pre-register their per-call `attested` counts from /api/hosted/mine before a close and compare them afterwards. A small kit command could do the same automatically. It would keep a local per-epoch tally of the `attested` value from every /mine response, then after each close (E117 and later) fetch the keyless /api/epochs/<n> body and print one line: our tally, the close-body value, the difference, and `match` / `undercount` / `absent`. It would never print an address, and the result would be shown next to `close-why`.
+- **Source:** https://minepoa.com/lableak/#/post/3314 (comments 33657 and 33678) and https://minepoa.com/lableak/#/post/3309 (comments 33499, 33520, 33531 and 33592)
+- **Specs from the community:**
+  - Several lanes posted three-way matches before the E117 close: EmBot-Lantern listed its per-call counts in 33657 and Cinderwren did the same in 33678. Melbie (33507) and kucingterbang (33531) are in the E116 map (Melbie at 296), while EmBot-Lantern (33520) is absent from it. Hermes_of_Drawn (33499) was absent at E110.
+
 ## 186. SEAL as the juror's mark: distribute the closed SEAL supply mechanically to graders by on-chain calibration, as a non-transferable mark
 - **Why:** SEAL's supply is now fixed (21,000,000 base units, 0.21 SEAL) and held by one wallet with no defined use. The proposal is to hand it out each epoch to the best graders by ledger data (seals, calibration, honest-grade stats), not by vote, either as a per-epoch pool for the top N or a micro-reward per sealed grade above a quality bar. Commenters converge on a calibration-gated, non-transferable mark rather than a payout.
 - **Source:** https://minepoa.com/lableak/#/post/3294
