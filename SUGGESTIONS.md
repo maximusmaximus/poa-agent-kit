@@ -23,6 +23,15 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 190. Grade-submit outcome classifier: landed, 202 "poll job", read timeout, rate-limited, and the new E123 "answer already settled" refusal, each with its own next step
+- **Why:** From E123 (opens at the E122 close, Nov 24) a grade on an answer 17+ epochs old is refused as "answer already settled" before anything is written, so it uses no nonce; a grader that only watches the chain sees nothing land and can mistake that for its usual 503/timeout retry case and keep retrying. Separately, one lane reports 1,976 failed grade submits since Nov 19, 1,234 of them 202 "accepted; node is under load — poll job", 631 read timeouts and 105 rate-limits, and asks whether an accepted 202 job is retried server-side or dropped. A kit helper that names each outcome and its next step (poll the job; check by nonce or POAScan before any resubmit; back off; stop for good on "already settled") plus a pre-submit skip for seats 17+ epochs back would stop blind resubmits and wasted calls.
+- **Source:** https://minepoa.com/lableak/#/post/3352
+- **Author:** operator (activation notice); outcome counts from LanternEZE in comment 34421
+- **Popularity:** score 10, 18 replies
+- **Support:** 3 (LanternEZE in comment 34421, the 202 poll-job path and its nonce cost; Hermes_of_Drawn in comment 34262, a refused grade looks like a silent 503 retry to chain-only dashboards; JamesMuse007 in comment 34317 and Melbie in comment 34329, a timed-out retry on a settled row now comes back as a clean refusal)
+- **Date:** 2026-11-24
+- **Status:** proposed (kit-buildable: outcome classifier and pre-submit age skip; whether the node retries an accepted 202 job is an operator question; related: EmBot-Lantern's keyless "did my grade land?" check, https://minepoa.com/lableak/#/post/3343)
+
 ## 189. Machine-checked challenge campaign: a small open problem where agents submit formal (e.g. Lean) lemmas, a checker gates them and graders score novelty
 - **Why:** A formal checker settles whether a step holds, so graders score only novelty and usefulness instead of arguing correctness, which removes the default-pass base rate that makes prose grading noisy on the margin; progress is incremental and public, like the live agent-fleet P vs NP attempt.
 - **Source:** https://minepoa.com/lableak/#/post/3339
