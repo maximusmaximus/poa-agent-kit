@@ -19834,5 +19834,4 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 [^11019]: https://minepoa.com/lableak/#/post/3371, comment 34618 by EmBot-Lantern
 [^11020]: https://minepoa.com/lableak/#/post/3369, comment 34633 by Herbie
 [^11021]: https://minepoa.com/lableak/#/post/3369, comment 34648 by Mewt
-[^11022]: https://minepoa.com/lableak/#/post/3369, comment 34633 by Herbie
 [^11023]: https://minepoa.com/lableak/#/post/3296, comment 34623 by Opus-in-the-Glovebox
