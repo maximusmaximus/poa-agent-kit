@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.25"
+KIT_VERSION = "1.9.26"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -5567,6 +5567,301 @@ def cmd_close_why(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# grade-outcome: name what a grade-submit response means and the one right next step
+# (SUGGESTIONS.md #190). Pure and read-only: it classifies a saved response or log line and
+# never sends anything. The grading loop and its verdicts are not changed by this section.
+# ---------------------------------------------------------------------------
+# From E123 (opened at the E122 close, Nov 24, 2026) a grade on an answer 17+ epochs old is
+# refused as "answer already settled" before anything is written, so it uses no nonce.
+GRADE_SETTLED_AGE = 17
+GRADE_SETTLED_FROM_EPOCH = 123
+GRADE_JOB_KEEP_S = 3600        # GET /api/job/<id> keeps a finished result one hour, then 404
+GRADE_JOB_EXPIRE_S = 1800      # a job still queued after 30 minutes ends unrun (408 job_expired)
+GRADE_DEFAULT_BACKOFF_S = 60
+
+GRADE_OUTCOMES = {
+    "landed": ("done", "The grade landed (txid/seal present). Nothing to do; never resubmit."),
+    "accepted_poll_job": ("poll", "Accepted (202), not failed. Poll GET /api/job/<id> within the hour (after retry_after_seconds); "
+                                  "do not resubmit while queued (409 duplicate_in_flight). The job runs from an on-disk queue, "
+                                  "survives a restart and keeps draining during a close."),
+    "job_expired": ("resubmit_once", "The job sat queued over 30 minutes and never ran (408 job_expired). It did not land and used "
+                                     "no nonce: rebuild with a fresh ts and submit once, if the seat is still dealt."),
+    "job_forgotten": ("check_landed", "The poll returned 404: the result is gone (kept 1 hour) or the id never existed. Outcome "
+                                      "unknown: check by nonce or POAScan before any resubmit."),
+    "already_settled": ("stop", "Refused: answer already settled (from E123, answers 17+ epochs old). Nothing was written and no "
+                                "nonce used. Stop for good on this seat; never retry it."),
+    "duplicate": ("stop", "Refused as a duplicate sealed grade: our grade on this seat is already in. Stop; do not resubmit."),
+    "unknown_assignment": ("stop", "Refused: unknown assignment (the seat is not dealt to this key, or no longer). Stop on this seat."),
+    "in_flight": ("poll", "409 duplicate_in_flight: an earlier submit of this grade is still queued. Poll that job; do not resubmit."),
+    "rate_limited": ("back_off", "429 rate-limited: refused before processing. Back off (retry_after if given, else about a minute, "
+                                 "with jitter), then send once."),
+    "timeout": ("check_landed", "Read timeout / connection closed with no job id: the write MAY have landed. Check by nonce or "
+                                "POAScan before any resubmit."),
+    "server_error": ("check_landed", "5xx / node busy or loading with no job id. Back off, then check by nonce or POAScan before any resubmit."),
+    "halted": ("back_off", "503 maintenance/halt: nothing written. Wait for the node to come back, then send once."),
+    "auth": ("stop", "401/403: the key was rejected. Retrying will not help; fix the key first."),
+    "other": ("check_landed", "Unrecognized response. Check by nonce or POAScan before any resubmit."),
+}
+
+_GO_SETTLED_RE = re.compile(r"answer\s+(is\s+)?already\s+settled", re.I)
+_GO_DUP_RE = re.compile(r"duplicate\s+sealed\s+grade|already\s+graded", re.I)
+_GO_UNKNOWN_RE = re.compile(r"unknown\s+assignment", re.I)
+_GO_INFLIGHT_RE = re.compile(r"duplicate_in_flight", re.I)
+_GO_EXPIRED_RE = re.compile(r"job_expired", re.I)
+_GO_TIMEOUT_RE = re.compile(r"read\s*timed?\s*out|timed?\s*out|timeout|connection\s+(closed|reset|aborted)|"
+                            r"remote\s+end\s+closed|no\s+response|RemoteDisconnected|IncompleteRead", re.I)
+_GO_RATE_RE = re.compile(r"rate[\s_-]*limit|too\s+many\s+requests", re.I)
+_GO_POLL_RE = re.compile(r"poll\s+job|under\s+load|accepted", re.I)
+_GO_JOBID_RE = re.compile(r"(?:api/job/|job[_ ]?id\W{0,4}|poll\s+job\s+)([A-Za-z0-9_.:\-]{4,128})", re.I)
+_GO_TXID_RE = re.compile(r"\btxid\W{0,4}([0-9a-fA-F]{16,128})")
+_GO_STATUS_RE = re.compile(r"(?:HTTP(?:/\d(?:\.\d)?)?|status(?:_code)?|code)\W{0,3}([1-5]\d\d)\b", re.I)
+_GO_RETRY_RE = re.compile(r"retry[_-]?after(?:_seconds)?\W{0,4}(\d{1,5})", re.I)
+GO_POLL_DONE_STATES = ("done", "finished", "complete", "completed", "succeeded", "success", "ok", "sealed")
+
+
+def _go_int(v):
+    try:
+        if isinstance(v, bool):
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _go_texts(obj) -> str:
+    """All error/message strings in a response dict (nested result/job included), lowercased."""
+    out = []
+    def walk(o, depth=0):
+        if depth > 4:
+            return
+        if isinstance(o, dict):
+            for k in ("error", "message", "detail", "reason", "engine_error", "msg"):
+                v = o.get(k)
+                if isinstance(v, str):
+                    out.append(v)
+                elif isinstance(v, dict):
+                    walk(v, depth + 1)
+            for k in ("result", "job", "body", "response"):
+                if isinstance(o.get(k), (dict, str)):
+                    walk(o[k], depth + 1)
+        elif isinstance(o, str):
+            out.append(o)
+    walk(obj)
+    return " | ".join(out)
+
+
+def _go_find(obj, keys, depth=0):
+    if depth > 4 or not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if obj.get(k) not in (None, "", False):
+            return obj.get(k)
+    for k in ("result", "job", "body", "response"):
+        v = _go_find(obj.get(k), keys, depth + 1)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def classify_grade_outcome(resp, status: int = None) -> dict:
+    """Pure: map one grade-submit response (or job-poll reply, or a log line) to a named outcome
+    and its next step. `resp` may be a dict (parsed JSON body, optionally wrapped as
+    {"status": 202, "body": {...}}), a string (raw body or log line) or None (no response).
+    Returns {outcome, action, next_step, http_status, job_id, retry_after_s, txid, resubmit}.
+    `resubmit` is True only for job_expired: every other outcome says poll, back off, check, or stop."""
+    if isinstance(resp, dict) and isinstance(resp.get("body"), (dict, str)) and \
+            any(k in resp for k in ("status", "http_status", "status_code")):
+        status = status if status is not None else _go_int(resp.get("status") or resp.get("http_status") or resp.get("status_code"))
+        resp = resp["body"]
+    text = ""
+    if isinstance(resp, dict):
+        text = _go_texts(resp)
+        if status is None:
+            status = _go_int(resp.get("http_status") or resp.get("status_code"))
+            if status is None:
+                status = _go_int(resp.get("status"))   # only numeric status counts
+    elif isinstance(resp, str):
+        text = resp
+        if status is None:
+            m = _GO_STATUS_RE.search(text)
+            status = int(m.group(1)) if m else None
+    low = text.lower()
+
+    job_id = retry_after = txid = None
+    state = ""
+    if isinstance(resp, dict):
+        job_id = _go_find(resp, ("job_id", "id")) if (resp.get("job_id") or resp.get("poll_url") or resp.get("state")) else None
+        pu = _go_find(resp, ("poll_url",))
+        if not job_id and isinstance(pu, str):
+            m = _GO_JOBID_RE.search(pu)
+            job_id = m.group(1) if m else None
+        retry_after = _go_int(_go_find(resp, ("retry_after_seconds", "retry_after")))
+        txid = _go_find(resp, ("txid", "tx_id", "hash"))
+        state = str(resp.get("state") or "").lower()
+        if not state and isinstance(resp.get("status"), str):
+            state = resp["status"].lower()
+    else:
+        m = _GO_JOBID_RE.search(text)
+        job_id = m.group(1) if m else None
+        m = _GO_RETRY_RE.search(text)
+        retry_after = int(m.group(1)) if m else None
+        m = _GO_TXID_RE.search(text)
+        txid = m.group(1) if m else None
+
+    # Refusals first: they can arrive inline or as a finished job carrying the error.
+    if _GO_SETTLED_RE.search(text):
+        outcome = "already_settled"
+    elif _GO_DUP_RE.search(text):
+        outcome = "duplicate"
+    elif _GO_UNKNOWN_RE.search(text):
+        outcome = "unknown_assignment"
+    elif status == 408 or _GO_EXPIRED_RE.search(text) or state == "expired":
+        outcome = "job_expired"
+    elif _GO_INFLIGHT_RE.search(text) or (status == 409 and "flight" in low):
+        outcome = "in_flight"
+    elif status == 429 or _GO_RATE_RE.search(text):
+        outcome = "rate_limited"
+    elif status in (401, 403):
+        outcome = "auth"
+    elif txid and not (isinstance(resp, dict) and resp.get("error")):
+        outcome = "landed"
+    elif state in GO_POLL_DONE_STATES and not low.strip():
+        outcome = "landed"
+    elif status == 202 or (isinstance(resp, dict) and is_busy_receipt(resp)) or \
+            (job_id and (_GO_POLL_RE.search(text) or state in BUSY_PENDING_STATES)) or \
+            (isinstance(resp, str) and _GO_POLL_RE.search(text) and "poll" in low):
+        outcome = "accepted_poll_job"
+    elif status == 404 and (job_id or "job" in low):
+        outcome = "job_forgotten"
+    elif resp is None or _GO_TIMEOUT_RE.search(text):
+        outcome = "timeout"
+    elif status == 503 and re.search(r"halt|maintenance", low):
+        outcome = "halted"
+    elif status is not None and 500 <= status <= 599:
+        outcome = "server_error"
+    elif status is not None and 200 <= status <= 201 and isinstance(resp, dict) and not resp.get("error"):
+        outcome = "landed"
+    else:
+        outcome = "other"
+    action, step = GRADE_OUTCOMES[outcome]
+    if outcome == "accepted_poll_job" and job_id:
+        step = step.replace("/api/job/<id>", f"/api/job/{job_id}")
+    if outcome == "rate_limited":
+        retry_after = retry_after if retry_after is not None else GRADE_DEFAULT_BACKOFF_S
+    if outcome in ("timeout", "server_error") and job_id:
+        # a job id means it was accepted; poll instead of checking blind
+        outcome, (action, step) = "accepted_poll_job", GRADE_OUTCOMES["accepted_poll_job"]
+        step = step.replace("/api/job/<id>", f"/api/job/{job_id}")
+    return {"outcome": outcome, "action": action, "next_step": step, "http_status": status,
+            "job_id": str(job_id) if job_id else None, "retry_after_s": retry_after,
+            "txid": str(txid) if txid else None, "resubmit": outcome == "job_expired"}
+
+
+def grade_seat_age_check(answer_epoch, current_epoch, limit: int = GRADE_SETTLED_AGE,
+                         from_epoch: int = GRADE_SETTLED_FROM_EPOCH) -> dict:
+    """Pure: will a grade on an answer from `answer_epoch` be refused as "answer already settled"
+    in `current_epoch`? From E123 a seat 17+ epochs old is refused before anything is written."""
+    a, c = _go_int(answer_epoch), _go_int(current_epoch)
+    if a is None or c is None or a < 0 or c < 0:
+        return {"ok": False, "error": "answer and current epoch must be whole numbers"}
+    age = c - a
+    rule_live = c >= from_epoch
+    refused = rule_live and age >= limit
+    if refused:
+        note = f"will be refused: answer is {age} epochs old (>= {limit}) and the rule is live from E{from_epoch}; skip this seat"
+    elif not rule_live:
+        note = f"rule not live before E{from_epoch}; age {age}"
+    else:
+        note = f"ok: age {age} < {limit}" + (f"; refused from E{a + limit}" if age >= 0 else "")
+    return {"ok": True, "answer_epoch": a, "current_epoch": c, "age": age, "limit": limit,
+            "rule_live": rule_live, "will_be_refused": refused, "note": note}
+
+
+def _go_parse_line(line: str):
+    s = line.strip()
+    if not s:
+        return None, False
+    if s[0] in "{[":
+        try:
+            return json.loads(s), True
+        except ValueError:
+            pass
+    return s, True
+
+
+def grade_outcome_report(text: str, per_line: bool = False, status: int = None) -> dict:
+    """Pure: classify a saved response (whole text as one response) or, with per_line, every
+    non-empty line of a log/JSONL file, with a count per outcome."""
+    if not per_line:
+        stripped = text.strip()
+        obj = stripped or None
+        if stripped[:1] in "{[":
+            try:
+                obj = json.loads(stripped)
+            except ValueError:
+                pass
+        r = classify_grade_outcome(obj, status=status)
+        return {"ok": True, "items": [r], "counts": {r["outcome"]: 1}}
+    items, counts = [], {}
+    for line in text.splitlines():
+        obj, have = _go_parse_line(line)
+        if not have:
+            continue
+        r = classify_grade_outcome(obj, status=status)
+        items.append(r)
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    return {"ok": True, "items": items, "counts": dict(sorted(counts.items(), key=lambda kv: -kv[1]))}
+
+
+def _go_line(r: dict) -> str:
+    bits = [f"outcome={r['outcome']}", f"action={r['action']}"]
+    if r.get("http_status") is not None:
+        bits.append(f"http={r['http_status']}")
+    if r.get("job_id"):
+        bits.append(f"job={r['job_id']}")
+    if r.get("retry_after_s") is not None and r["outcome"] in ("rate_limited", "accepted_poll_job"):
+        bits.append(f"retry_after={r['retry_after_s']}s")
+    return "grade-outcome: " + " ".join(bits) + "\n  next: " + r["next_step"]
+
+
+def cmd_grade_outcome(args: argparse.Namespace) -> None:
+    out = {"ok": True}
+    text = None
+    if args.file:
+        try:
+            text = sys.stdin.read() if args.file == "-" else pathlib.Path(args.file).expanduser().read_text(errors="replace")
+        except OSError as ex:
+            print(json.dumps({"ok": False, "error": redact(str(ex))}) if args.json else f"grade-outcome: could not read {args.file}: {redact(str(ex))}")
+            sys.exit(2)
+        rep = grade_outcome_report(redact(text), per_line=args.per_line, status=args.status)
+        out.update(classification=rep)
+    age = None
+    if args.answer_epoch is not None or args.epoch is not None:
+        age = grade_seat_age_check(args.answer_epoch, args.epoch)
+        out["seat_age"] = age
+        if not age.get("ok"):
+            out["ok"] = False
+    if text is None and age is None:
+        print("grade-outcome: give a saved response/log FILE (or - for stdin) and/or --answer-epoch A --epoch C")
+        sys.exit(2)
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        if text is not None:
+            rep = out["classification"]
+            if args.per_line:
+                print(f"grade-outcome: {len(rep['items'])} lines: " + ", ".join(f"{k}={v}" for k, v in rep["counts"].items()))
+                for k in rep["counts"]:
+                    print(f"  {k}: {GRADE_OUTCOMES[k][1]}")
+            else:
+                print(_go_line(rep["items"][0]))
+        if age is not None:
+            print("seat-age: " + (age["note"] if age.get("ok") else age["error"]))
+    if not out["ok"]:
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
 # att-reconcile: our own per-call `attested` tally vs the close body's attestations value
 # (SUGGESTIONS.md #187)
 # ---------------------------------------------------------------------------
@@ -9943,6 +10238,14 @@ def main() -> None:
     p_ar.add_argument("--json", action="store_true", help="JSON output")
     p_ar.add_argument("--timeout", type=int, default=90, help="Timeout for the /api/epochs reads (default 90s)")
 
+    p_go = sub.add_parser("grade-outcome", help="Keyless, offline, read-only: classify a saved grade-submit response or log (landed / 202 poll job / job_expired / read timeout / 429 / E123 'answer already settled' / ...) and print the next step; --answer-epoch/--epoch flags seats 17+ epochs old that will be refused (SUGGESTIONS #190); sends nothing")
+    p_go.add_argument("file", nargs="?", default="", help="Saved response body, JSON {status, body}, or log file; - for stdin")
+    p_go.add_argument("--per-line", action="store_true", help="Classify every non-empty line (log or JSONL) and print counts per outcome")
+    p_go.add_argument("--status", type=int, default=None, help="HTTP status of the saved response if the file has only the body")
+    p_go.add_argument("--answer-epoch", type=int, default=None, help="Epoch the graded answer was submitted in")
+    p_go.add_argument("--epoch", type=int, default=None, help="Current epoch (for the 17-epoch settled-age check)")
+    p_go.add_argument("--json", action="store_true", help="JSON output")
+
     p_cd = sub.add_parser("close-dist", help="Keyless, read-only: per close, payout p10/p50/p90 over accounts paid > 0, split by challenge_eligible, modal payout, answer/grading pool / W / per-unit with the ceiling re-pool, and settle-lag quantiles (SUGGESTIONS #182); never prints an address")
     p_cd.add_argument("--last", type=int, default=CLOSE_DIST_DEFAULT_LAST, help="Closes to show (default 4)")
     p_cd.add_argument("--address", default="", help="poa1... address for your own rank line (default $POA_ADDRESS or ~/.poa/address); never printed")
@@ -10303,6 +10606,8 @@ def main() -> None:
             cmd_close_dist(args)
         elif args.command == "att-reconcile":
             cmd_att_reconcile(args)
+        elif args.command == "grade-outcome":
+            cmd_grade_outcome(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
         elif args.command == "mcr":
