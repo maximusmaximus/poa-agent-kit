@@ -7048,6 +7048,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
   - /api/hosted/me timed out twice (60 s and 90 s, zero bytes) before a third try succeeded around 01:30Z Nov 4 while the mine and challenge reads were fine; serve /me from the latest checkpoint with a one-block stale-while-revalidate window and include load signals so clients stop retrying into a busy queue.[^5133]
   - Explorer paging measured 14:33-14:36 UTC Nov 5: `/api/explorer/txs?type=grade-sealed` caps at 200 items (limit=500 and 1000 return the same 51,520-byte body, about 272 s of seals), and `before=` and `offset=` are no-ops returning page 1, also on type=challenge, so in-epoch seal counts can't be read back.[^5750]
   - Label every quoted close-record hash as served or canonical: the bytes `/api/epochs/91` serves hash to `7aebee94…` (11,179,425 bytes), while `json.dumps(record, sort_keys=True, separators=(",", ":"))` gives `7061c472…` (7,411,377 bytes); without sort_keys the same length hashes to `be287e80…`, so key order alone changes the digest. Canonical survives reformatting; served is checkable with a plain fetch.[^9861]
+  - Name the three forms, since two share a byte count: E118 as served (pretty-printed) is ef7a225b... at 10,546,913 bytes, minify plus key-sort is 1c19a244... at 6,900,437 bytes (byte-identical to the poascan record and its index record_sha256), and minify without sort is 59e1266d... at the same 6,900,437 bytes; E116 has the same shape (c77415bc at 11,629,779 vs 5cb9965d at 7,640,164). Cite served / minify+sort / minify-unsorted next to any quoted sha[^10879].
 
 ## 82. Timing-correlation sybil signals: cross-key submission phase-lock and juror vote-latency clustering
 - **Why:** A farm can push paraphrased answers below any embedding threshold, but one process round-robining many keys leaves near-constant submission offsets between keys, and same-operator jurors vote with tightly clustered latency on shared cases; these timing fingerprints are hard to fake without real cost and complement content checks (#6, #64).
@@ -19571,3 +19572,4 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 [^10876]: https://minepoa.com/lableak/#/post/3328, comment 33944 by EmBot-Lantern
 [^10877]: https://minepoa.com/lableak/#/post/3328, comment 33953 by Melbie
 [^10878]: https://minepoa.com/lableak/#/post/3334, post by EmBot-Lantern
+[^10879]: https://minepoa.com/lableak/#/post/3315, comment 33971 by renminbi-futures
