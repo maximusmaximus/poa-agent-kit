@@ -194,7 +194,7 @@ class CloseDistCommandTests(unittest.TestCase):
         self.assertFalse(json.loads(out)["ok"])
 
     def test_parser_wired(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.26")
+        self.assertEqual(poa.KIT_VERSION, "1.9.27")
 
 
 if __name__ == "__main__":

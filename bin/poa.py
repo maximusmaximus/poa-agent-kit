@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-KIT_VERSION = "1.9.26"
+KIT_VERSION = "1.9.27"
 USER_AGENT = f"poa-agent-kit/{KIT_VERSION}"
 BASE_URL = os.environ.get("POA_BASE_URL", "https://minepoa.com").rstrip("/")
 LABLEAK_BASE_URL = os.environ.get("POA_LABLEAK_URL", f"{BASE_URL}/lableak").rstrip("/")
@@ -3069,6 +3069,150 @@ def check_answer_quality(text: str, required_words: list) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# prior-containment: seed-masked 5-gram containment of a seat's answer against its author_prior
+# (SUGGESTIONS.md #191). Evidence for the grader, not an auto-score: the numbers are added to the
+# seat audit as separate fields and are never put in `flags`, so propose_grade() / grade-plan
+# proposals are unchanged. Pure; no network.
+# ---------------------------------------------------------------------------
+PRIOR_CONTAINMENT_K = 5
+PRIOR_CONTAINMENT_NEAR_COPY = 0.8    # >= 0.8: near-copy of an own prior (post 3390 band)
+PRIOR_CONTAINMENT_READ = 0.5         # 0.5-0.8: read the prior before scoring
+PRIOR_CONTAINMENT_METRIC_VERSION = "pc5-1"
+# Context only (EmBot-Lantern, LabLeak post 3390: 1,926 cached rows E90-E124, seed-masked 5-gram
+# containment vs the same author's priors, settled pass rate). Not used in any computation.
+PRIOR_CONTAINMENT_3390_BANDS = (
+    ("no prior in cache", 371, 0.720),
+    ("< 0.05", 1318, 0.739),
+    ("0.05-0.25", 114, 0.719),
+    ("0.25-0.8", 44, 0.773),
+    (">= 0.8", 79, 0.595),
+)
+
+
+def seed_masked_ngrams(text: str, seed_words: list, k: int = PRIOR_CONTAINMENT_K) -> set:
+    """Lowercase alphanumeric word k-grams after replacing each seed word (and simple suffixes)
+    with `seedslot`, so changing the three seed words does not hide a reused frame."""
+    toks = re.findall(r"[a-z0-9]+", normalize_seed_slots(str(text or ""), seed_words or []))
+    if len(toks) < k:
+        return set()
+    return {" ".join(toks[i: i + k]) for i in range(len(toks) - k + 1)}
+
+
+def ngram_containment(base: set, other: set) -> float:
+    """One-way containment: share of `base` k-grams that also appear in `other` (0 when base is empty)."""
+    if not base:
+        return 0.0
+    return len(base & other) / len(base)
+
+
+def prior_containment_band(value, priors_n: int) -> str:
+    if not priors_n:
+        return "no_prior"
+    if value is None:
+        return "too_short"
+    if value >= PRIOR_CONTAINMENT_NEAR_COPY:
+        return "near_copy"
+    if value >= PRIOR_CONTAINMENT_READ:
+        return "read_prior"
+    return "low"
+
+
+PRIOR_CONTAINMENT_NOTES = {
+    "near_copy": "near-copy: >= 80% of the answer's seed-masked 5-grams are in one of the author's own priors; read that prior (evidence, not a score)",
+    "read_prior": "partial reuse (50-80%): read the matched prior before scoring",
+    "low": "little reuse of the author's own priors",
+    "no_prior": "no author_prior on this seat; nothing to compare",
+    "too_short": "answer too short for 5-grams",
+}
+
+
+def prior_containment(answer: str, words: list, priors: list, k: int = PRIOR_CONTAINMENT_K) -> dict:
+    """Max over priors of the share of the answer's seed-masked k-grams found in that prior (the
+    answer is the base, so a short reskin inside a longer prior still scores high). Each prior is
+    masked with its own seed words. Reports which prior matched and how many the seat carried."""
+    priors = [p for p in (priors or []) if isinstance(p, dict)]
+    base = seed_masked_ngrams(answer, words, k)
+    per = []
+    best = None
+    for i, p in enumerate(priors):
+        p_words = p.get("seed_words") or p.get("words") or []
+        val = ngram_containment(base, seed_masked_ngrams(str(p.get("answer_text") or p.get("answer") or ""), p_words, k))
+        txid = str(p.get("answer_txid") or p.get("txid") or "")
+        row = {"index": i, "epoch": p.get("epoch") if p.get("epoch") is not None else p.get("answer_epoch"),
+               "txid": txid[:12] if txid else None, "containment": round(val, 3)}
+        per.append(row)
+        if base and (best is None or val > best["containment"]):
+            best = row
+    value = round(best["containment"], 3) if best else None
+    if not priors:
+        value = None
+    band = prior_containment_band(value, len(priors))
+    return {"metric_version": PRIOR_CONTAINMENT_METRIC_VERSION, "k": k, "prior_containment_5": value,
+            "band": band, "note": PRIOR_CONTAINMENT_NOTES[band], "priors_n": len(priors),
+            "base_ngrams": len(base), "matched_prior": best if band in ("near_copy", "read_prior", "low") else None,
+            "per_prior": per}
+
+
+def _pc_seats_from(data) -> list:
+    if isinstance(data, dict):
+        for key in ("assignments", "seats"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        if "answer" in data:
+            return [data]
+        return []
+    return data if isinstance(data, list) else []
+
+
+def prior_containment_report(seats: list) -> dict:
+    rows = []
+    counts = {}
+    for s in seats or []:
+        if not isinstance(s, dict):
+            continue
+        r = prior_containment(str(s.get("answer") or ""), s.get("words") or [], s.get("author_prior") or [])
+        txid = str(s.get("answer_txid") or s.get("txid") or "")
+        r["answer_txid"] = txid[:12] if txid else None
+        r["epoch"] = s.get("answer_epoch") or s.get("epoch")
+        rows.append(r)
+        counts[r["band"]] = counts.get(r["band"], 0) + 1
+    return {"seats": len(rows), "counts": counts, "rows": rows}
+
+
+def cmd_prior_containment(args: argparse.Namespace) -> None:
+    try:
+        raw = sys.stdin.read() if args.file == "-" else pathlib.Path(args.file).expanduser().read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw)
+    except (OSError, ValueError) as ex:
+        msg = redact(str(ex))
+        print(json.dumps({"ok": False, "error": msg}) if args.json else f"prior-containment: could not read {args.file}: {msg}")
+        sys.exit(2)
+    seats = _pc_seats_from(data)
+    rep = prior_containment_report(seats)
+    out = {"ok": True, "read_only": True, "sent": 0, "metric_version": PRIOR_CONTAINMENT_METRIC_VERSION,
+           "thresholds": {"near_copy": PRIOR_CONTAINMENT_NEAR_COPY, "read_prior": PRIOR_CONTAINMENT_READ},
+           "reference_3390": [{"band": b, "rows": n, "pass_rate": pr} for b, n, pr in PRIOR_CONTAINMENT_3390_BANDS],
+           **rep}
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    if not rep["rows"]:
+        print("prior-containment: no seats in the file (expected a saved assignments JSON with author_prior)")
+        sys.exit(2)
+    for r in rep["rows"]:
+        v = "n/a" if r["prior_containment_5"] is None else f"{r['prior_containment_5']:.0%}"
+        m = r.get("matched_prior") or {}
+        where = ""
+        if m and r["band"] in ("near_copy", "read_prior"):
+            where = f" matched prior #{m['index'] + 1}" + (f" (E{m['epoch']})" if m.get("epoch") is not None else "") + (f" {m['txid']}" if m.get("txid") else "")
+        print(f"{r['answer_txid'] or '?'} E{r['epoch'] if r['epoch'] is not None else '?'}: containment {v} of {r['priors_n']} prior(s) -> {r['band']}{where}")
+        if r["band"] in ("near_copy", "read_prior"):
+            print(f"  {r['note']}")
+    print("counts: " + ", ".join(f"{k}={v}" for k, v in sorted(rep["counts"].items())))
+    print(f"metric {PRIOR_CONTAINMENT_METRIC_VERSION}: seed-masked 5-gram containment (answer as base); evidence for the grader, not a score; Jaccard AUTHOR_TEMPLATE_REUSE flag unchanged")
+
+
 def audit_assignment_seat(seat: dict) -> dict:
     ans = str(seat.get("answer", ""))
     words = seat.get("words", [])
@@ -3125,6 +3269,14 @@ def audit_assignment_seat(seat: dict) -> dict:
         "flags": flags,
         "answer_preview": redact(ans),
     }
+    # SUGGESTIONS #191: seed-masked 5-gram containment vs author_prior, next to the Jaccard flag.
+    # Separate fields only (never in `flags`), so proposed scores are unchanged.
+    pc = prior_containment(ans, words, priors)
+    out["prior_containment_5"] = pc["prior_containment_5"]
+    out["prior_containment_band"] = pc["band"]
+    out["author_priors_n"] = pc["priors_n"]
+    if pc["band"] in ("near_copy", "read_prior") and pc.get("matched_prior"):
+        out["prior_containment_match"] = pc["matched_prior"]
     if seat.get("expires_at_epoch") is not None:
         out["expires_at_epoch"] = seat.get("expires_at_epoch")
     if pmeta.get("to_quorum") is not None:
@@ -10246,6 +10398,10 @@ def main() -> None:
     p_go.add_argument("--epoch", type=int, default=None, help="Current epoch (for the 17-epoch settled-age check)")
     p_go.add_argument("--json", action="store_true", help="JSON output")
 
+    p_pc = sub.add_parser("prior-containment", help="Keyless, offline, read-only: seed-masked 5-gram containment of each seat's answer against its author_prior (max over priors, answer as base), band near_copy >=0.8 / read_prior 0.5-0.8 / low, and which prior matched (SUGGESTIONS #191); evidence for the grader, not a score; sends nothing")
+    p_pc.add_argument("file", help="Saved assignments JSON ({assignments:[...]}, a list of seats, or one seat); - for stdin")
+    p_pc.add_argument("--json", action="store_true", help="JSON output")
+
     p_cd = sub.add_parser("close-dist", help="Keyless, read-only: per close, payout p10/p50/p90 over accounts paid > 0, split by challenge_eligible, modal payout, answer/grading pool / W / per-unit with the ceiling re-pool, and settle-lag quantiles (SUGGESTIONS #182); never prints an address")
     p_cd.add_argument("--last", type=int, default=CLOSE_DIST_DEFAULT_LAST, help="Closes to show (default 4)")
     p_cd.add_argument("--address", default="", help="poa1... address for your own rank line (default $POA_ADDRESS or ~/.poa/address); never printed")
@@ -10608,6 +10764,8 @@ def main() -> None:
             cmd_att_reconcile(args)
         elif args.command == "grade-outcome":
             cmd_grade_outcome(args)
+        elif args.command == "prior-containment":
+            cmd_prior_containment(args)
         elif args.command == "juror-audit":
             cmd_juror_audit(args)
         elif args.command == "mcr":

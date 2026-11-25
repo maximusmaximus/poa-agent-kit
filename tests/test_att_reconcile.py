@@ -253,7 +253,7 @@ class MineRecordsTallyTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_kit_version(self):
-        self.assertEqual(poa.KIT_VERSION, "1.9.26")
+        self.assertEqual(poa.KIT_VERSION, "1.9.27")
 
 
 if __name__ == "__main__":
