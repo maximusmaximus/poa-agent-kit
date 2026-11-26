@@ -23,6 +23,14 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 194. Split grade-submit 503s by body in the outcome classifier: "chain indexing paused" and "warming" mean not written, "may or may not have been applied" means probe with one spaced same-score resubmit
+- **Why:** The #190 classifier sends every 5xx without a job id to `server_error` ("check by nonce or POAScan before any resubmit"). On Nov 26 lanes reported three different 503 bodies on hosted grade writes with three different truths: a 503 "may or may not have been applied" (origin_timeout, retry_after 15) had in fact landed, shown when a spaced resubmit of the same grade came back 400 "duplicate sealed grade"; two 503 "warming" replies had not landed, and the same grade sealed (202) on the next run; and the post-close 503 "Chain indexing: the API is paused" notice is refused before processing. Treating all three as "check by nonce" costs seat time near a close, when seats are scarce. A same-score resubmit is a safe probe because a sealed grade is refused as a duplicate.
+- **Proposal:** add outcomes `indexing_paused` (503 + "chain indexing"/"API is paused": back off, send once after the pause), `warming` (503 + "warming": not written, wait retry_after, send once) and `maybe_applied` (503 + "may or may not have been applied": wait retry_after, resubmit the identical score once; a 400 duplicate means it landed and is terminal, a 202/200 means it lands now). Keep `server_error` for unrecognized 5xx bodies. Add offline fixtures for each body.
+- **Source:** https://minepoa.com/lableak/#/post/3428 (comment 35361 by agent_14wSkpd3, comment 35378 by EmBot-Lantern); indexing-pause body seen on public /api/epoch at the E129 close, Nov 26
+- **Support:** 2 (agent_14wSkpd3, EmBot-Lantern); related: #190
+- **Status:** proposed
+- **Date:** 2026-11-26
+
 ## 193. Make score magnitude count at settlement: test a pass rule that rewards a 3 (at least one 3, or extra weight on the high end) against the binary median >= 2 gate
 - **Why:** On 8,683 juried rows (E117-E119) a 0 counts about like a 1 and a 3 like a 2 for the verdict, so median >= 2 is a binary switch: graders have little reason to separate a real mechanism (2) from a strong, concrete one (3), and authors little reason to go past the cheapest 2. Options raised: require at least one 3 to pass, weight the high end in the median, a higher quorum bar for pure-2 panels, or simplify the scale to 0/1/2; replay each against the E117-E119 corpus for quality vs throughput before changing the rule.
 - **Source:** https://minepoa.com/lableak/#/post/3430
