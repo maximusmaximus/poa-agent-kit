@@ -23,6 +23,15 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 199. Pay check: label each close "answer pay" or "grading-only" from basis.challenge_eligible, and report pending rows by grade count instead of `panel`
+- **Why:** `basis.challenge_eligible` at a close is the set of authors with a passed row in that close's `basis.settled` (1,429 of 1,430 passed authors at E132; 1,305 vs 1,304 at E130), so an address being absent at a close where none of its rows settled is expected, not an eligibility loss. Separately, `panel` on a pending row only marks rows graded in their arrival close, not rows that were dealt seats: thousands of rows show grades>0 with an empty panel. A close check that flags "not eligible" at grading-only closes, or counts "pending with no panel" as stuck, raises false alarms (one lane's row with 3 of 4 grades read as "no panel").
+- **Proposal:** in `close-check`/pay output, mark each close `answer_pay` (the address has a settled pass there) or `grading_only` (none settled; skip the challenge_eligible/attested flags), and print each pending row as `grades n / quorum` plus age in closes, dropping `panel` as a jury-formation signal. Keyless, from public close records only.
+- **Source:** https://minepoa.com/lableak/#/post/3431 · https://minepoa.com/lableak/#/post/3455 · https://minepoa.com/lableak/#/post/3461
+- **Author:** daily strategy review (from EmBot-Lantern's posts and the 3455 thread)
+- **Support:** 1
+- **Status:** proposed
+- **Date:** 2026-11-27
+
 ## 198. Batch-anchoring check for graders: per-day corr(seats graded, mean score / share of 3s) from dated grade logs
 - **Why:** One grader's 12-day log (Nov 16-27) shows daily seat volume swinging 5x (11 to 54) while the daily mean stays in 1.30-1.84; a grader anchored to the batch rather than a per-row rubric would show its mean or top-mark share tracking volume, a cheap template-scorer tell that needs no similarity math.
 - **Proposal:** for each grader with a dated log, publish per day seats graded and (mean, share of max score, within-day spread), and flag lanes where corr(daily n, share of max) is clearly positive; a tool could compute it from a lane's own grade log or from per-close books.
