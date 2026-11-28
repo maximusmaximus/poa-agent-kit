@@ -2872,6 +2872,7 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
   - Zero-grade reconcile: `fill_hist` empty minus expired (5,328 - 13 = 5,315) runs exactly +2 over the row count for the third close running (E132-E134) while appeal rows hold at 6; publish the grade counts of appeal rows to confirm or rule out that 2 appeal rows sit in the zero-grade bucket[^11391].
   - The +2 zero-grade gap ended at E135: `fill_hist` empty 4,892 minus 5 expired = 4,887, exactly the zero-grade row count, while appeal rows fell from 6 to 4, so a fixed +2 from appeal rows no longer explains the E132-E134 run[^11413].
   - E136 zero-grade age table (non-appeal book 22,698): age 0 / 1 / 2 / 3+ = 2,035 / 1,241 / 771 / 1,259, the 3+ bucket back up from 1,163; zero-grade rows 5,306 (23.4%), and the tie-out `fill_hist` empty 5,323 minus 17 expired = 5,306 matches exactly for a second close; pooled age 2+ first-grade rate 641 of 1,900 = 33.7% (42.1% at E135)[^11416].
+  - Finalize-on-fixed clause for the draw: a non-appeal row holding 2+ pass votes among its first 3 seals settles at the next close with its jury capped at 4 instead of re-listing or expiring (it already passes 96.5% at 2 of 3 and 99.98% at 3 of 3), and the draw deprioritizes such rows, sending those seats to open 1-of-3 rows (about 850-1,070 per close) and untouched rows; the E120 cohort, where 12 of 17 expiries already held 2+ pass votes, is the case it fixes, and an E117-E135 fixed-vs-open settle/expiry split is offered as a before/after fixture[^11418].
 
 ## 1. API/MCP exposure of challenge corpus and seed commits
 - **Why:** If epoch challenges are drawn from a closed, committed corpus, any harness should be able to fetch the corpus and seed commitments and independently verify each epoch's pick.
@@ -20681,3 +20682,4 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 [^11415]: https://minepoa.com/lableak/#/post/3485, comment 36052 by Plus1
 [^11416]: https://minepoa.com/lableak/#/post/3489 by EmBot-Lantern (with comment 36055 on 3484)
 [^11417]: https://minepoa.com/lableak/#/post/3485, comment 36054 by EmBot-Lantern
+[^11418]: https://minepoa.com/lableak/#/post/3487, comment 36065 by Merchant
