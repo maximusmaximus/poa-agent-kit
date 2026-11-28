@@ -23,6 +23,16 @@ A backlog of ideas for tools and improvements that could support the Proof of Ag
 
 > **Suggestions only.** Nothing here gets built without the maintainer's approval. A daily strategy routine appends new ideas to this file, and the maintainer approves, rejects or reprioritizes each item. Status values: `proposed`, `approved`, `in progress`, `done`, `rejected`.
 
+## 201. Grader self-audit: `poa jury-align` prints your own jury alignment per close, split by pass and fail votes, with a leave-one-out view
+- **Why:** Only aligned seats on settled juries are paid (about 1e8/W each), and the misses cluster in fail votes: across the E134-E137 settled juries the network aligned on 96.9% of pass votes but only 36.7% of fail votes (28,385/29,291 vs 3,525/9,606, from public close records). Graders keep asking whether a low-score streak is their scoring or their seat feed (3492, 14+ comments), and EmBot-Lantern's keyless script in 3472 already shows the data is public. A kit command makes that self-check one line, and the leave-one-out view answers loom's and Merchant's point that a grader's own vote sits inside the verdict it is matched against.
+- **Proposal:** `poa jury-align [--closes N]` reads `/api/epochs/<n>` for the last N closes (default 4), finds seats where `grader` is the configured address, and prints per close: jury seats, pass votes aligned/total, fail votes aligned/total, and the network's same split for comparison. Add a leave-one-out column (would the verdict have been the same without this seat?) so 2-2 tie seats are flagged instead of counted as clean matches. Keyless, read-only, mocked-fixture tests; the address comes from local config, never hardcoded.
+- **Source:** https://minepoa.com/lableak/#/post/3472 · https://minepoa.com/lableak/#/post/3492 · https://minepoa.com/lableak/#/post/3465
+- **Author:** daily strategy review (from EmBot-Lantern's 3472 script and the 3492 thread: loom 36120, Merchant 36121)
+- **Popularity:** 3472 score 7, 18 replies; 3492 score 7, 15 replies
+- **Support:** 3 (Hermes_of_Drawn in comment 35804 on 3465, asking for a per-grader alignment feed; Merchant in comment 36121, leave-one-out; LedgerAnnotator in comment 35866, share of network aligned seats)
+- **Status:** proposed
+- **Date:** 2026-11-28
+
 ## 200. Number ATP-20 tokens permanently in creation order
 - **Why:** More than 3,000 ATP-20 tokens exist and the two public indexers already disagree on the count (Magic-Agent 3,140 vs POAScan 3,334 at Nov 27, 8:24 PM PT), so a permanent, reproducible creation-order number (#1 SEAL, #2 MAM, ...) gives tokens a stable reference that does not depend on whichever indexer is used.
 - **Proposal:** each valid ATP-20 token gets a never-reused number from its first valid, final deploy memo, sorted by deploy timestamp ascending, then deploy txid ascending as hex (the `ts,id` replay order Magic-Agent and POAScan already publish); a `HEIGHT:INDEX` location id can be shown later if block position becomes public, without renumbering.
